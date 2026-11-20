@@ -1844,7 +1844,7 @@ window.__ModuleLoader__.load({
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
-function OutputPanel({ panel, trace, onTab, onSelect, onClose }) {
+function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
   const entry = trace.length === 0 ? undefined : trace[Math.min(panel.index, trace.length - 1)]
   const conversation = entry === undefined ? undefined : entry.conversation
   const system = conversation === undefined ? '' : conversation.system
@@ -1852,7 +1852,7 @@ function OutputPanel({ panel, trace, onTab, onSelect, onClose }) {
   const answer = conversation === undefined ? '' : conversation.answer
   return h(
     'div',
-    { className: 'dsh-ide-panel' },
+    { className: 'dsh-ide-panel', style: { height: `${height}px` } },
     h(
       'div',
       { className: 'dsh-ide-panel-head' },
@@ -1967,6 +1967,7 @@ function IdeBody(props) {
   // The output panel mirrors the VS Code one: "Trajectory" explains every
   // completion request, "Chat" shows the exact prompt and answer.
   const [panel, setPanel] = React.useState(undefined)
+  const [panelHeight, setPanelHeight] = React.useState(190)
   const [trace, setTrace] = React.useState([])
       const [quick, setQuick] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
@@ -2136,7 +2137,9 @@ function IdeBody(props) {
         if (text.length > 4 * 1024 * 1024) return { items: [] }
         const offset = model.getOffsetAt(position)
         const stamp = `${key}:${offset}:${model.getVersionId()}:${explicit ? 'x' : 'a'}`
-        if (runtime.current.lastCompletion === stamp) return { items: [] }
+        // An explicit request is a fresh question even at an unchanged position:
+        // only automatic suggestions are de-duplicated.
+        if (!explicit && runtime.current.lastCompletion === stamp) return { items: [] }
         runtime.current.lastCompletion = stamp
         const controller = new AbortController()
         if (cancelToken && typeof cancelToken.onCancellationRequested === 'function') {
@@ -2217,6 +2220,22 @@ function IdeBody(props) {
         }
       }, [])
 
+      const beginPanelResize = (event) => {
+        event.preventDefault()
+        const startY = event.clientY
+        const startHeight = panelHeight
+        const move = (moveEvent) => {
+          const next = Math.min(560, Math.max(90, startHeight - (moveEvent.clientY - startY)))
+          setPanelHeight(next)
+        }
+        const finish = () => {
+          window.removeEventListener('mousemove', move)
+          window.removeEventListener('mouseup', finish)
+        }
+        window.addEventListener('mousemove', move)
+        window.addEventListener('mouseup', finish)
+      }
+
       const openQuick = () => {
         if (quick !== undefined && quick.loading !== true) {
           setQuick({ files: quick.files, loading: false, error: quick.error })
@@ -2251,6 +2270,7 @@ function IdeBody(props) {
           renderLineHighlight: 'line',
           smoothScrolling: true,
           padding: { top: 8, bottom: 24 },
+          inlineSuggest: { enabled: true },
         })
         runtime.current.editor = editor
         runtime.current.monaco = monaco
@@ -2272,7 +2292,10 @@ function IdeBody(props) {
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS, () => {
           void handlersRef.current.saveAll?.()
         })
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => editor.trigger('keyboard', 'editor.action.inlineSuggest.trigger', {}))
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => {
+          handlersRef.current.openOutput?.()
+          editor.trigger('keyboard', 'editor.action.inlineSuggest.trigger', {})
+        })
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
 
@@ -2353,6 +2376,7 @@ function IdeBody(props) {
             runtime.current.autoSuggest = loaded.autoSuggest !== false
             const saved = statePayload.state || {}
             if (typeof saved.treeWidth === 'number') setExplorerWidth(saved.treeWidth)
+            if (typeof saved.panelHeight === 'number') setPanelHeight(saved.panelHeight)
             setShowTree(saved.showTree !== false)
             setHidden(saved.hidden === true)
             const wanted = []
@@ -2412,13 +2436,14 @@ function IdeBody(props) {
               tabs: tabs.map((candidate) => candidate.path),
               active: (tabs.find((candidate) => candidate.key === activeKey) || {}).path || '',
               treeWidth: explorerWidth,
+              panelHeight,
               showTree,
               hidden,
             },
           }).catch(() => {})
         }, STATE_WRITE_DELAY_MS)
         return () => window.clearTimeout(timer)
-      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, showTree, hidden])
+      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, panelHeight, showTree, hidden])
 
       const saveSettings = async (patch) => {
         try {
@@ -2508,6 +2533,7 @@ function IdeBody(props) {
         openQuick,
         complete,
         toggleOutput,
+        openOutput: () => setPanel({ tab: 'trajectory', index: 0 }),
         openSettings: () => setSettingsOpen(true),
       }
 
@@ -2979,10 +3005,12 @@ function IdeBody(props) {
                 )
               : null,
             h('div', { className: 'dsh-ide-stage', ref: hostRef }),
+            panel === undefined ? null : h('div', { className: 'dsh-ide-panel-resize', onMouseDown: beginPanelResize }),
             panel === undefined
               ? null
               : h(OutputPanel, {
                   panel,
+                  height: panelHeight,
                   trace,
                   onTab: (tab) => setPanel({ tab, index: panel.index }),
                   onSelect: (index) => setPanel({ tab: 'chat', index }),
@@ -3185,7 +3213,9 @@ function IdeBody(props) {
 .dsh-ide-crumb-last { color:var(--ide-text); }
 .dsh-ide-crumb-sep { padding:0 3px; opacity:.6; }
 .dsh-ide-stage { flex:1 1 auto; min-height:0; }
-.dsh-ide-panel { flex:0 0 auto; height:190px; display:flex; flex-direction:column; border-top:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-panel { flex:0 0 auto; min-height:90px; max-height:560px; display:flex; flex-direction:column; border-top:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-panel-resize { flex:0 0 auto; height:5px; margin-bottom:-5px; cursor:row-resize; z-index:2; }
+.dsh-ide-panel-resize:hover { background:var(--ide-accent); opacity:.6; }
 .dsh-ide-panel-head { display:flex; align-items:center; gap:2px; flex:0 0 auto; padding:0 6px; height:28px; border-bottom:1px solid var(--ide-border); }
 .dsh-ide-panel-tab { border:none; background:transparent; color:var(--ide-fg-dim); font:400 11px/1.6 var(--ide-font); text-transform:uppercase; letter-spacing:.4px; padding:4px 8px; cursor:pointer; border-bottom:1px solid transparent; }
 .dsh-ide-panel-tab:hover { color:var(--ide-fg); }

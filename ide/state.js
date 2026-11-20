@@ -15,11 +15,14 @@ const MAX_TABS = 40
 const MAX_PATH_CHARS = 400
 const MIN_TREE_WIDTH = 150
 const MAX_TREE_WIDTH = 640
+const MIN_PANEL_HEIGHT = 90
+const MAX_PANEL_HEIGHT = 560
 
 const DEFAULTS = Object.freeze({
   tabs: [],
   active: '',
   treeWidth: 220,
+  panelHeight: 190,
   showTree: true,
   hidden: false,
 })
@@ -34,6 +37,12 @@ const clampWidth = (value) => {
   const number = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(number)) return DEFAULTS.treeWidth
   return Math.min(MAX_TREE_WIDTH, Math.max(MIN_TREE_WIDTH, Math.round(number)))
+}
+
+const clampPanel = (value) => {
+  const number = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(number)) return DEFAULTS.panelHeight
+  return Math.min(MAX_PANEL_HEIGHT, Math.max(MIN_PANEL_HEIGHT, Math.round(number)))
 }
 
 const cleanTab = (value) => {
@@ -63,6 +72,7 @@ export function sanitizeSessionState(raw) {
     tabs,
     active: active !== undefined && seen.has(active) ? active : tabs[0] ?? '',
     treeWidth: clampWidth(source.treeWidth),
+    panelHeight: clampPanel(source.panelHeight),
     showTree: typeof source.showTree === 'boolean' ? source.showTree : DEFAULTS.showTree,
     hidden: typeof source.hidden === 'boolean' ? source.hidden : DEFAULTS.hidden,
   }
