@@ -347,6 +347,12 @@ window.__ModuleLoader__.load({
       const [reloadKey, setReloadKey] = React.useState(0)
       const [rowMenu, setRowMenu] = React.useState(undefined)
       const [moreMenu, setMoreMenu] = React.useState(undefined)
+      // Inline "new file / new folder" row, the way the VS Code explorer does it:
+      // the name is typed straight into the tree instead of a modal dialog.
+      const [draft, setDraft] = React.useState(undefined)
+      const [draftError, setDraftError] = React.useState('')
+      const createRequest = props.createRequest
+      const createNonce = createRequest === undefined ? 0 : createRequest.nonce
 
       const workspaceRoot = (() => {
         const root = cache.get('')
@@ -435,6 +441,24 @@ window.__ModuleLoader__.load({
 
       const needle = query.trim().toLowerCase()
 
+      // A create request from the menu bar or the explorer toolbar opens the
+      // inline row in the target folder, expanding (and loading) it first.
+      React.useEffect(() => {
+        if (createRequest === undefined) return
+        const directory = createRequest.directory === '' ? '' : normalPath(createRequest.directory)
+        setDraft({ type: createRequest.type, directory, value: '' })
+        setDraftError('')
+        setQuery('')
+        if (directory !== '') {
+          setExpanded((previous) => {
+            const next = new Set(previous)
+            next.add(directory)
+            return next
+          })
+          void load(directory)
+        }
+      }, [createNonce])
+
       React.useEffect(() => {
         if (needle === '' || flat !== undefined || typeof sessionId !== 'string' || sessionId === '') return
         let cancelled = false
@@ -468,6 +492,58 @@ window.__ModuleLoader__.load({
       }, [needle, flat])
 
       const rows = []
+
+      // The inline "new file / new folder" row. Enter accepts, Escape cancels,
+      // and losing focus cancels like the VS Code explorer does.
+      const draftRow = (directory, depth) => {
+        if (draft === undefined) return null
+        const submit = async () => {
+          const name = draft.value.trim()
+          if (name === '') {
+            setDraft(undefined)
+            return
+          }
+          const base = directory === '' ? '' : `${directory}/`
+          const error = await props.onCreate(draft.type, `${base}${name}`)
+          if (typeof error === 'string' && error !== '') {
+            setDraftError(error)
+            return
+          }
+          setDraft(undefined)
+          setDraftError('')
+        }
+        return h(
+          'div',
+          { key: `draft:${directory}`, className: 'dsh-ide-draft', style: { paddingLeft: `${6 + depth * 12}px` } },
+          ...Array.from({ length: depth }, (_unused, index) => h('span', { key: `g${index}`, className: 'dsh-ide-guide' })),
+          h('span', { className: 'dsh-ide-caret' }),
+          draft.type === 'directory'
+            ? h(FolderIcon, { open: false })
+            : h(ToolbarIcon, { kind: 'file' }),
+          h('input', {
+            className: 'dsh-ide-draft-input',
+            autoFocus: true,
+            value: draft.value,
+            placeholder: draft.type === 'directory' ? 'Имя папки' : 'Имя файла',
+            'aria-label': draft.type === 'directory' ? 'Имя новой папки' : 'Имя нового файла',
+            onChange: (event) => setDraft({ ...draft, value: event.currentTarget.value }),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                void submit()
+              } else if (event.key === 'Escape') {
+                event.preventDefault()
+                setDraft(undefined)
+                setDraftError('')
+              }
+            },
+            onBlur: () => {
+              setDraft(undefined)
+              setDraftError('')
+            },
+          }),
+        )
+      }
 
       if (needle !== '') {
         if (flatError !== '') rows.push(h('div', { key: 'flat-error', className: 'dsh-ide-tree-error' }, flatError))
@@ -504,8 +580,10 @@ window.__ModuleLoader__.load({
             return
           }
           if (listing.entries.length === 0) {
-            rows.push(h('div', { key: `empty:${directory}`, className: 'dsh-ide-tree-empty', style: { paddingLeft: `${8 + depth * 12}px` } }, 'пусто'))
-            return
+            if (draft === undefined || draft.directory !== directory) {
+              rows.push(h('div', { key: `empty:${directory}`, className: 'dsh-ide-tree-empty', style: { paddingLeft: `${8 + depth * 12}px` } }, 'пусто'))
+              return
+            }
           }
           for (const entry of listing.entries) {
             const path = directory === '' ? entry.name : `${directory}/${entry.name}`
@@ -539,6 +617,10 @@ window.__ModuleLoader__.load({
           }
           if (listing.truncated) {
             rows.push(h('div', { key: `more:${directory}`, className: 'dsh-ide-tree-empty', style: { paddingLeft: `${10 + depth * 12}px` } }, 'Показаны первые 400 записей'))
+          }
+          if (draft !== undefined && draft.directory === directory) {
+            rows.push(draftRow(directory, depth))
+            if (draftError !== '') rows.push(h('div', { key: `draft-error:${directory}`, className: 'dsh-ide-tree-error', style: { paddingLeft: `${10 + depth * 12}px` } }, draftError))
           }
         }
         walk('', 0)
@@ -1722,6 +1804,7 @@ window.__ModuleLoader__.load({
       const [preferences, setPreferences] = React.useState(undefined)
       const [settingsOpen, setSettingsOpen] = React.useState(false)
       const [modelDialog, setModelDialog] = React.useState(false)
+      const [createRequest, setCreateRequest] = React.useState(undefined)
       const [catalog, setCatalog] = React.useState(undefined)
       const [tabMenu, setTabMenu] = React.useState(undefined)
       const [quick, setQuick] = React.useState(undefined)
@@ -2272,27 +2355,31 @@ window.__ModuleLoader__.load({
         withEditor((editor) => editor.updateOptions({ wordWrap: next ? 'on' : 'off' }))
       }
 
-      const createFile = (directory = '') => {
-        const base = normalPath(directory)
-        setPrompt({
-          title: 'Новый файл',
-          label: 'Путь относительно рабочей папки',
-          value: base === '' ? '' : `${base}/`,
-          action: 'Создать',
-          submit: async (value) => {
-            const relative = normalPath(value)
-            if (relative === '') return
-            try {
-              await call('create', { sessionId, path: relative })
-              setReloadSignal((previous) => previous + 1)
-              await openFile(relative)
-              setStatus({ kind: 'ok', message: `Создан файл: ${relative}` })
-            } catch (cause) {
-              setStatus({ kind: 'error', message: describeError(cause) })
-            }
-          },
-        })
+      // Creating a file or a folder starts an inline row inside the explorer,
+      // the way VS Code does it: the name is typed in place, not in a dialog.
+      const createNonce = React.useRef(0)
+      const beginCreate = (type, directory = '') => {
+        createNonce.current += 1
+        setCreateRequest({ type, directory: normalPath(directory), nonce: createNonce.current })
+        setSettingsOpen(false)
+        setModelDialog(false)
       }
+
+      const submitCreate = async (type, relative) => {
+        const path = normalPath(relative)
+        if (path === '' || path.split('/').includes('..')) return 'Некорректное имя файла или папки.'
+        try {
+          await call(type === 'directory' ? 'mkdir' : 'create', { sessionId, path })
+          setReloadSignal((previous) => previous + 1)
+          if (type !== 'directory') await openFile(path)
+          setStatus({ kind: 'ok', message: type === 'directory' ? `Создана папка: ${path}` : `Создан файл: ${path}` })
+          return ''
+        } catch (cause) {
+          return describeError(cause)
+        }
+      }
+
+      const createFile = (directory = '') => beginCreate('file', directory)
 
       const renamePath = (path, name) => {
         setPrompt({
@@ -2324,26 +2411,7 @@ window.__ModuleLoader__.load({
         setDialog({ mode: 'delete', path, name, type })
       }
 
-      const createDirectory = (directory = '') => {
-        const base = normalPath(directory)
-        setPrompt({
-          title: 'Новая папка',
-          label: 'Путь относительно рабочей папки',
-          value: base === '' ? '' : `${base}/`,
-          action: 'Создать',
-          submit: async (value) => {
-            const relative = normalPath(value)
-            if (relative === '') return
-            try {
-              await call('mkdir', { sessionId, path: relative })
-              setReloadSignal((previous) => previous + 1)
-              setStatus({ kind: 'ok', message: `Создана папка: ${relative}` })
-            } catch (cause) {
-              setStatus({ kind: 'error', message: describeError(cause) })
-            }
-          },
-        })
-      }
+      const createDirectory = (directory = '') => beginCreate('directory', directory)
 
       // The same top-level arrangement as VS Code. Commands the IDE cannot honour
       // are disabled with the reason in their tooltip instead of being hidden.
@@ -2612,6 +2680,8 @@ window.__ModuleLoader__.load({
                     void openFile(path, { activate: true })
                   },
                   onToggleHidden: setHidden,
+                  createRequest,
+                  onCreate: submitCreate,
                   onNewFile: createFile,
                   onNewFolder: createDirectory,
                   onRename: renamePath,
@@ -2834,6 +2904,8 @@ window.__ModuleLoader__.load({
 .dsh-ide-row-name { overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-row-dim { color:var(--ide-muted); overflow:hidden; text-overflow:ellipsis; max-width:60%; }
 .dsh-ide-row-tag { color:var(--ide-muted); font-size:10px; }
+.dsh-ide-draft { display:flex; align-items:center; gap:4px; height:22px; padding-right:6px; background:var(--ide-active); }
+.dsh-ide-draft-input { flex:1; min-width:0; height:18px; border:1px solid var(--ide-accent); border-radius:2px; background:var(--ide-bg); color:var(--ide-text); font:400 12px/1.3 var(--dsh-font-ui, system-ui, sans-serif); padding:0 4px; outline:none; }
 .dsh-ide-guide { flex:0 0 12px; width:12px; align-self:stretch; border-left:1px solid var(--ide-border); opacity:.55; margin-left:1px; }
 .dsh-ide-caret { flex:0 0 12px; width:12px; font-size:9px; color:var(--ide-muted); transition:transform .1s ease; }
 .dsh-ide-caret-open { transform:rotate(90deg); }
