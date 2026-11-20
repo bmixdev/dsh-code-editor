@@ -243,3 +243,40 @@ test('the credential route degrades when no credential store is available', asyn
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('the completion permission survives an editor restart', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async (file) => {
+      const first = setup({ root })
+      const opened = await first.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      const denied = await first.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = ',
+        offset: 22,
+      })
+      assert.equal(errorCode(denied.body), 'not-opted-in')
+
+      const enabled = await first.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      assert.equal(enabled.body.smartTab, true)
+      const stored = JSON.parse(await readFile(file, 'utf8'))
+      assert.deepEqual(stored.completionOptIn, [root])
+
+      // A fresh host instance sees only the preferences file — that is a restart.
+      const second = setup({ root })
+      const reopened = await second.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      const allowed = await second.call('complete', {
+        id: reopened.body.id,
+        sessionId: SESSION_ID,
+        token: reopened.body.token,
+        text: 'export const answer = ',
+        offset: 22,
+      })
+      assert.equal(allowed.body.text, 'return 1')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

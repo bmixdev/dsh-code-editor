@@ -468,10 +468,20 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsh-ide-explorer-head' },
-          h('span', { className: 'dsh-ide-explorer-title' }, 'Explorer'),
+          h('span', { className: 'dsh-ide-explorer-title' }, 'ПРОВОДНИК'),
           h(
             'span',
             { className: 'dsh-ide-explorer-actions' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-icon-button',
+                title: 'Свернуть все папки',
+                onClick: () => setExpanded(new Set()),
+              },
+              '⊟',
+            ),
             h(
               'button',
               {
@@ -1115,6 +1125,8 @@ window.__ModuleLoader__.load({
       const [quick, setQuick] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
+      const [consent, setConsent] = React.useState(undefined)
+      const [menuOpen, setMenuOpen] = React.useState(false)
       const [booted, setBooted] = React.useState(false)
 
       const stateRef = React.useRef({})
@@ -1261,8 +1273,32 @@ window.__ModuleLoader__.load({
           return { items: [{ insertText: payload.text }] }
         } catch (cause) {
           if (cause instanceof Error && (cause.name === 'AbortError' || cause.code === 'cancelled')) return { items: [] }
+          if (cause instanceof Error && cause.code === 'not-opted-in') {
+            // The host only sends buffer context after the workspace opted in. The
+            // reminder is a one-click consent bar instead of a dead error line.
+            setConsent({ tabKey: key })
+            setStatus({ kind: 'idle', message: '' })
+            return { items: [] }
+          }
           setStatus({ kind: 'error', message: describeError(cause) })
           return { items: [] }
+        }
+      }, [])
+
+      const enableSuggestions = React.useCallback(async () => {
+        const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (active === undefined) {
+          setConsent(undefined)
+          return
+        }
+        try {
+          await call('settings', { id: active.hostId, sessionId: stateRef.current.sessionId, smartTab: true })
+          setConsent(undefined)
+          setStatus({ kind: 'ok', message: 'Подсказки включены для этой рабочей папки.' })
+          const instance = runtime.current.editor
+          if (instance !== undefined) instance.trigger('dsh-ide', 'editor.action.inlineSuggest.trigger', {})
+        } catch (cause) {
+          setStatus({ kind: 'error', message: describeError(cause) })
         }
       }, [])
 
@@ -1533,15 +1569,15 @@ window.__ModuleLoader__.load({
             'button',
             {
               type: 'button',
-              className: `dsh-ide-icon-button${showTree ? ' dsh-ide-icon-button-active' : ''}`,
-              title: showTree ? 'Скрыть проводник' : 'Показать проводник',
-              onClick: () => setShowTree(!showTree),
+              className: `dsh-ide-icon-button${menuOpen ? ' dsh-ide-icon-button-active' : ''}`,
+              title: 'Меню IDE',
+              onClick: () => setMenuOpen(!menuOpen),
             },
             '☰',
           ),
           h('span', { className: 'dsh-ide-top-title', title: activeTab === undefined ? 'IDE' : activeTab.path }, activeTab === undefined ? 'IDE' : activeTab.name),
           h('span', { className: 'dsh-ide-top-spacer' }),
-          h('button', { type: 'button', className: 'dsh-ide-button', title: 'Быстрое открытие (Ctrl+P)', onClick: openQuick }, 'Файл'),
+          h('button', { type: 'button', className: 'dsh-ide-button', title: 'Быстрое открытие (Ctrl+P)', onClick: openQuick }, 'Открыть файл'),
           h(
             'button',
             {
@@ -1555,11 +1591,137 @@ window.__ModuleLoader__.load({
             },
             'Сохранить всё',
           ),
-          h('button', { type: 'button', className: 'dsh-ide-icon-button', title: 'Настройки IDE', onClick: () => setSettingsOpen(true) }, '⚙'),
         ),
+        menuOpen
+          ? h(
+              'div',
+              { className: 'dsh-ide-menu', role: 'menu' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-menu-item',
+                  onClick: () => {
+                    setMenuOpen(false)
+                    void saveActive()
+                  },
+                },
+                h('span', null, 'Сохранить'),
+                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+S'),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-menu-item',
+                  onClick: () => {
+                    setMenuOpen(false)
+                    void saveAll()
+                  },
+                },
+                h('span', null, 'Сохранить всё'),
+                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+Shift+S'),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-menu-item',
+                  onClick: () => {
+                    setMenuOpen(false)
+                    closeActive()
+                  },
+                },
+                h('span', null, 'Закрыть вкладку'),
+                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+W'),
+              ),
+              h('div', { className: 'dsh-ide-menu-sep' }),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-menu-item',
+                  onClick: () => {
+                    setMenuOpen(false)
+                    openQuick()
+                  },
+                },
+                h('span', null, 'Открыть файл по имени'),
+                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+P'),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-menu-item',
+                  onClick: () => {
+                    setMenuOpen(false)
+                    setSettingsOpen(true)
+                  },
+                },
+                h('span', null, 'Настройки IDE'),
+                h('span', { className: 'dsh-ide-menu-key' }, ''),
+              ),
+            )
+          : null,
         h(
           'div',
           { className: 'dsh-ide-body' },
+          // VS Code's activity bar: one narrow rail, the panel toggles live there,
+          // so the explorer can be hidden without leaving the editor.
+          h(
+            'div',
+            { className: 'dsh-ide-activity' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: `dsh-ide-activity-button${showTree ? ' dsh-ide-activity-button-active' : ''}`,
+                title: showTree ? 'Скрыть проводник' : 'Показать проводник',
+                onClick: () => setShowTree(!showTree),
+              },
+              h(
+                'svg',
+                { width: '18', height: '18', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+                h('path', {
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  strokeWidth: '1.3',
+                  d: 'M2 2.2h8.2L13 5v8.8H2zM10,2.2V5h2.6',
+                }),
+              ),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-activity-button',
+                title: 'Быстрое открытие файла (Ctrl+P)',
+                onClick: openQuick,
+              },
+              h(
+                'svg',
+                { width: '18', height: '18', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+                h('path', {
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  strokeWidth: '1.3',
+                  d: 'M7 2.6a4.4 4.4 0 1 0 0 8.8 4.4 4.4 0 0 0 0-8.8zM10.4 10.4 14 14',
+                }),
+              ),
+            ),
+            h('span', { className: 'dsh-ide-activity-spacer' }),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-activity-button',
+                title: 'Настройки IDE',
+                onClick: () => setSettingsOpen(true),
+              },
+              h('span', { className: 'dsh-ide-activity-glyph' }, '⚙'),
+            ),
+          ),
           showTree && typeof sessionId === 'string'
             ? h(
                 'div',
@@ -1582,6 +1744,31 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dsh-ide-editor' },
             h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab }),
+            consent === undefined
+              ? null
+              : h(
+                  'div',
+                  { className: 'dsh-ide-consent' },
+                  h(
+                    'span',
+                    { className: 'dsh-ide-consent-text' },
+                    `Подсказки отправляют фрагмент файла (до ${preferences === undefined ? 4000 : preferences.contextLeft} символов до курсора и ${preferences === undefined ? 1000 : preferences.contextRight} после) модели ${preferences !== undefined && preferences.completionProvider !== '' ? preferences.completionProvider : 'сессии'}. Включить для этой рабочей папки?`,
+                  ),
+                  h(
+                    'span',
+                    { className: 'dsh-ide-consent-actions' },
+                    h(
+                      'button',
+                      { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: () => void enableSuggestions() },
+                      'Включить',
+                    ),
+                    h(
+                      'button',
+                      { type: 'button', className: 'dsh-ide-button', onClick: () => setConsent(undefined) },
+                      'Не сейчас',
+                    ),
+                  ),
+                ),
             h(
               'div',
               { className: 'dsh-ide-breadcrumbs' },
@@ -1600,8 +1787,9 @@ window.__ModuleLoader__.load({
               ? h(
                   'div',
                   { className: 'dsh-ide-empty' },
+                  h('div', { className: 'dsh-ide-watermark' }, 'IDE'),
                   h('div', { className: 'dsh-ide-empty-title' }, 'Файл не открыт'),
-                  h('div', { className: 'dsh-ide-empty-text' }, 'Выберите файл в проводнике слева или нажмите «Файл», чтобы найти его по имени.'),
+                  h('div', { className: 'dsh-ide-empty-text' }, 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.'),
                 )
               : null,
             h('div', { className: 'dsh-ide-stage', ref: hostRef }),
@@ -1666,7 +1854,24 @@ window.__ModuleLoader__.load({
   border-bottom:1px solid var(--ide-border); flex:0 0 auto; min-height:32px; }
 .dsh-ide-top-title { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-top-spacer { flex:1 1 auto; }
+.dsh-ide-menu { position:absolute; top:31px; left:8px; z-index:8; min-width:230px; display:flex; flex-direction:column;
+  padding:4px; background:var(--ide-panel-2); border:1px solid var(--ide-border); border-radius:6px;
+  box-shadow:0 8px 24px rgba(0,0,0,.45); }
+.dsh-ide-menu-item { display:flex; align-items:center; justify-content:space-between; gap:18px; border:0; border-radius:4px;
+  background:transparent; color:inherit; text-align:left; cursor:pointer; padding:5px 8px; font:inherit; }
+.dsh-ide-menu-item:hover { background:var(--ide-accent); color:#ffffff; }
+.dsh-ide-menu-key { color:var(--ide-muted); font-size:10.5px; }
+.dsh-ide-menu-item:hover .dsh-ide-menu-key { color:#ffffff; }
+.dsh-ide-menu-sep { height:1px; margin:4px 2px; background:var(--ide-border); }
 .dsh-ide-body { display:flex; flex:1 1 auto; min-height:0; }
+.dsh-ide-activity { display:flex; flex-direction:column; align-items:center; gap:2px; flex:0 0 36px; width:36px;
+  padding:4px 0; background:var(--ide-panel-2); border-right:1px solid var(--ide-border); }
+.dsh-ide-activity-button { display:flex; align-items:center; justify-content:center; width:30px; height:30px; border:0;
+  border-radius:4px; background:transparent; color:var(--ide-muted); cursor:pointer; padding:0; }
+.dsh-ide-activity-button:hover { color:var(--ide-text); background:var(--ide-hover); }
+.dsh-ide-activity-button-active { color:var(--ide-text); box-shadow:inset 2px 0 0 var(--ide-accent); }
+.dsh-ide-activity-glyph { font-size:15px; line-height:1; }
+.dsh-ide-activity-spacer { flex:1 1 auto; }
 .dsh-ide-explorer-wrap { flex:0 0 auto; min-width:0; display:flex; background:var(--ide-panel); }
 .dsh-ide-divider { flex:0 0 4px; width:4px; cursor:col-resize; background:transparent; border-right:1px solid var(--ide-border); }
 .dsh-ide-divider:hover { background:var(--ide-accent); }
@@ -1705,8 +1910,7 @@ window.__ModuleLoader__.load({
 .dsh-ide-tab { display:flex; align-items:center; gap:5px; padding:5px 6px 5px 9px; border-right:1px solid var(--ide-border);
   cursor:pointer; max-width:220px; min-width:0; position:relative; color:var(--ide-muted); }
 .dsh-ide-tab:hover { color:var(--ide-text); }
-.dsh-ide-tab-active { background:var(--ide-bg); color:var(--ide-text); }
-.dsh-ide-tab-active::before { content:""; position:absolute; left:0; right:0; top:0; height:1px; background:var(--ide-accent); }
+.dsh-ide-tab-active { background:var(--ide-bg); color:var(--ide-text); box-shadow:inset 0 -1px 0 var(--ide-bg); }
 .dsh-ide-tab-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsh-ide-tab-dirty { color:var(--ide-text); font-size:9px; }
 .dsh-ide-tab-close { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:3px; padding:0 3px;
@@ -1720,14 +1924,22 @@ window.__ModuleLoader__.load({
 .dsh-ide-stage { flex:1 1 auto; min-height:0; }
 .dsh-ide-empty { position:absolute; inset:64px 0 24px; display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:6px; text-align:center; padding:16px; pointer-events:none; }
+.dsh-ide-watermark { font:700 72px/1 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.02em; color:var(--ide-text);
+  opacity:.06; margin-bottom:-4px; }
 .dsh-ide-empty-title { font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-empty-text { max-width:320px; color:var(--ide-muted); font-size:11.5px; }
-.dsh-ide-status { display:flex; align-items:center; gap:10px; flex:0 0 auto; padding:3px 10px; background:var(--ide-panel);
-  border-top:1px solid var(--ide-border); color:var(--ide-muted); font-size:11px; white-space:nowrap; overflow:hidden; }
+.dsh-ide-status { display:flex; align-items:center; gap:12px; flex:0 0 auto; padding:3px 10px; background:var(--ide-accent);
+  color:#ffffff; font-size:11px; white-space:nowrap; overflow:hidden; }
 .dsh-ide-status-text { overflow:hidden; text-overflow:ellipsis; }
-.dsh-ide-status-error { color:var(--ide-error); }
+.dsh-ide-status-error { color:#ffe0d8; font-weight:600; }
 .dsh-ide-status-spacer { flex:1 1 auto; }
 .dsh-ide-status-item { flex:0 0 auto; }
+.dsh-ide-status-item:hover { background:rgba(255,255,255,.12); border-radius:3px; padding:0 3px; margin:0 -3px; }
+.dsh-ide-consent { display:flex; align-items:center; gap:8px; flex:0 0 auto; padding:6px 10px; background:#3a2d1f;
+  border-bottom:1px solid var(--ide-border); color:#e8d6b8; font-size:11.5px; }
+.dsh-ide-root[data-theme="light"] .dsh-ide-consent { background:#fff4d6; color:#4d3a12; }
+.dsh-ide-consent-text { flex:1 1 auto; min-width:0; }
+.dsh-ide-consent-actions { display:flex; gap:6px; flex:0 0 auto; }
 .dsh-ide-settings { position:absolute; inset:0; z-index:6; display:flex; flex-direction:column; background:var(--ide-panel); }
 .dsh-ide-settings-head { display:flex; align-items:center; justify-content:space-between; padding:8px 10px;
   border-bottom:1px solid var(--ide-border); font:600 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }

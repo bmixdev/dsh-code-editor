@@ -34,7 +34,7 @@ import {
   saveCredential,
 } from './catalog.js'
 import { buildContext, postprocessCompletion } from './completion.js'
-import { readPreferences, writePreferences } from './prefs.js'
+import { optedInRoots, readPreferences, writePreferences } from './prefs.js'
 import { listFiles, listTree } from './tree.js'
 import { readSessionState, writeSessionState } from './state.js'
 
@@ -385,6 +385,18 @@ export function apply(ctx, config) {
     }
     if (body.smartTab === true) optedIn.add(scope.cwd)
     else if (body.smartTab === false) optedIn.delete(scope.cwd)
+    if (body.smartTab === true || body.smartTab === false) {
+      // The permission is remembered: an editor restart must not silently turn
+      // completions back off, which reads to the user as "suggestions broke".
+      const roots = optedInRoots(preferences)
+      const next =
+        body.smartTab === true
+          ? roots.includes(scope.cwd)
+            ? roots
+            : [...roots, scope.cwd].slice(-20)
+          : roots.filter((root) => root !== scope.cwd)
+      await writePreferences({ completionOptIn: next })
+    }
     return {
       smartTab: optedIn.has(scope.cwd) && !completionExcluded(document.displayPath) && !excludedFiles.has(fileKey(document.displayPath)),
       fileExcluded: excludedFiles.has(fileKey(document.displayPath)),
@@ -400,7 +412,11 @@ export function apply(ctx, config) {
     if (document === undefined) return fail('no-document', 'Документ не открыт.')
     if (body.sessionId !== document.sessionId) return fail('wrong-session', 'Документ принадлежит другой сессии.')
     if (body.token !== document.token) return fail('stale-client', 'Редактор потерял актуальную версию файла.')
-    if (!optedIn.has(document.workspaceRoot)) {
+    const preferences = await readPreferences()
+    if (
+      !optedIn.has(document.workspaceRoot) &&
+      !optedInRoots(preferences).includes(document.workspaceRoot)
+    ) {
       return fail('not-opted-in', 'Подсказки не включены для этой рабочей папки.')
     }
     if (completionExcluded(document.displayPath)) {
@@ -414,7 +430,6 @@ export function apply(ctx, config) {
     if (rawText.length > MAX_CONTEXT_TEXT_CHARS) {
       return fail('context-too-large', 'Файл слишком велик для подсказок в редакторе.')
     }
-    const preferences = await readPreferences()
     const left = boundedWindow(body.contextLeft, preferences.contextLeft)
     const right = boundedWindow(body.contextRight, preferences.contextRight)
     const context = buildContext({

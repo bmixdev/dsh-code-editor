@@ -29,12 +29,17 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   contextRight: 1000,
   /** Last credential name shown in the API key field. */
   apiKeyRef: '',
+  /** Workspace roots whose owner allowed sending buffer context to the model. */
+  completionOptIn: [],
 })
 
 const LIMITS = {
   contextLeft: [200, 20000],
   contextRight: [0, 8000],
 }
+
+/** How many workspaces may stay opted in at once. */
+const MAX_OPT_IN = 20
 
 /** Absolute path of the preferences file, overridable for tests and portable profiles. */
 export function preferencesPath() {
@@ -67,7 +72,29 @@ function sanitize(patch) {
       result[key] = clampInteger(patch[key], LIMITS[key], DEFAULT_PREFERENCES[key])
     }
   }
+  if (patch.completionOptIn !== undefined) {
+    if (!Array.isArray(patch.completionOptIn)) {
+      throw Object.assign(new Error('Список разрешений должен быть массивом.'), { code: 'bad-request' })
+    }
+    const roots = []
+    for (const candidate of patch.completionOptIn) {
+      const value = String(candidate ?? '').trim()
+      if (value === '' || value.length > 400) continue
+      if (!roots.includes(value)) roots.push(value)
+      if (roots.length >= MAX_OPT_IN) break
+    }
+    result.completionOptIn = roots
+  }
   return result
+}
+
+/**
+ * The workspace roots the user allowed sending buffer context from.
+ * Kept in one place so the editor and the IDE agree on the permission.
+ */
+export function optedInRoots(preferences) {
+  const roots = preferences !== undefined && preferences !== null ? preferences.completionOptIn : undefined
+  return Array.isArray(roots) ? roots.filter((entry) => typeof entry === 'string' && entry !== '') : []
 }
 
 /** Read the preferences, falling back to defaults for anything unreadable. */
