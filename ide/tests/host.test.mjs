@@ -23,6 +23,7 @@ const ROUTES = [
   'tree',
   'files',
   'create',
+  'mkdir',
   'state',
   'catalog',
   'credentials',
@@ -184,6 +185,30 @@ test('a new file is created inside the workspace and never overwrites', async ()
 
     const listing = await app.call('tree', { sessionId: SESSION_ID, path: 'notes' })
     assert.deepEqual(listing.body.entries.map((entry) => entry.name), ['todo.md'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a new folder is created inside the workspace and never replaces one', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+
+    const created = await app.call('mkdir', { sessionId: SESSION_ID, path: 'notes/draft' })
+    assert.equal(created.status, 200)
+    assert.equal(created.body.created, true)
+    const info = await stat(path.join(root, 'notes', 'draft'))
+    assert.equal(info.isDirectory(), true)
+
+    const again = await app.call('mkdir', { sessionId: SESSION_ID, path: 'src' })
+    assert.equal(errorCode(again.body), 'exists')
+
+    const outside = await app.call('mkdir', { sessionId: SESSION_ID, path: '../escape' })
+    assert.equal(errorCode(outside.body), 'bad-request')
+
+    const listing = await app.call('tree', { sessionId: SESSION_ID, path: 'notes' })
+    assert.deepEqual(listing.body.entries.map((entry) => entry.name), ['draft'])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

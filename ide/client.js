@@ -306,6 +306,21 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // Small stroke icons for the explorer toolbar, so the buttons read like
+    // the VS Code explorer instead of relying on font glyphs.
+    function ToolbarIcon({ kind }) {
+      const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-width': 1.3, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }
+      const paths =
+        kind === 'file'
+          ? [h('path', { key: 'a', d: 'M9.5 1.5H4.2a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h7.6a1 1 0 0 0 1-1V5z', ...stroke }), h('path', { key: 'b', d: 'M9.5 1.5V5h3.3', ...stroke }), h('path', { key: 'c', d: 'M8 7.4v4.2M5.9 9.5h4.2', ...stroke })]
+          : kind === 'folder'
+            ? [h('path', { key: 'a', d: 'M1.4 3.4h4.1l1.3 1.5h7.6c.4 0 .8.4.8.8v6.5c0 .4-.4.8-.8.8H1.4a.8.8 0 0 1-.8-.8V4.2c0-.4.4-.8.8-.8z', ...stroke }), h('path', { key: 'b', d: 'M8 6.8v4.2M5.9 8.9h4.2', ...stroke })]
+            : kind === 'refresh'
+              ? [h('path', { key: 'a', d: 'M13.2 8a5.2 5.2 0 1 1-1.6-3.7', ...stroke }), h('path', { key: 'b', d: 'M13.4 1.9v3.4h-3.4', ...stroke })]
+              : [h('path', { key: 'a', d: 'M2 2.5h12M2 8h12M2 13.5h8', ...stroke })]
+      return h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', 'aria-hidden': 'true', className: 'dsh-ide-toolbar-icon' }, paths)
+    }
+
     // ---------------------------------------------------------------- explorer
 
     /**
@@ -479,6 +494,44 @@ window.__ModuleLoader__.load({
               {
                 type: 'button',
                 className: 'dsh-ide-icon-button',
+                title: 'Новый файл…',
+                'aria-label': 'Новый файл',
+                disabled: typeof sessionId !== 'string' || sessionId === '',
+                onClick: () => {
+                  if (typeof props.onNewFile === 'function') props.onNewFile('')
+                },
+              },
+              h(ToolbarIcon, { kind: 'file' }),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-icon-button',
+                title: 'Новая папка…',
+                'aria-label': 'Новая папка',
+                disabled: typeof sessionId !== 'string' || sessionId === '',
+                onClick: () => {
+                  if (typeof props.onNewFolder === 'function') props.onNewFolder('')
+                },
+              },
+              h(ToolbarIcon, { kind: 'folder' }),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-icon-button',
+                title: 'Обновить дерево',
+                onClick: () => setReloadKey((value) => value + 1),
+              },
+              h(ToolbarIcon, { kind: 'refresh' }),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-icon-button',
                 title: 'Свернуть все папки',
                 onClick: () => setExpanded(new Set()),
               },
@@ -493,16 +546,6 @@ window.__ModuleLoader__.load({
                 onClick: () => onToggleHidden(!hidden),
               },
               hidden ? '◉' : '◎',
-            ),
-            h(
-              'button',
-              {
-                type: 'button',
-                className: 'dsh-ide-icon-button',
-                title: 'Обновить дерево',
-                onClick: () => setReloadKey((value) => value + 1),
-              },
-              '⟳',
             ),
           ),
         ),
@@ -2109,11 +2152,12 @@ window.__ModuleLoader__.load({
         withEditor((editor) => editor.updateOptions({ wordWrap: next ? 'on' : 'off' }))
       }
 
-      const createFile = () => {
+      const createFile = (directory = '') => {
+        const base = normalPath(directory)
         setPrompt({
           title: 'Новый файл',
           label: 'Путь относительно рабочей папки',
-          value: '',
+          value: base === '' ? '' : `${base}/`,
           action: 'Создать',
           submit: async (value) => {
             const relative = normalPath(value)
@@ -2130,6 +2174,27 @@ window.__ModuleLoader__.load({
         })
       }
 
+      const createDirectory = (directory = '') => {
+        const base = normalPath(directory)
+        setPrompt({
+          title: 'Новая папка',
+          label: 'Путь относительно рабочей папки',
+          value: base === '' ? '' : `${base}/`,
+          action: 'Создать',
+          submit: async (value) => {
+            const relative = normalPath(value)
+            if (relative === '') return
+            try {
+              await call('mkdir', { sessionId, path: relative })
+              setReloadSignal((previous) => previous + 1)
+              setStatus({ kind: 'ok', message: `Создана папка: ${relative}` })
+            } catch (cause) {
+              setStatus({ kind: 'error', message: describeError(cause) })
+            }
+          },
+        })
+      }
+
       // The same top-level arrangement as VS Code. Commands the IDE cannot honour
       // are disabled with the reason in their tooltip instead of being hidden.
       const menus = [
@@ -2137,7 +2202,8 @@ window.__ModuleLoader__.load({
           id: 'file',
           label: 'Файл',
           items: [
-            { id: 'new', label: 'Новый файл…', run: createFile },
+            { id: 'new', label: 'Новый файл…', run: () => createFile() },
+            { id: 'new-folder', label: 'Новая папка…', run: () => createDirectory() },
             { id: 'open', label: 'Открыть файл…', key: 'Ctrl+P', run: openQuick },
             { separator: true },
             { id: 'save', label: 'Сохранить', key: 'Ctrl+S', run: () => void saveActive() },
@@ -2396,6 +2462,8 @@ window.__ModuleLoader__.load({
                     void openFile(path, { activate: true })
                   },
                   onToggleHidden: setHidden,
+                  onNewFile: createFile,
+                  onNewFolder: createDirectory,
                 }),
               )
             : null,
@@ -2621,6 +2689,8 @@ window.__ModuleLoader__.load({
 .dsh-ide-icon-button { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:4px;
   padding:2px 5px; font:400 12px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-icon-button:hover { background:var(--ide-hover); }
+.dsh-ide-icon-button:disabled { opacity:.45; cursor:default; background:transparent; }
+.dsh-ide-toolbar-icon { display:block; }
 .dsh-ide-icon-button-active { background:var(--ide-active); }
 .dsh-ide-editor { display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; background:var(--ide-bg); position:relative; }
 .dsh-ide-tabs { display:flex; align-items:stretch; flex:0 0 auto; overflow-x:auto; overflow-y:hidden; background:var(--ide-panel-2);
