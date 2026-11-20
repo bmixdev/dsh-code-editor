@@ -39,7 +39,8 @@
   ],
   "scripts": {
     "check": "node scripts/check-manifests.mjs",
-    "test": "node --test tests/completion.test.mjs tests/client-smoke.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs"
+    "test": "node --test tests/completion.test.mjs tests/client-smoke.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs",
+    "test:ide": "node --test ide/tests/host.test.mjs ide/tests/client.test.mjs ide/tests/sync.test.mjs"
   },
   "engines": {
     "node": ">=22"

@@ -95,7 +95,7 @@ export async function buildCatalog(ctx) {
 /** Credential status for one key name, or a clear "not available" answer. */
 export async function credentialStatus(ctx, name) {
   if (typeof credentialsOf(ctx) === 'undefined') {
-    return { ref: name ?? '', supported: false, message: 'Хранилище ключей недоступно в этой сборке.' }
+    return { ref: name ?? '', supported: false, configured: false, message: 'Хранилище ключей недоступно в этой сборке.' }
   }
   const ref = String(name ?? '').trim()
   if (ref === '') return { ref: '', supported: true, configured: false }

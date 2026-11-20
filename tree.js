@@ -138,3 +138,46 @@ export async function listTree(ctx, { cwd, relativePath = '', hidden = false, si
     truncated,
   }
 }
+
+/**
+ * Every file inside the workspace, flattened for the IDE's quick open.
+ *
+ * Breadth-first so the files nearest the root win the budget; the caller gets a
+ * navigator index, not a complete inventory.
+ * @param {object} ctx - Host context carrying `fs`.
+ * @param {{cwd: string, hidden?: boolean, limit?: number, signal?: AbortSignal}} request
+ */
+export async function listFiles(ctx, { cwd, hidden = false, limit = 3000, signal }) {
+  const root = await ctx.fs.resolve(cwd, { signal })
+  const native = ctx.fs.processPath(root)
+  const cap = Math.min(20000, Math.max(1, Math.round(limit)))
+  const files = []
+  const queue = [{ relative: '', absolute: native, depth: 0 }]
+
+  while (queue.length > 0 && files.length < cap) {
+    if (signal?.aborted) throw fail('cancelled', 'Список файлов прерван')
+    const current = queue.shift()
+    let dirents
+    try {
+      dirents = await readdir(current.absolute, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    dirents.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
+    for (const dirent of dirents) {
+      if (files.length >= cap) break
+      const name = dirent.name
+      if (!hidden && name.startsWith('.')) continue
+      const type = kindOf(dirent)
+      const relative = current.relative === '' ? name : `${current.relative}/${name}`
+      if (type === 'directory') {
+        if (SKIPPED.has(name) || current.depth >= 8) continue
+        queue.push({ relative, absolute: path.join(current.absolute, name), depth: current.depth + 1 })
+      } else if (type === 'file') {
+        files.push({ path: relative, name, type })
+      }
+    }
+  }
+
+  return { files, truncated: files.length >= cap, workspaceRoot: native }
+}
