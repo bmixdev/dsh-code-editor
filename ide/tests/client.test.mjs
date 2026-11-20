@@ -124,6 +124,16 @@ test('apply registers the tab type, its slots, the action and the close guard', 
   assert.equal(tabType.id, '@local/dsh-ide')
   assert.equal(tabType.kind, 'dsh-ide')
   assert.equal(tabType.priority, 'fallback')
+  assert.equal(tabType.multiple, false)
+  assert.deepEqual(tabType.patterns, ['dsh-resource://ide/**'])
+  assert.equal(tabType.canOpen('dsh-resource://ide/session/session-1'), true)
+  assert.equal(tabType.canOpen('sidebar://dsh-ide'), true)
+  assert.equal(tabType.canOpen('dsh-resource://file/session/session-1/a.ts'), false)
+
+  assert.equal(tabType.guide.length, 1)
+  assert.equal(tabType.guide[0].id, 'dsh-ide')
+  assert.equal(tabType.guide[0].order, 10)
+  assert.equal(tabType.guide[0].title(), 'IDE')
 
   assert.deepEqual(host.slotInjections, [
     'sidebar.right.pane.tab',
@@ -131,6 +141,7 @@ test('apply registers the tab type, its slots, the action and the close guard', 
     'sidebar.right.tab.document.actions',
     'sidebar.right.tab.files.actions',
     'sidebar.right.tab.guide.actions',
+    'conversation.input.left',
   ])
 
   const action = host.registrations.find((entry) => entry.config.name === 'sidebar.right.tab.document.actions')
@@ -146,6 +157,10 @@ test('apply registers the tab type, its slots, the action and the close guard', 
   assert.ok(guideAction, 'the guide toolbar action is registered')
   assert.equal(guideAction.config.id, 'dsh-ide.open.guide')
 
+  const composerAction = host.registrations.find((entry) => entry.config.name === 'conversation.input.left')
+  assert.ok(composerAction, 'the composer entry is registered')
+  assert.equal(composerAction.config.id, 'dsh-ide.open.composer')
+
   assert.equal(host.closeHandlers.length, 1)
   assert.equal(host.closeHandlers[0].kind, 'dsh-ide')
   assert.doesNotThrow(() => host.closeHandlers[0].handler('session-1', { id: 'tab-1' }))
@@ -157,8 +172,9 @@ test('the tab type titles a workspace tab and a file tab differently', async () 
   plugin.apply(host.ctx)
   const title = host.tabTypes[0].title
 
-  assert.equal(title('dsh-ide://session/session-1'), 'IDE')
-  assert.equal(title('dsh-ide://session/session-1/src/main.ts'), 'main.ts')
+  assert.equal(title('dsh-resource://ide/session/session-1'), 'IDE')
+  assert.equal(title('dsh-resource://ide/session/session-1/src/main.ts'), 'main.ts')
+  assert.equal(title('sidebar://dsh-ide'), 'IDE')
   assert.equal(title('dsh-resource://file/session/session-1/src/main.ts'), 'IDE')
 })
 
@@ -192,11 +208,14 @@ test('every registered component renders its first pass without throwing', async
   plugin.apply(host.ctx)
 
   for (const entry of host.registrations) {
-    const props = entry.config.name === 'sidebar.right.pane.tab' ? { tab: { contentId: 'dsh-ide://session/session-1', id: 'tab-1' } } : {}
+    const props =
+      entry.config.name === 'sidebar.right.pane.tab'
+        ? { tab: { contentId: 'dsh-resource://ide/session/session-1', id: 'tab-1' } }
+        : {}
     assert.doesNotThrow(() => renderText(entry.component(props)), `${entry.config.name} renders`)
   }
 
   const pane = host.registrations.find((entry) => entry.config.name === 'sidebar.right.pane.tab')
-  const text = renderText(pane.component({ tab: { contentId: 'dsh-ide://session/session-1', id: 'tab-1' } }))
+  const text = renderText(pane.component({ tab: { contentId: 'dsh-resource://ide/session/session-1', id: 'tab-1' } }))
   assert.match(text, /IDE/)
 })

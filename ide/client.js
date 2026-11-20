@@ -8,8 +8,9 @@
  * the tab is spawned.
  *
  * Entry points:
- *  - an "IDE" action on the document preview toolbar;
- *  - any `dsh-ide://session/<id>[/<path>]` address opened with kind `dsh-ide`.
+ *  - the "IDE" button in the composer tool row (always visible in a session);
+ *  - an "IDE" action on the document, files and guide toolbars;
+ *  - any `dsh-resource://ide/session/<id>[/<path>]` address opened with kind `dsh-ide`.
  *
  * Monaco is vendored (ide/vendor/vs) and served by the Host half at /ide/vs, so
  * nothing is fetched from a CDN.
@@ -30,7 +31,17 @@ window.__ModuleLoader__.load({
     ]
     const API_BASE = '/api/ide/'
     const ASSET_BASE = '/ide/vs'
-    const ADDRESS_PREFIX = 'dsh-ide://session/'
+    // Sidebar tab addresses must live under the shell's resource scheme, or the
+    // sidebar refuses to place the tab at all.
+    const ADDRESS_PREFIX = 'dsh-resource://ide/session/'
+    const LEGACY_PREFIX = 'dsh-ide://session/'
+    // Glob: the registry matches `patterns` with picomatch over the whole
+    // address (any pattern containing ':' is compared to the full string).
+    const ADDRESS_PATTERN = 'dsh-resource://ide/**'
+    // `multiple: false` tab types are opened by kind on a synthetic page
+    // address; the guide row in the Start panel uses exactly this route.
+    const PAGE_ADDRESS = `sidebar://${TAB_KIND}`
+    const GUIDE_ENTRY_ID = 'dsh-ide'
 
     /** Pause the explorer writes so typing does not spam the Host. */
     const STATE_WRITE_DELAY_MS = 400
@@ -69,8 +80,14 @@ window.__ModuleLoader__.load({
     }
 
     function parseAddress(address) {
-      if (typeof address !== 'string' || !address.startsWith(ADDRESS_PREFIX)) return undefined
-      const rest = address.slice(ADDRESS_PREFIX.length).split('?')[0].split('#')[0]
+      if (typeof address !== 'string') return undefined
+      // The workspace page (`sidebar://dsh-ide`) carries no session of its own;
+      // the pane learns it from the slot props instead.
+      if (address === PAGE_ADDRESS) return { sessionId: undefined, path: '' }
+      const prefix =
+        address.startsWith(ADDRESS_PREFIX) ? ADDRESS_PREFIX : address.startsWith(LEGACY_PREFIX) ? LEGACY_PREFIX : undefined
+      if (prefix === undefined) return undefined
+      const rest = address.slice(prefix.length).split('?')[0].split('#')[0]
       const segments = rest.split('/').filter((segment) => segment !== '')
       if (segments.length === 0) return undefined
       const decoded = segments.map((segment) => {
@@ -83,6 +100,60 @@ window.__ModuleLoader__.load({
       const sessionId = decoded.shift()
       if (typeof sessionId !== 'string' || sessionId === '') return undefined
       return { sessionId, path: decoded.join('/') }
+    }
+
+    // Addresses of the built-in document preview, e.g.
+    // `dsh-resource://file/session/<id>/src/main.ts`. The IDE button lives in
+    // that tab's toolbar, so it must understand the same scheme.
+    const FILE_ADDRESS_PREFIX = 'dsh-resource://file/session/'
+
+    function parseFileAddress(address) {
+      if (typeof address !== 'string' || !address.startsWith(FILE_ADDRESS_PREFIX)) return undefined
+      const rest = address.slice(FILE_ADDRESS_PREFIX.length).split('?')[0].split('#')[0]
+      const segments = rest.split('/').filter((segment) => segment !== '')
+      if (segments.length === 0) return undefined
+      const decoded = segments.map((segment) => {
+        try {
+          return decodeURIComponent(segment)
+        } catch {
+          return segment
+        }
+      })
+      const sessionId = decoded.shift()
+      if (typeof sessionId !== 'string' || sessionId === '') return undefined
+      return { sessionId, path: decoded.join('/') }
+    }
+
+    // The IDE keeps one tab per session, so a requested file cannot travel in
+    // the tab address: opening another address would stack another tab. Buttons
+    // leave the request here and an already mounted pane consumes it.
+    const pendingOpens = new Map()
+    const openListeners = new Set()
+    let openNonce = 0
+
+    function requestOpen(sessionId, filePath) {
+      const path = normalPath(filePath)
+      const request = { path, nonce: ++openNonce }
+      pendingOpens.set(sessionId, request)
+      for (const listener of openListeners) {
+        try {
+          listener(sessionId, request)
+        } catch {
+          /* a broken listener must not block the open */
+        }
+      }
+      return request
+    }
+
+    function subscribeOpens(listener) {
+      openListeners.add(listener)
+      return () => {
+        openListeners.delete(listener)
+      }
+    }
+
+    function latestOpen(sessionId) {
+      return pendingOpens.get(sessionId)
     }
 
     function baseName(filePath) {
@@ -939,9 +1010,9 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
       const tab = tabOf(props)
-      const parsed = tab && typeof tab.contentId === 'string' ? parseAddress(tab.contentId) : undefined
+      const fromTab = tab && typeof tab.contentId === 'string' ? parseAddress(tab.contentId) ?? parseFileAddress(tab.contentId) : undefined
       const absolutePath =
-        props && typeof props.absolutePath === 'string' ? props.absolutePath : parsed !== undefined ? parsed.path : ''
+        props && typeof props.absolutePath === 'string' ? props.absolutePath : fromTab !== undefined ? fromTab.path : ''
       const label = props && typeof props.label === 'string' ? props.label : 'IDE'
       const providedSession = props && typeof props.sessionId === 'string' ? props.sessionId : ''
 
@@ -951,6 +1022,7 @@ window.__ModuleLoader__.load({
           setBusy(true)
           try {
             let sessionId = providedSession !== '' ? providedSession : sessionIdFromElement(event && event.currentTarget)
+            if (sessionId === undefined && fromTab !== undefined) sessionId = fromTab.sessionId
             if (sessionId === undefined) {
               if (absolutePath === '') {
                 setError('Не удалось определить сессию')
@@ -964,23 +1036,34 @@ window.__ModuleLoader__.load({
               return
             }
             const sidebar = services.sidebarRight
-            if (!sidebar || typeof sidebar.openResource !== 'function') {
+            if (!sidebar) {
               setError('Правая панель недоступна')
               return
             }
-            sidebar.openResource(fileAddress(sessionId, absolutePath), { kind: TAB_KIND })
+            requestOpen(sessionId, absolutePath)
+            // One IDE tab per session: `multiple: false` makes every open land
+            // on the same page address, so the tab is revealed instead of stacked.
+            if (typeof sidebar.openTabIn === 'function') {
+              sidebar.openTabIn(sessionId, TAB_KIND, {})
+            } else if (typeof sidebar.openTab === 'function') {
+              sidebar.openTab(TAB_KIND, {})
+            } else if (typeof sidebar.openResourceIn === 'function') {
+              sidebar.openResourceIn(sessionId, fileAddress(sessionId, ''), { kind: TAB_KIND })
+            } else {
+              setError('Правая панель недоступна')
+            }
           } catch (cause) {
             setError(describeError(cause))
           } finally {
             setBusy(false)
           }
         },
-        [absolutePath, providedSession],
+        [absolutePath, fromTab, providedSession],
       )
 
       return h(
         'span',
-        { className: 'dsh-ide-action' },
+        { className: props && props.compact === true ? 'dsh-ide-action dsh-ide-action-compact' : 'dsh-ide-action' },
         h(
           'button',
           {
@@ -1000,7 +1083,10 @@ window.__ModuleLoader__.load({
       const tab = tabOf(props)
       const address = tab && typeof tab.contentId === 'string' ? tab.contentId : ''
       const parsed = parseAddress(address)
-      const sessionId = parsed !== undefined ? parsed.sessionId : undefined
+      // The workspace page address carries no session; session-scoped slots hand
+      // it over in props instead.
+      const providedSession = props && typeof props.sessionId === 'string' ? props.sessionId : ''
+      const sessionId = parsed !== undefined && parsed.sessionId !== undefined ? parsed.sessionId : providedSession || undefined
       const initialPath = parsed !== undefined ? parsed.path : ''
 
       const hostRef = React.useRef(null)
@@ -1346,6 +1432,23 @@ window.__ModuleLoader__.load({
         void openFile(initialPath, { activate: true })
       }, [booted, initialPath, openFile])
 
+      // Buttons request a file through `requestOpen` instead of changing the tab
+      // address, so the pane only has one tab to reveal. Consume the latest
+      // request when it mounts, then stay subscribed for later clicks.
+      const consumedOpen = React.useRef(0)
+      React.useEffect(() => {
+        if (!booted || typeof sessionId !== 'string' || sessionId === '') return
+        const apply = (request) => {
+          if (request === undefined || request.path === '' || request.nonce <= consumedOpen.current) return
+          consumedOpen.current = request.nonce
+          void openFile(request.path, { activate: true })
+        }
+        apply(latestOpen(sessionId))
+        return subscribeOpens((target, request) => {
+          if (target === sessionId) apply(request)
+        })
+      }, [booted, sessionId, openFile])
+
       const tabsKey = tabs.map((candidate) => candidate.path).join('\n')
       React.useEffect(() => {
         if (!booted || typeof sessionId !== 'string' || sessionId === '') return
@@ -1672,6 +1775,8 @@ window.__ModuleLoader__.load({
 .dsh-ide-action-button:hover:not(:disabled) { background:var(--dsh-hover, rgba(127,127,127,.14)); }
 .dsh-ide-action-button:disabled { opacity:.5; cursor:default; }
 .dsh-ide-action-error { color:#d9534f; font-weight:700; cursor:help; }
+.dsh-ide-action-compact .dsh-ide-action-button { padding:1px 6px; font-size:10px; line-height:1.4;
+  letter-spacing:.4px; text-transform:uppercase; }
 `
 
     function injectStyles() {
@@ -1702,10 +1807,23 @@ window.__ModuleLoader__.load({
             id: TAB_ID,
             kind: TAB_KIND,
             priority: 'fallback',
+            multiple: false,
+            patterns: [ADDRESS_PATTERN],
+            canOpen: (candidate) => parseAddress(candidate) !== undefined,
             title: (candidate) => {
               const parsed = parseAddress(candidate)
               return parsed === undefined || parsed.path === '' ? 'IDE' : baseName(parsed.path)
             },
+            // The Start panel lists one row per guide entry, and the row opens
+            // the tab by kind — this is the entry point with no prerequisites.
+            guide: [
+              {
+                id: GUIDE_ENTRY_ID,
+                order: 10,
+                title: () => 'IDE',
+                description: () => 'Редактор с деревом файлов и вкладками',
+              },
+            ],
           })
           return () => {
             dispose()
@@ -1733,6 +1851,15 @@ window.__ModuleLoader__.load({
         for (const [slot, id, order, label] of ACTION_SLOTS) {
           ctx.slots.inject(slot, () => ctx.slots.register({ name: slot, id, order, label }, OpenIdeButton))
         }
+
+        // The composer row is always on screen inside a session, so this is the
+        // entry point that does not depend on any other panel being open.
+        ctx.slots.inject('conversation.input.left', () =>
+          ctx.slots.register(
+            { name: 'conversation.input.left', id: `${ACTION_ID}.composer`, order: 40, label: 'IDE' },
+            (props) => h(OpenIdeButton, { ...props, compact: true, absolutePath: '' }),
+          ),
+        )
       },
     }
 
