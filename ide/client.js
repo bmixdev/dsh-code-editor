@@ -665,7 +665,9 @@ window.__ModuleLoader__.load({
         }
 
         const rootListing = cache.get('')
-        const rootName = rootListing === undefined ? '' : baseName(String(rootListing.workspaceRoot === undefined ? '' : rootListing.workspaceRoot).replace(/[\\/]+$/, ''))
+        const rootAbsolute = rootListing === undefined || rootListing.workspaceRoot === undefined ? '' : String(rootListing.workspaceRoot)
+        const rootParts = rootAbsolute.replace(/[\\/]+$/, '').split(/[\\/]/)
+        const rootName = rootParts.length === 0 ? '' : rootParts[rootParts.length - 1]
         rows.push(
           h(
             'button',
