@@ -933,7 +933,11 @@ window.__ModuleLoader__.load({
     function OpenIdeButton(props) {
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
-      const absolutePath = props && typeof props.absolutePath === 'string' ? props.absolutePath : undefined
+      const tab = tabOf(props)
+      const parsed = tab && typeof tab.contentId === 'string' ? parseAddress(tab.contentId) : undefined
+      const absolutePath =
+        props && typeof props.absolutePath === 'string' ? props.absolutePath : parsed !== undefined ? parsed.path : ''
+      const label = props && typeof props.label === 'string' ? props.label : 'IDE'
 
       const open = React.useCallback(
         async (event) => {
@@ -942,7 +946,7 @@ window.__ModuleLoader__.load({
           try {
             let sessionId = sessionIdFromElement(event && event.currentTarget)
             if (sessionId === undefined) {
-              if (absolutePath === undefined) {
+              if (absolutePath === '') {
                 setError('Не удалось определить сессию')
                 return
               }
@@ -958,7 +962,7 @@ window.__ModuleLoader__.load({
               setError('Правая панель недоступна')
               return
             }
-            sidebar.openResource(fileAddress(sessionId, absolutePath || ''), { kind: TAB_KIND })
+            sidebar.openResource(fileAddress(sessionId, absolutePath), { kind: TAB_KIND })
           } catch (cause) {
             setError(describeError(cause))
           } finally {
@@ -980,7 +984,7 @@ window.__ModuleLoader__.load({
             disabled: busy,
             title: error === '' ? 'Открыть рабочую область в IDE' : error,
           },
-          'IDE',
+          label,
         ),
         error === '' ? null : h('span', { className: 'dsh-ide-action-error', title: error }, '!'),
       )
