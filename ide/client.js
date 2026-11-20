@@ -351,6 +351,21 @@ window.__ModuleLoader__.load({
       // the name is typed straight into the tree instead of a modal dialog.
       const [draft, setDraft] = React.useState(undefined)
       const [draftError, setDraftError] = React.useState('')
+      const [rootOpen, setRootOpen] = React.useState(true)
+      const expandedRef = React.useRef(new Set())
+      const selected = props.selected
+      const selectRow = (path, type) => {
+        if (typeof props.onSelect === 'function') props.onSelect(path, type)
+      }
+      React.useEffect(() => {
+        expandedRef.current = expanded
+      }, [expanded])
+      // New files and folders land in the selected folder, or next to the
+      // selected file, exactly like the VS Code explorer.
+      const targetDirectory = () => {
+        if (selected === undefined || typeof selected.path !== 'string') return ''
+        return selected.type === 'directory' ? selected.path : dirName(selected.path)
+      }
       const createRequest = props.createRequest
       const createNonce = createRequest === undefined ? 0 : createRequest.nonce
 
@@ -433,11 +448,25 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         setExpanded(new Set())
+        expandedRef.current = new Set()
         setCache(new Map())
         setFlat(undefined)
         setFlatError('')
         if (typeof sessionId === 'string' && sessionId !== '') void load('')
-      }, [sessionId, hidden, reloadKey, reloadSignal, load])
+      }, [sessionId, hidden, load])
+
+      // Refreshing keeps the expanded folders open, the way VS Code does: only
+      // the listings are reloaded, not the tree layout.
+      const firstRefresh = React.useRef(true)
+      React.useEffect(() => {
+        if (firstRefresh.current) {
+          firstRefresh.current = false
+          return
+        }
+        if (typeof sessionId !== 'string' || sessionId === '') return
+        void load('')
+        for (const directory of expandedRef.current) void load(directory)
+      }, [reloadKey, reloadSignal])
 
       const needle = query.trim().toLowerCase()
 
@@ -449,6 +478,7 @@ window.__ModuleLoader__.load({
         setDraft({ type: createRequest.type, directory, value: '' })
         setDraftError('')
         setQuery('')
+        setRootOpen(true)
         if (directory !== '') {
           setExpanded((previous) => {
             const next = new Set(previous)
@@ -557,12 +587,16 @@ window.__ModuleLoader__.load({
                 {
                   key: `m:${file.path}`,
                   type: 'button',
-                  className: `dsh-ide-row${file.path === activePath ? ' dsh-ide-row-active' : ''}`,
+                  className: `dsh-ide-row${file.path === activePath ? ' dsh-ide-row-active' : ''}${selected !== undefined && selected.path === file.path ? ' dsh-ide-row-selected' : ''}`,
                   style: { paddingLeft: '8px' },
                   title: file.path,
-                  onClick: () => onOpenFile(file.path),
+                  onClick: () => {
+                    selectRow(file.path, file.type === 'directory' ? 'directory' : 'file')
+                    onOpenFile(file.path)
+                  },
                   onContextMenu: (event) => {
                     event.preventDefault()
+                    selectRow(file.path, file.type === 'directory' ? 'directory' : 'file')
                     setRowMenu({ ...menuPoint(event), path: file.path, name: file.name, type: file.type === 'directory' ? 'directory' : 'file' })
                   },
                 },
@@ -589,18 +623,24 @@ window.__ModuleLoader__.load({
             const path = directory === '' ? entry.name : `${directory}/${entry.name}`
             const isDirectory = entry.type === 'directory'
             const open = isDirectory && expanded.has(path)
+            const selectedClass = selected !== undefined && selected.path === path ? ' dsh-ide-row-selected' : ''
             rows.push(
               h(
                 'button',
                 {
                   key: path,
                   type: 'button',
-                  className: `dsh-ide-row${path === activePath ? ' dsh-ide-row-active' : ''}`,
+                  className: `dsh-ide-row${path === activePath ? ' dsh-ide-row-active' : ''}${selectedClass}`,
                   style: { paddingLeft: `${6 + depth * 12}px` },
                   title: path,
-                  onClick: () => (isDirectory ? toggle(path, cache.has(path)) : onOpenFile(path)),
+                  onClick: () => {
+                    selectRow(path, isDirectory ? 'directory' : 'file')
+                    if (isDirectory) toggle(path, cache.has(path))
+                    else onOpenFile(path)
+                  },
                   onContextMenu: (event) => {
                     event.preventDefault()
+                    selectRow(path, isDirectory ? 'directory' : 'file')
                     setRowMenu({ ...menuPoint(event), path, name: entry.name, type: isDirectory ? 'directory' : 'file' })
                   },
                 },
@@ -623,7 +663,35 @@ window.__ModuleLoader__.load({
             if (draftError !== '') rows.push(h('div', { key: `draft-error:${directory}`, className: 'dsh-ide-tree-error', style: { paddingLeft: `${10 + depth * 12}px` } }, draftError))
           }
         }
-        walk('', 0)
+
+        const rootListing = cache.get('')
+        const rootName = rootListing === undefined ? '' : baseName(String(rootListing.workspaceRoot === undefined ? '' : rootListing.workspaceRoot).replace(/[\\/]+$/, ''))
+        rows.push(
+          h(
+            'button',
+            {
+              key: 'root',
+              type: 'button',
+              className: `dsh-ide-row dsh-ide-row-root${rootOpen ? '' : ' dsh-ide-row-collapsed'}${selected !== undefined && selected.path === '' ? ' dsh-ide-row-selected' : ''}`,
+              style: { paddingLeft: '6px' },
+              title: rootListing === undefined ? '' : String(rootListing.workspaceRoot),
+              onClick: () => {
+                selectRow('', 'directory')
+                setRootOpen((previous) => !previous)
+              },
+              onContextMenu: (event) => {
+                event.preventDefault()
+                selectRow('', 'directory')
+                setRowMenu({ ...menuPoint(event), path: '', name: rootName, type: 'directory' })
+              },
+            },
+            h('span', { className: `dsh-ide-caret${rootOpen ? ' dsh-ide-caret-open' : ''}` }, '▸'),
+            h(FolderIcon, { open: rootOpen }),
+            h('span', { className: 'dsh-ide-row-name dsh-ide-row-root-name' }, rootName === '' ? 'Рабочая папка' : rootName),
+          ),
+        )
+        if (rootOpen) walk('', 1)
+        if (rootListing === undefined) rows.push(h('div', { key: 'loading', className: 'dsh-ide-tree-empty', style: { paddingLeft: '20px' } }, pending === '' ? 'Загрузка…' : 'Читаю папку…'))
         if (error !== '') rows.unshift(h('div', { key: 'tree-error', className: 'dsh-ide-tree-error' }, error))
       }
 
@@ -646,7 +714,7 @@ window.__ModuleLoader__.load({
                 'aria-label': 'Новый файл',
                 disabled: typeof sessionId !== 'string' || sessionId === '',
                 onClick: () => {
-                  if (typeof props.onNewFile === 'function') props.onNewFile('')
+                  if (typeof props.onNewFile === 'function') props.onNewFile(targetDirectory())
                 },
               },
               h(ToolbarIcon, { kind: 'file' }),
@@ -660,7 +728,7 @@ window.__ModuleLoader__.load({
                 'aria-label': 'Новая папка',
                 disabled: typeof sessionId !== 'string' || sessionId === '',
                 onClick: () => {
-                  if (typeof props.onNewFolder === 'function') props.onNewFolder('')
+                  if (typeof props.onNewFolder === 'function') props.onNewFolder(targetDirectory())
                 },
               },
               h(ToolbarIcon, { kind: 'folder' }),
@@ -1818,6 +1886,15 @@ window.__ModuleLoader__.load({
       const [fontSize, setFontSize] = React.useState(13)
       const [wordWrap, setWordWrap] = React.useState(false)
       const [booted, setBooted] = React.useState(false)
+      const [selected, setSelected] = React.useState(undefined)
+      const selectedRef = React.useRef(undefined)
+      selectedRef.current = selected
+      // The explorer's selected folder decides where a new file or folder goes.
+      const selectionDirectory = () => {
+        const value = selectedRef.current
+        if (value === undefined || typeof value.path !== 'string') return ''
+        return value.type === 'directory' ? value.path : dirName(value.path)
+      }
 
       const stateRef = React.useRef({})
       stateRef.current = { tabs, activeKey, sessionId, preferences }
@@ -1849,6 +1926,7 @@ window.__ModuleLoader__.load({
           }
           setTabs((previous) => (previous.some((candidate) => candidate.path === normalized) ? previous : [...previous, entry]))
           if (options === undefined || options.activate !== false) setActiveKey(entry.key)
+          setSelected({ path: normalized, type: 'file' })
           setStatus({ kind: 'idle', message: '' })
           return entry
         } catch (cause) {
@@ -2379,7 +2457,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const createFile = (directory = '') => beginCreate('file', directory)
+      const createFile = (directory) => beginCreate('file', directory === undefined ? selectionDirectory() : directory)
 
       const renamePath = (path, name) => {
         setPrompt({
@@ -2411,7 +2489,7 @@ window.__ModuleLoader__.load({
         setDialog({ mode: 'delete', path, name, type })
       }
 
-      const createDirectory = (directory = '') => beginCreate('directory', directory)
+      const createDirectory = (directory) => beginCreate('directory', directory === undefined ? selectionDirectory() : directory)
 
       // The same top-level arrangement as VS Code. Commands the IDE cannot honour
       // are disabled with the reason in their tooltip instead of being hidden.
@@ -2682,6 +2760,8 @@ window.__ModuleLoader__.load({
                   onToggleHidden: setHidden,
                   createRequest,
                   onCreate: submitCreate,
+                  selected,
+                  onSelect: (path, type) => setSelected({ path, type }),
                   onNewFile: createFile,
                   onNewFolder: createDirectory,
                   onRename: renamePath,
@@ -2820,11 +2900,11 @@ window.__ModuleLoader__.load({
     const STYLES = `
 .dsh-ide-root { display:flex; flex-direction:column; height:100%; min-height:0; position:relative;
   --ide-bg:#1e1e1e; --ide-panel:#252526; --ide-panel-2:#2d2d2d; --ide-border:#3c3c3c; --ide-text:#cccccc;
-  --ide-muted:#8a8a8a; --ide-hover:#2a2d2e; --ide-active:#37373d; --ide-accent:#007acc; --ide-error:#f48771;
+  --ide-muted:#8a8a8a; --ide-hover:#2a2d2e; --ide-active:#37373d; --ide-select:#094771; --ide-accent:#007acc; --ide-error:#f48771;
   background:var(--ide-bg); color:var(--ide-text);
   font:400 12px/1.45 var(--dsh-font-ui, system-ui, -apple-system, Segoe UI, sans-serif); }
 .dsh-ide-root[data-theme="light"] { --ide-bg:#ffffff; --ide-panel:#f3f3f3; --ide-panel-2:#ececec; --ide-border:#e2e2e2;
-  --ide-text:#2b2b2b; --ide-muted:#6b6b6b; --ide-hover:#e8e8e8; --ide-active:#e4e6f1; --ide-accent:#0066bf; --ide-error:#b5200d; }
+  --ide-text:#2b2b2b; --ide-muted:#6b6b6b; --ide-hover:#e8e8e8; --ide-active:#e4e6f1; --ide-select:#cce4ff; --ide-accent:#0066bf; --ide-error:#b5200d; }
 .dsh-ide-root * { box-sizing:border-box; }
 .dsh-ide-top { display:flex; align-items:center; gap:6px; padding:3px 8px; background:var(--ide-panel);
   border-bottom:1px solid var(--ide-border); flex:0 0 auto; min-height:32px; }
@@ -2901,6 +2981,10 @@ window.__ModuleLoader__.load({
   text-align:left; cursor:pointer; padding:2px 6px 2px 6px; font:inherit; line-height:18px; white-space:nowrap; }
 .dsh-ide-row:hover { background:var(--ide-hover); }
 .dsh-ide-row-active { background:var(--ide-active); }
+.dsh-ide-row-selected { background:var(--ide-select); }
+.dsh-ide-row-root { font-weight:600; }
+.dsh-ide-row-root-name { color:var(--ide-text); }
+.dsh-ide-row-collapsed { opacity:.85; }
 .dsh-ide-row-name { overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-row-dim { color:var(--ide-muted); overflow:hidden; text-overflow:ellipsis; max-width:60%; }
 .dsh-ide-row-tag { color:var(--ide-muted); font-size:10px; }
