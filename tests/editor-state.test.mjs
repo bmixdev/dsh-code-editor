@@ -1,4 +1,4 @@
-﻿import assert from 'node:assert/strict'
+import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -239,7 +239,7 @@ test('credentials route validates the key name, stores, reports, and clears', as
   const credentials = {
     async describe(ref) {
       return store.has(ref)
-        ? { configured: true, source: 'store', writable: true, masked: 'sk-вЂ¦abcd' }
+        ? { configured: true, source: 'store', writable: true, masked: 'sk-…abcd' }
         : { configured: false, writable: true }
     },
     async set(ref, value) {
@@ -265,7 +265,7 @@ test('credentials route validates the key name, stores, reports, and clears', as
 
     const saved = await app.call('credentials', { op: 'set', ref: 'FIXTURE_API_KEY', value: 'sk-live-123' })
     assert.equal(saved.body.configured, true)
-    assert.equal(saved.body.masked, 'sk-вЂ¦abcd')
+    assert.equal(saved.body.masked, 'sk-…abcd')
     assert.equal(store.get('FIXTURE_API_KEY'), 'sk-live-123')
 
     const cleared = await app.call('credentials', { op: 'clear', ref: 'FIXTURE_API_KEY' })
