@@ -1465,24 +1465,34 @@ window.__ModuleLoader__.load({
         return true
       }
 
-      const removeTab = (key) => {
-        const model = runtime.current.models.get(key)
-        const editor = runtime.current.editor
-        if (model !== undefined) {
-          if (editor !== undefined && editor.getModel() === model) editor.setModel(null)
-          runtime.current.modelTabs.delete(model.uri.toString())
-          model.dispose()
-          runtime.current.models.delete(key)
+      const removeTabs = (keys) => {
+        const removing = new Set(keys)
+        if (removing.size === 0) return
+        for (const key of removing) {
+          const model = runtime.current.models.get(key)
+          const editor = runtime.current.editor
+          if (model !== undefined) {
+            if (editor !== undefined && editor.getModel() === model) editor.setModel(null)
+            runtime.current.modelTabs.delete(model.uri.toString())
+            model.dispose()
+            runtime.current.models.delete(key)
+          }
+          runtime.current.views.delete(key)
+          dirtyTabs.delete(key)
         }
-        runtime.current.views.delete(key)
         const current = stateRef.current.tabs
-        const index = current.findIndex((candidate) => candidate.key === key)
-        const next = current.filter((candidate) => candidate.key !== key)
+        const next = current.filter((candidate) => !removing.has(candidate.key))
+        const active = stateRef.current.activeKey
         setTabs(next)
-        if (stateRef.current.activeKey === key) {
+        if (removing.has(active)) {
+          const index = current.findIndex((candidate) => candidate.key === active)
           if (next.length === 0) setActiveKey('')
-          else setActiveKey((next[Math.min(index, next.length - 1)] || next[0]).key)
+          else setActiveKey((next[Math.min(Math.max(index, 0), next.length - 1)] || next[0]).key)
         }
+      }
+
+      const removeTab = (key) => {
+        removeTabs([key])
       }
 
       const closeTab = (key) => {
@@ -1812,11 +1822,18 @@ window.__ModuleLoader__.load({
         }
         if (current.mode === 'close-many') {
           if (mode === 'save') {
-            for (const key of current.keys) await saveKey(key)
-          } else {
-            for (const key of current.keys) dirtyTabs.delete(key)
+            const kept = []
+            for (const key of current.keys) {
+              const saved = await saveKey(key)
+              if (!saved) kept.push(key)
+            }
+            if (kept.length > 0) {
+              setStatus({ kind: 'error', message: 'Не удалось сохранить часть вкладок — они остались открытыми.' })
+              removeTabs(current.keys.filter((key) => !kept.includes(key)))
+              return
+            }
           }
-          for (const key of current.keys) removeTab(key)
+          removeTabs(current.keys)
           return
         }
         if (mode === 'save') {
@@ -1851,7 +1868,7 @@ window.__ModuleLoader__.load({
           setDialog({ mode: 'close-many', keys: targets.map((candidate) => candidate.key) })
           return
         }
-        for (const candidate of targets) removeTab(candidate.key)
+        removeTabs(targets.map((candidate) => candidate.key))
       }
 
       const closeAllTabs = () => closeMany(stateRef.current.tabs.map((candidate) => candidate.key))
