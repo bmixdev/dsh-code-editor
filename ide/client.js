@@ -1796,6 +1796,21 @@ window.__ModuleLoader__.load({
           ],
         },
         {
+          id: 'view',
+          label: 'Вид',
+          items: [
+            { id: 'word-wrap', label: wordWrap ? 'Отключить перенос по словам' : 'Включить перенос по словам', run: toggleWordWrap },
+            { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показывать скрытые файлы', run: () => setHidden(!hidden) },
+            { separator: true },
+            { id: 'zoom-in', label: 'Увеличить шрифт', run: () => zoom(1) },
+            { id: 'zoom-out', label: 'Уменьшить шрифт', run: () => zoom(-1) },
+            { id: 'zoom-reset', label: 'Сбросить размер шрифта', run: () => zoom(13 - fontSize) },
+            { separator: true },
+            { id: 'settings', label: 'Настройки IDE…', run: () => setSettingsOpen(true) },
+            { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
+          ],
+        },
+        {
           id: 'go',
           label: 'Переход',
           items: [
@@ -1828,18 +1843,18 @@ window.__ModuleLoader__.load({
           ],
         },
         {
-          id: 'view',
-          label: 'Вид',
+          id: 'run',
+          label: 'Запуск',
           items: [
-            { id: 'word-wrap', label: wordWrap ? 'Отключить перенос по словам' : 'Включить перенос по словам', run: toggleWordWrap },
-            { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показывать скрытые файлы', run: () => setHidden(!hidden) },
+            {
+              id: 'run-no-debug',
+              label: 'Запуск без отладки',
+              disabled: true,
+              hint: 'Запуск кода в DSH выполняют терминал и инструменты агента; у IDE нет доступа к PTY.',
+            },
+            { id: 'run-start', label: 'Запуск с отладкой', disabled: true, hint: 'Отладчика в бандле нет.' },
             { separator: true },
-            { id: 'zoom-in', label: 'Увеличить шрифт', run: () => zoom(1) },
-            { id: 'zoom-out', label: 'Уменьшить шрифт', run: () => zoom(-1) },
-            { id: 'zoom-reset', label: 'Сбросить размер шрифта', run: () => zoom(13 - fontSize) },
-            { separator: true },
-            { id: 'settings', label: 'Настройки IDE…', run: () => setSettingsOpen(true) },
-            { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
+            { id: 'run-config', label: 'Открыть launch.json', disabled: true, hint: 'Конфигурации запуска VS Code к IDE не применимы.' },
           ],
         },
         {
