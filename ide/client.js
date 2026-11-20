@@ -864,7 +864,199 @@ window.__ModuleLoader__.load({
       return `${String(provider || 'PROVIDER').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`
     }
 
-    function SettingsPanel({ preferences, sessionModel, onClose, onSave }) {
+    // Continue-style "connect a model" dialog: provider, model, key, one button.
+    function ModelDialog({ preferences, sessionModel, onClose, onConnected }) {
+      const [catalog, setCatalog] = React.useState(undefined)
+      const [provider, setProvider] = React.useState(preferences.completionProvider || '')
+      const [model, setModel] = React.useState(preferences.completionModel || '')
+      const [keyValue, setKeyValue] = React.useState('')
+      const [keyStatus, setKeyStatus] = React.useState(undefined)
+      const [busy, setBusy] = React.useState(false)
+      const [message, setMessage] = React.useState('')
+      const [connected, setConnected] = React.useState(false)
+
+      React.useEffect(() => {
+        let cancelled = false
+        void (async () => {
+          try {
+            const payload = await call('catalog', {})
+            if (!cancelled) setCatalog(payload)
+          } catch (cause) {
+            if (!cancelled) setMessage(describeError(cause))
+          }
+        })()
+        return () => {
+          cancelled = true
+        }
+      }, [])
+
+      const groups = catalog !== undefined && Array.isArray(catalog.groups) ? catalog.groups : []
+      const configurable = catalog !== undefined && Array.isArray(catalog.configurable) ? catalog.configurable : []
+      const sessionProvider = sessionModel !== undefined && sessionModel !== null ? sessionModel.provider : ''
+      const effectiveProvider = provider !== '' ? provider : sessionProvider
+      const group = groups.find((entry) => entry.id === effectiveProvider)
+      const profile = configurable.find((entry) => entry.provider === effectiveProvider)
+      const models = group === undefined ? [] : group.models
+      const fallbackModel = models.length > 0 ? models[0].id : ''
+      const effectiveModel = model !== '' ? model : fallbackModel
+      const keyRef = providerKeyName(profile, effectiveProvider)
+
+      React.useEffect(() => {
+        let cancelled = false
+        void (async () => {
+          if (keyRef === '') {
+            setKeyStatus(undefined)
+            return
+          }
+          try {
+            const status = await call('credentials', { op: 'status', ref: keyRef })
+            if (!cancelled) setKeyStatus(status)
+          } catch (cause) {
+            if (!cancelled) setKeyStatus({ supported: false, message: describeError(cause) })
+          }
+        })()
+        return () => {
+          cancelled = true
+        }
+      }, [keyRef])
+
+      const providerOptions = []
+      providerOptions.push(
+        h('option', { key: '__session__', value: '' }, sessionProvider === '' ? 'Как у сессии' : `Как у сессии (${sessionProvider})`),
+      )
+      const known = new Set()
+      for (const entry of groups) {
+        known.add(entry.id)
+        providerOptions.push(h('option', { key: entry.id, value: entry.id }, `${entry.name} (${entry.models.length})`))
+      }
+      if (effectiveProvider !== '' && !known.has(effectiveProvider)) {
+        providerOptions.push(h('option', { key: `__unknown__${effectiveProvider}`, value: effectiveProvider }, `${effectiveProvider} (нет в каталоге)`))
+      }
+
+      const modelOptions = []
+      if (models.length === 0) {
+        modelOptions.push(h('option', { key: '__none__', value: '' }, 'Нет доступных моделей'))
+      } else {
+        for (const entry of models) {
+          modelOptions.push(h('option', { key: entry.id, value: entry.id }, entry.name || entry.id))
+        }
+      }
+      if (model !== '' && !models.some((entry) => entry.id === model)) {
+        modelOptions.push(h('option', { key: `__saved__${model}`, value: model }, `${model} (сохранена ранее)`))
+      }
+
+      const keyHint = keyStatus === undefined
+        ? `Имя ключа: ${keyRef || '—'}`
+        : keyStatus.supported === false
+          ? keyStatus.message || 'Хранилище ключей недоступно в этой сборке.'
+          : keyStatus.configured === true
+            ? `Ключ уже сохранён${keyStatus.source === 'environment' ? ' (переменная окружения)' : ''}. Введите новый, чтобы заменить.`
+            : `Ключ не задан. Сохранится как ${keyRef}.`
+
+      const connect = async () => {
+        if (effectiveProvider === '' || effectiveModel === '') {
+          setMessage('Выберите провайдера и модель.')
+          return
+        }
+        setBusy(true)
+        setMessage('')
+        try {
+          if (keyValue.trim() !== '' && keyRef !== '') {
+            setKeyStatus(await call('credentials', { op: 'set', ref: keyRef, value: keyValue.trim() }))
+            setKeyValue('')
+          }
+          await onConnected({
+            completionProvider: provider,
+            completionModel: effectiveModel,
+            apiKeyRef: keyRef,
+          })
+          setConnected(true)
+          setMessage(`Подключено: ${effectiveProvider} / ${effectiveModel}`)
+        } catch (cause) {
+          setMessage(describeError(cause))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(
+        'div',
+        { className: 'dsh-ide-model-dialog', role: 'dialog', 'aria-modal': 'true' },
+        h(
+          'div',
+          { className: 'dsh-ide-model-card' },
+          h(
+            'div',
+            { className: 'dsh-ide-model-head' },
+            h('span', { className: 'dsh-ide-model-title' }, 'Подключить модель'),
+            h('button', { type: 'button', className: 'dsh-ide-model-close', title: 'Закрыть', onClick: onClose }, '×'),
+          ),
+          h(
+            'div',
+            { className: 'dsh-ide-model-field' },
+            h('span', { className: 'dsh-ide-model-label' }, 'Провайдер'),
+            h(
+              'select',
+              {
+                value: provider,
+                'aria-label': 'Провайдер',
+                onChange: (event) => {
+                  setProvider(event.target.value)
+                  setModel('')
+                  setMessage('')
+                },
+              },
+              providerOptions,
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsh-ide-model-field' },
+            h('span', { className: 'dsh-ide-model-label' }, 'Модель'),
+            h(
+              'select',
+              {
+                value: effectiveModel,
+                'aria-label': 'Модель',
+                onChange: (event) => {
+                  setModel(event.target.value)
+                  setMessage('')
+                },
+              },
+              modelOptions,
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsh-ide-model-field' },
+            h('span', { className: 'dsh-ide-model-label' }, 'API-ключ'),
+            h('input', {
+              type: 'password',
+              value: keyValue,
+              autoComplete: 'off',
+              spellCheck: false,
+              placeholder: `Введите ключ ${keyRef || 'провайдера'}`,
+              onChange: (event) => setKeyValue(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key === 'Enter') void connect()
+              },
+            }),
+            h('span', { className: 'dsh-ide-model-hint' }, keyHint),
+          ),
+          h(
+            'button',
+            { type: 'button', className: 'dsh-ide-model-button', disabled: busy, onClick: () => void connect() },
+            busy ? 'Подключение…' : connected ? 'Готово' : 'Подключить',
+          ),
+          message === ''
+            ? null
+            : h('div', { className: connected ? 'dsh-ide-model-message dsh-ide-model-ok' : 'dsh-ide-model-message' }, message),
+          h('div', { className: 'dsh-ide-model-foot' }, 'Настройки сохранятся в ~/.dsh/code-editor.json, ключ — в хранилище DSH.'),
+        ),
+      )
+    }
+
+    function SettingsPanel({ preferences, sessionModel, onClose, onSave, onAddModel }) {
       const [provider, setProvider] = React.useState(preferences.completionProvider || '')
       const [model, setModel] = React.useState(preferences.completionModel || '')
       const [autoSuggest, setAutoSuggest] = React.useState(preferences.autoSuggest !== false)
@@ -1226,6 +1418,7 @@ window.__ModuleLoader__.load({
           { className: 'dsh-ide-settings-foot' },
           message === '' ? null : h('span', { className: 'dsh-ide-settings-message' }, message),
           h('span', { className: 'dsh-ide-settings-foot-spacer' }),
+          h('button', { type: 'button', className: 'dsh-ide-button', onClick: onAddModel }, 'Подключить модель…'),
           h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
           h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: submit }, 'Сохранить'),
         ),
@@ -1380,6 +1573,7 @@ window.__ModuleLoader__.load({
       const [hidden, setHidden] = React.useState(false)
       const [preferences, setPreferences] = React.useState(undefined)
       const [settingsOpen, setSettingsOpen] = React.useState(false)
+      const [modelDialog, setModelDialog] = React.useState(false)
       const [catalog, setCatalog] = React.useState(undefined)
       const [tabMenu, setTabMenu] = React.useState(undefined)
       const [quick, setQuick] = React.useState(undefined)
@@ -1996,6 +2190,7 @@ window.__ModuleLoader__.load({
             { id: 'zoom-reset', label: 'Сбросить размер шрифта', run: () => zoom(13 - fontSize) },
             { separator: true },
             { id: 'settings', label: 'Настройки IDE…', key: 'Ctrl+,', run: () => setSettingsOpen(true) },
+            { id: 'connect-model', label: 'Подключить модель…', run: () => setModelDialog(true) },
             { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
           ],
         },
@@ -2280,6 +2475,19 @@ window.__ModuleLoader__.load({
               sessionModel: catalog === undefined ? undefined : catalog.default,
               onClose: () => setSettingsOpen(false),
               onSave: saveSettings,
+              onAddModel: () => setModelDialog(true),
+            })
+          : null,
+        modelDialog && preferences !== undefined
+          ? h(ModelDialog, {
+              preferences,
+              sessionModel: catalog === undefined ? undefined : catalog.default,
+              onClose: () => setModelDialog(false),
+              onConnected: async (patch) => {
+                await saveSettings(patch)
+                setModelDialog(false)
+                setSettingsOpen(false)
+              },
             })
           : null,
         quick !== undefined
@@ -2352,6 +2560,28 @@ window.__ModuleLoader__.load({
 .dsh-ide-context { position:fixed; z-index:31; min-width:210px; display:flex; flex-direction:column; padding:4px;
   background:var(--ide-panel-2); border:1px solid var(--ide-border); border-radius:6px;
   box-shadow:0 8px 24px rgba(0,0,0,.45); }
+.dsh-ide-model-dialog { position:fixed; inset:0; z-index:40; display:flex; align-items:center; justify-content:center;
+  background:rgba(0,0,0,.5); }
+.dsh-ide-model-card { width:420px; max-width:calc(100vw - 40px); max-height:calc(100vh - 60px); overflow:auto;
+  padding:20px 22px 16px; background:var(--ide-panel); border:1px solid var(--ide-border); border-radius:10px;
+  box-shadow:0 18px 48px rgba(0,0,0,.55); }
+.dsh-ide-model-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }
+.dsh-ide-model-title { font-size:17px; font-weight:600; }
+.dsh-ide-model-close { border:0; background:transparent; color:var(--ide-muted); cursor:pointer; font-size:18px;
+  line-height:1; padding:2px 6px; border-radius:4px; }
+.dsh-ide-model-close:hover { background:var(--ide-hover); color:var(--ide-text); }
+.dsh-ide-model-field { display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }
+.dsh-ide-model-label { font-weight:600; }
+.dsh-ide-model-field select, .dsh-ide-model-field input { width:100%; padding:8px 10px; border:1px solid var(--ide-border);
+  border-radius:6px; background:var(--ide-panel-2); color:var(--ide-text); font:inherit; }
+.dsh-ide-model-field select:focus, .dsh-ide-model-field input:focus { outline:none; border-color:var(--ide-accent); }
+.dsh-ide-model-hint { color:var(--ide-muted); font-size:11px; }
+.dsh-ide-model-button { width:100%; margin-top:4px; padding:9px 12px; border:1px solid var(--ide-accent); border-radius:6px;
+  background:var(--ide-accent); color:#ffffff; font:inherit; font-weight:600; cursor:pointer; }
+.dsh-ide-model-button:disabled { opacity:.55; cursor:default; }
+.dsh-ide-model-message { margin-top:10px; color:var(--ide-error); font-size:11px; }
+.dsh-ide-model-ok { color:#89d185; }
+.dsh-ide-model-foot { margin-top:10px; text-align:center; color:var(--ide-muted); font-size:11px; }
 .dsh-ide-body { display:flex; flex:1 1 auto; min-height:0; }
 .dsh-ide-activity { display:flex; flex-direction:column; align-items:center; gap:2px; flex:0 0 36px; width:36px;
   padding:4px 0; background:var(--ide-panel-2); border-right:1px solid var(--ide-border); }
