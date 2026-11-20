@@ -48,6 +48,7 @@ async function makeWorkspace() {
 
 function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' } }) {
   const routes = new Map()
+  const streamCalls = []
   const session = { id: SESSION_ID }
   const ctx = {
     effect(effect) {
@@ -73,8 +74,15 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
         return [{ id: 'fixture-model', name: 'Fixture model' }]
       },
       listConfigurableProviders: () => [],
-      async *stream() {
+      // A thinking model advertises opaque effort ids; the completion pins the
+      // least one so the hidden reasoning cannot eat the output budget.
+      async resolveModelInfo() {
+        return { reasoning: { efforts: [{ id: 'low', name: 'Low' }] } }
+      },
+      async *stream(request) {
+        streamCalls.push(request)
         yield { type: 'text-delta', index: 0, text: 'return 1' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
       },
     },
     fs: {
@@ -116,7 +124,7 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
     return { status: response.status, body: await response.json() }
   }
 
-  return { call, routes }
+  return { call, routes, streamCalls }
 }
 
 async function withFile(variable, name, run) {
@@ -357,6 +365,37 @@ test('the completion permission survives an editor restart', async () => {
         offset: 22,
       })
       assert.equal(allowed.body.text, 'return 1')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the completion pins the least reasoning effort and reports its trajectory', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      assert.equal(opened.status, 200)
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+
+      const answered = await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 42\n',
+        offset: 'export const answer = 42\n'.length,
+      })
+      assert.equal(answered.status, 200)
+      assert.equal(answered.body.text, 'return 1')
+      assert.equal(app.streamCalls[0].reasoningEffort, 'low')
+      assert.equal(app.streamCalls[0].maxTokens, 900)
+      assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
+      assert.equal(answered.body.trajectory.before, 'export const answer = 42\n'.length)
+      assert.equal(answered.body.trajectory.finishReason, 'stop')
+      assert.equal(answered.body.conversation.answer, 'return 1')
+      assert.ok(answered.body.conversation.message.includes('--- текст до курсора ---'))
     })
   } finally {
     await rm(root, { recursive: true, force: true })

@@ -492,9 +492,38 @@ export function apply(ctx, config) {
       attempts.push({ provider: selection.provider, model: selection.model })
     }
 
+    const systemPrompt =
+      'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
+      'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
+      'уже написанного кода. Продолжение должно быть коротким (1–5 строк) и синтаксически уместным. ' +
+      'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
+      'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
+      'Если уместного продолжения нет, ответь пустой строкой.'
+    // The suffix must follow its own header: an inverted layout tells the model to
+    // continue past the text that comes after the cursor, which produced empty
+    // answers for every request of the first benchmark.
+    const requestText =
+      `Файл: ${document.displayPath}\n` +
+      `Язык: ${document.language}\n\n` +
+      `--- текст до курсора ---\n${prefix}\n--- курсор ---\n` +
+      `--- текст после курсора ---\n${suffix}`
+
     const deadline = AbortSignal.timeout(COMPLETION_DEADLINE_MS)
     const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
     const startedAt = Date.now()
+
+    // A thinking model spends the output budget on hidden reasoning and then
+    // returns nothing, which reads in the GUI as "completions stopped working".
+    // Pinning the least advertised effort leaves the budget to the code.
+    const leastEffort = async (provider, model) => {
+      try {
+        const info = await ctx.llm.resolveModelInfo(provider, model, combined)
+        const effort = info?.reasoning?.efforts?.[0]
+        return typeof effort?.id === 'string' && effort.id !== '' ? effort.id : undefined
+      } catch {
+        return undefined
+      }
+    }
 
     let text = ''
     let used = attempts[0]
@@ -507,7 +536,8 @@ export function apply(ctx, config) {
     let finishReason = ''
     let firstChunk = ''
     for (const attempt of attempts) {
-      used = attempt
+      const effort = await leastEffort(attempt.provider, attempt.model)
+      used = effort === undefined ? attempt : { ...attempt, effort }
       let buffer = ''
       streamError = ''
       finishReason = ''
@@ -515,16 +545,8 @@ export function apply(ctx, config) {
       for await (const chunk of ctx.llm.stream({
         provider: attempt.provider,
         model: attempt.model,
-      system:
-        'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
-        'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
-        'уже написанного кода. Продолжение должно быть коротким (1–5 строк) и синтаксически уместным. ' +
-        // A comment that asks for code is the most common way a programmer
-        // starts a block, so the answer has to begin with a line break and
-        // contain the code itself rather than a repeat of the comment.
-        'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
-        'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
-        'Если уместного продолжения нет, ответь пустой строкой.',
+        ...(used.effort === undefined ? {} : { reasoningEffort: used.effort }),
+      system: systemPrompt,
       // Message content is a list of typed blocks, not a bare string: every
       // other host-side caller in this installation passes
       // `[{ type: 'text', text }]`, and a string content made the adapter end
@@ -535,23 +557,16 @@ export function apply(ctx, config) {
           content: [
             {
               type: 'text',
-              text:
-                `Файл: ${document.displayPath}\n` +
-                `Язык: ${document.language}\n\n` +
-                // The suffix must follow its own header: an inverted layout tells the
-                // model to continue past the text that comes after the cursor, which
-                // produced empty answers for every request of the first benchmark.
-                `--- текст до курсора ---\n${prefix}\n--- курсор ---\n` +
-                `--- текст после курсора ---\n${suffix}`,
+              text: requestText,
             },
           ],
         },
       ],
       // 160 tokens was not enough for a reasoning model: it spent the whole
       // budget on `reasoning_content` and every answer came back empty with
-      // `finish_reason: length`. 400 leaves room for the thinking that
-      // deepseek-v4.1-flash still does before the five lines of code.
-      maxTokens: 400,
+      // `finish_reason: length`. The effort is pinned to the least advertised
+      // value above and 900 tokens leave room for the five lines of code.
+      maxTokens: 900,
       temperature: 0.1,
       signal: combined,
       sessionId: document.sessionId,
@@ -610,20 +625,36 @@ export function apply(ctx, config) {
       error: streamError,
       firstChunk,
     })
-    if (text.trim() === '' && streamError !== '') {
-      return fail('upstream', `Модель не ответила: ${streamError}`)
-    }
-    if (text.trim() === '' && finishReason === 'length') {
-      return fail(
-        'upstream',
-        'Модель израсходовала лимит на рассуждения: выберите нерассуждающую модель в настройках редактора (шестерёнка).',
-      )
-    }
+    // An empty answer is a normal outcome the user has to be able to read, so
+    // it comes back with the same diagnostics block as a real completion.
+    const reason =
+      streamError !== ''
+        ? `Модель не ответила: ${streamError}`
+        : finishReason === 'length'
+          ? 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
+          : text.trim() === ''
+            ? 'Модель не вернула продолжение.'
+            : ''
     return {
       text: result,
       provider: used.provider,
       model: used.model,
       durationMs: Date.now() - startedAt,
+      reason,
+      // The IDE renders these in its output panel: the trajectory explains what
+      // was attempted and what came back, the conversation shows the exact text.
+      trajectory: {
+        attempts: attempts.map(attempt => `${attempt.provider} / ${attempt.model}`),
+        finishReason,
+        streamError,
+        chunkTypes: [...chunkTypes],
+        rawChars: text.length,
+        answerChars: result.length,
+        before: prefix.length,
+        after: suffix.length,
+        explicit: body.explicit === true,
+      },
+      conversation: { system: systemPrompt, message: requestText, answer: text },
     }
   }
 

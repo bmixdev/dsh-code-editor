@@ -1840,7 +1840,94 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function IdeBody(props) {
+    function asNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function OutputPanel({ panel, trace, onTab, onSelect, onClose }) {
+  const entry = trace.length === 0 ? undefined : trace[Math.min(panel.index, trace.length - 1)]
+  const conversation = entry === undefined ? undefined : entry.conversation
+  const system = conversation === undefined ? '' : conversation.system
+  const message = conversation === undefined ? '' : conversation.message
+  const answer = conversation === undefined ? '' : conversation.answer
+  return h(
+    'div',
+    { className: 'dsh-ide-panel' },
+    h(
+      'div',
+      { className: 'dsh-ide-panel-head' },
+      h(
+        'button',
+        {
+          type: 'button',
+          className: panel.tab === 'trajectory' ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
+          onClick: () => onTab('trajectory'),
+        },
+        'Траектория',
+      ),
+      h(
+        'button',
+        {
+          type: 'button',
+          className: panel.tab === 'chat' ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
+          onClick: () => onTab('chat'),
+        },
+        'Чат',
+      ),
+      h('span', { className: 'dsh-ide-panel-spacer' }),
+      h('span', { className: 'dsh-ide-panel-hint' }, trace.length === 0 ? 'пока пусто' : `запросов: ${trace.length}`),
+      h('button', { type: 'button', className: 'dsh-ide-panel-close', title: 'Закрыть панель', onClick: onClose }, '×'),
+    ),
+    panel.tab === 'trajectory'
+      ? h(
+          'div',
+          { className: 'dsh-ide-panel-body' },
+          trace.length === 0
+            ? h(
+                'div',
+                { className: 'dsh-ide-panel-empty' },
+                'Здесь появятся попытки автодополнения: модель, размер контекста, длительность и результат.',
+              )
+            : trace.map((row, index) =>
+                h(
+                  'div',
+                  {
+                    key: `${row.at}:${index}`,
+                    className: index === panel.index ? 'dsh-ide-trace dsh-ide-trace-active' : 'dsh-ide-trace',
+                    onClick: () => onSelect(index),
+                  },
+                  h('span', { className: 'dsh-ide-trace-time' }, row.at),
+                  h('span', { className: 'dsh-ide-trace-path' }, row.path),
+                  h('span', { className: 'dsh-ide-trace-model' }, `${row.provider} / ${row.model}`),
+                  h('span', { className: 'dsh-ide-trace-mode' }, row.explicit ? 'Ctrl+Space' : 'авто'),
+                  h('span', { className: 'dsh-ide-trace-meta' }, `${row.before}/${row.after} символов`),
+                  h('span', { className: 'dsh-ide-trace-meta' }, `${row.durationMs} мс`),
+                  row.ok
+                    ? h('span', { className: 'dsh-ide-trace-ok' }, `+${row.chars} символов`)
+                    : h('span', { className: 'dsh-ide-trace-error' }, row.reason || 'пустой ответ'),
+                ),
+              ),
+        )
+      : h(
+          'div',
+          { className: 'dsh-ide-panel-body dsh-ide-chat' },
+          entry === undefined
+            ? h('div', { className: 'dsh-ide-panel-empty' }, 'Запросов пока не было.')
+            : h(
+                'div',
+                null,
+                h('div', { className: 'dsh-ide-chat-label' }, 'Системная инструкция'),
+                h('pre', { className: 'dsh-ide-chat-text' }, system),
+                h('div', { className: 'dsh-ide-chat-label' }, 'Отправлено'),
+                h('pre', { className: 'dsh-ide-chat-text' }, message),
+                h('div', { className: 'dsh-ide-chat-label' }, 'Ответ модели'),
+                h('pre', { className: 'dsh-ide-chat-text' }, answer === '' ? entry.reason || '(пусто)' : answer),
+              ),
+        ),
+  )
+}
+
+function IdeBody(props) {
       const tab = tabOf(props)
       const address = tab && typeof tab.contentId === 'string' ? tab.contentId : ''
       const parsed = parseAddress(address)
@@ -1877,6 +1964,10 @@ window.__ModuleLoader__.load({
       const [createRequest, setCreateRequest] = React.useState(undefined)
       const [catalog, setCatalog] = React.useState(undefined)
       const [tabMenu, setTabMenu] = React.useState(undefined)
+  // The output panel mirrors the VS Code one: "Trajectory" explains every
+  // completion request, "Chat" shows the exact prompt and answer.
+  const [panel, setPanel] = React.useState(undefined)
+  const [trace, setTrace] = React.useState([])
       const [quick, setQuick] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
@@ -2027,6 +2118,14 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const pushTrace = React.useCallback((record) => {
+        setTrace((current) => [record, ...current].slice(0, 60))
+      }, [])
+
+      const toggleOutput = React.useCallback(() => {
+        setPanel((current) => (current === undefined ? { tab: 'trajectory', index: 0 } : undefined))
+      }, [])
+
       const complete = React.useCallback(async (model, position, context, cancelToken) => {
         const key = runtime.current.modelTabs.get(model.uri.toString())
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === key)
@@ -2049,7 +2148,30 @@ window.__ModuleLoader__.load({
             { id: entry.hostId, sessionId: stateRef.current.sessionId, token: entry.token, text, offset, explicit },
             controller.signal,
           )
-          if (payload === undefined || typeof payload.text !== 'string' || payload.text === '') return { items: [] }
+          if (payload === undefined || typeof payload.text !== 'string') return { items: [] }
+          const trajectory = payload.trajectory === undefined || payload.trajectory === null ? {} : payload.trajectory
+          pushTrace({
+            at: new Date().toLocaleTimeString('ru-RU'),
+            path: entry.path,
+            provider: payload.provider,
+            model: payload.model,
+            explicit,
+            before: asNumber(trajectory.before),
+            after: asNumber(trajectory.after),
+            durationMs: asNumber(payload.durationMs),
+            chars: payload.text.length,
+            ok: payload.text !== '',
+            reason: typeof payload.reason === 'string' ? payload.reason : '',
+            conversation: payload.conversation,
+          })
+          if (payload.text === '') {
+            // A silent empty answer is the worst failure mode: an explicit
+            // request says why, an automatic one stays quiet like VS Code.
+            if (explicit && typeof payload.reason === 'string' && payload.reason !== '') {
+              setStatus({ kind: 'error', message: payload.reason })
+            }
+            return { items: [] }
+          }
           return { items: [{ insertText: payload.text }] }
         } catch (cause) {
           if (cause instanceof Error && (cause.name === 'AbortError' || cause.code === 'cancelled')) return { items: [] }
@@ -2060,10 +2182,23 @@ window.__ModuleLoader__.load({
             setStatus({ kind: 'idle', message: '' })
             return { items: [] }
           }
-          setStatus({ kind: 'error', message: describeError(cause) })
+          if (explicit) setStatus({ kind: 'error', message: describeError(cause) })
+          pushTrace({
+            at: new Date().toLocaleTimeString('ru-RU'),
+            path: entry.path,
+            provider: '—',
+            model: '—',
+            explicit,
+            before: 0,
+            after: 0,
+            durationMs: 0,
+            chars: 0,
+            ok: false,
+            reason: describeError(cause),
+          })
           return { items: [] }
         }
-      }, [])
+      }, [pushTrace])
 
       const enableSuggestions = React.useCallback(async () => {
         const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
@@ -2139,6 +2274,7 @@ window.__ModuleLoader__.load({
         })
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => editor.trigger('keyboard', 'editor.action.inlineSuggest.trigger', {}))
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
 
         const provider = monaco.languages.registerInlineCompletionsProvider(
           { pattern: '**' },
@@ -2365,7 +2501,15 @@ window.__ModuleLoader__.load({
         removeTab(current.key)
       }
 
-      handlersRef.current = { saveActive, closeActive, saveAll, openQuick, complete, openSettings: () => setSettingsOpen(true) }
+      handlersRef.current = {
+        saveActive,
+        closeActive,
+        saveAll,
+        openQuick,
+        complete,
+        toggleOutput,
+        openSettings: () => setSettingsOpen(true),
+      }
 
       const withEditor = (run) => {
         const editor = runtime.current.editor
@@ -2552,6 +2696,13 @@ window.__ModuleLoader__.load({
             { id: 'zoom-in', label: 'Увеличить шрифт', run: () => zoom(1) },
             { id: 'zoom-out', label: 'Уменьшить шрифт', run: () => zoom(-1) },
             { id: 'zoom-reset', label: 'Сбросить размер шрифта', run: () => zoom(13 - fontSize) },
+            { separator: true },
+            {
+              id: 'output',
+              label: panel === undefined ? 'Показать панель вывода' : 'Скрыть панель вывода',
+              key: 'Ctrl+',
+              run: toggleOutput,
+            },
             { separator: true },
             { id: 'settings', label: 'Настройки IDE…', key: 'Ctrl+,', run: () => setSettingsOpen(true) },
             { id: 'connect-model', label: 'Подключить модель…', run: () => setModelDialog(true) },
@@ -2828,6 +2979,15 @@ window.__ModuleLoader__.load({
                 )
               : null,
             h('div', { className: 'dsh-ide-stage', ref: hostRef }),
+            panel === undefined
+              ? null
+              : h(OutputPanel, {
+                  panel,
+                  trace,
+                  onTab: (tab) => setPanel({ tab, index: panel.index }),
+                  onSelect: (index) => setPanel({ tab: 'chat', index }),
+                  onClose: () => setPanel(undefined),
+                }),
             h(
               'div',
               { className: 'dsh-ide-status' },
@@ -3025,6 +3185,30 @@ window.__ModuleLoader__.load({
 .dsh-ide-crumb-last { color:var(--ide-text); }
 .dsh-ide-crumb-sep { padding:0 3px; opacity:.6; }
 .dsh-ide-stage { flex:1 1 auto; min-height:0; }
+.dsh-ide-panel { flex:0 0 auto; height:190px; display:flex; flex-direction:column; border-top:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-panel-head { display:flex; align-items:center; gap:2px; flex:0 0 auto; padding:0 6px; height:28px; border-bottom:1px solid var(--ide-border); }
+.dsh-ide-panel-tab { border:none; background:transparent; color:var(--ide-fg-dim); font:400 11px/1.6 var(--ide-font); text-transform:uppercase; letter-spacing:.4px; padding:4px 8px; cursor:pointer; border-bottom:1px solid transparent; }
+.dsh-ide-panel-tab:hover { color:var(--ide-fg); }
+.dsh-ide-panel-tab-active { color:var(--ide-fg); border-bottom-color:var(--ide-accent); }
+.dsh-ide-panel-spacer { flex:1 1 auto; }
+.dsh-ide-panel-hint { font:400 11px/1.6 var(--ide-font); color:var(--ide-fg-dim); padding-right:6px; }
+.dsh-ide-panel-close { border:none; background:transparent; color:var(--ide-fg-dim); font-size:14px; line-height:1; cursor:pointer; padding:2px 6px; }
+.dsh-ide-panel-close:hover { color:var(--ide-fg); }
+.dsh-ide-panel-body { flex:1 1 auto; min-height:0; overflow:auto; padding:4px 0; font:400 11.5px/1.55 var(--ide-font); }
+.dsh-ide-panel-empty { color:var(--ide-fg-dim); padding:8px 12px; }
+.dsh-ide-trace { display:flex; gap:10px; align-items:baseline; padding:2px 12px; cursor:pointer; white-space:nowrap; }
+.dsh-ide-trace:hover { background:var(--ide-hover); }
+.dsh-ide-trace-active { background:var(--ide-active); }
+.dsh-ide-trace-time { color:var(--ide-fg-dim); flex:0 0 auto; }
+.dsh-ide-trace-path { color:var(--ide-fg); flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-trace-model { color:var(--ide-fg-dim); flex:0 0 auto; }
+.dsh-ide-trace-mode { color:var(--ide-fg-dim); flex:0 0 auto; }
+.dsh-ide-trace-meta { color:var(--ide-fg-dim); flex:0 0 auto; }
+.dsh-ide-trace-ok { color:#89d185; flex:0 0 auto; }
+.dsh-ide-trace-error { color:#f48771; flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-chat { padding:6px 12px 10px; }
+.dsh-ide-chat-label { color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px; font-size:10px; margin:8px 0 3px; }
+.dsh-ide-chat-text { margin:0; white-space:pre-wrap; word-break:break-word; font:400 11.5px/1.5 var(--ide-mono); color:var(--ide-fg); max-height:120px; overflow:auto; background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; }
 .dsh-ide-empty { position:absolute; inset:64px 0 24px; display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:6px; text-align:center; padding:16px; pointer-events:none; }
 .dsh-ide-watermark { font:700 72px/1 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.02em; color:var(--ide-text);
