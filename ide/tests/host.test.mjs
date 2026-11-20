@@ -22,6 +22,7 @@ const ROUTES = [
   'resolve',
   'tree',
   'files',
+  'create',
   'state',
   'catalog',
   'credentials',
@@ -160,6 +161,29 @@ test('the explorer lists a folder and quick open flattens the workspace', async 
     const paths = files.body.files.map((entry) => entry.path).sort()
     assert.deepEqual(paths, ['README.md', 'src/index.js', 'src/util.ts'])
     assert.equal(files.body.truncated, false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a new file is created inside the workspace and never overwrites', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+
+    const created = await app.call('create', { sessionId: SESSION_ID, path: 'notes/todo.md' })
+    assert.equal(created.status, 200)
+    assert.equal(created.body.created, true)
+    assert.equal(await readFile(path.join(root, 'notes', 'todo.md'), 'utf8'), '')
+
+    const again = await app.call('create', { sessionId: SESSION_ID, path: 'README.md' })
+    assert.equal(errorCode(again.body), 'exists')
+
+    const outside = await app.call('create', { sessionId: SESSION_ID, path: '../escape.txt' })
+    assert.equal(errorCode(outside.body), 'bad-request')
+
+    const listing = await app.call('tree', { sessionId: SESSION_ID, path: 'notes' })
+    assert.deepEqual(listing.body.entries.map((entry) => entry.name), ['todo.md'])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

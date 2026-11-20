@@ -319,6 +319,8 @@ window.__ModuleLoader__.load({
       const activePath = typeof props.activePath === 'string' ? props.activePath : ''
       const onOpenFile = props.onOpenFile
       const onToggleHidden = props.onToggleHidden
+      // The menu bar asks for a refresh without owning the tree's internal state.
+      const reloadSignal = props.reloadSignal === undefined ? 0 : props.reloadSignal
 
       const [expanded, setExpanded] = React.useState(() => new Set())
       const [cache, setCache] = React.useState(() => new Map())
@@ -356,7 +358,7 @@ window.__ModuleLoader__.load({
         setFlat(undefined)
         setFlatError('')
         if (typeof sessionId === 'string' && sessionId !== '') void load('')
-      }, [sessionId, hidden, reloadKey, load])
+      }, [sessionId, hidden, reloadKey, reloadSignal, load])
 
       const needle = query.trim().toLowerCase()
 
@@ -537,6 +539,127 @@ window.__ModuleLoader__.load({
     }
 
     // -------------------------------------------------------------- tab strip
+
+    // The menu bar mirrors VS Code's title bar: a row of top-level menus whose
+    // dropdowns list commands. Items that the IDE cannot honour stay visible but
+    // disabled, with the reason in the tooltip, so the gap is explicit.
+    function MenuBar({ menus, openId, onOpen }) {
+      return h(
+        'div',
+        {
+          className: 'dsh-ide-menubar',
+          role: 'menubar',
+          onKeyDown: (event) => {
+            if (event.key === 'Escape') onOpen('')
+          },
+        },
+        menus.map((menu) =>
+          h(
+            'div',
+            { key: menu.id, className: 'dsh-ide-menubar-slot' },
+            h(
+              'button',
+              {
+                type: 'button',
+                role: 'menuitem',
+                className: `dsh-ide-menubar-button${openId === menu.id ? ' dsh-ide-menubar-button-active' : ''}`,
+                'aria-expanded': openId === menu.id,
+                onClick: () => onOpen(openId === menu.id ? '' : menu.id),
+                onMouseEnter: () => {
+                  if (openId !== '' && openId !== menu.id) onOpen(menu.id)
+                },
+              },
+              menu.label,
+            ),
+            openId === menu.id
+              ? h(
+                  'div',
+                  { className: 'dsh-ide-dropdown', role: 'menu' },
+                  menu.items.map((item, index) =>
+                    item.separator === true
+                      ? h('div', { key: `separator-${index}`, className: 'dsh-ide-menu-sep' })
+                      : h(
+                          'button',
+                          {
+                            key: item.id,
+                            type: 'button',
+                            role: 'menuitem',
+                            className: 'dsh-ide-menu-item',
+                            disabled: item.disabled === true,
+                            title: item.hint === undefined ? '' : item.hint,
+                            onClick: () => {
+                              if (item.disabled === true) return
+                              onOpen('')
+                              if (typeof item.run === 'function') item.run()
+                            },
+                          },
+                          h('span', null, item.label),
+                          h('span', { className: 'dsh-ide-menu-key' }, item.key === undefined ? '' : item.key),
+                        ),
+                  ),
+                )
+              : null,
+          ),
+        ),
+      )
+    }
+
+    function PromptDialog({ prompt, onClose }) {
+      const [value, setValue] = React.useState(prompt.value === undefined ? '' : prompt.value)
+      const [busy, setBusy] = React.useState(false)
+      const submit = () => {
+        if (busy) return
+        setBusy(true)
+        Promise.resolve(prompt.submit(value)).finally(() => {
+          setBusy(false)
+          onClose()
+        })
+      }
+      return h(
+        'div',
+        { className: 'dsh-ide-modal' },
+        h(
+          'div',
+          { className: 'dsh-ide-modal-card' },
+          h('div', { className: 'dsh-ide-modal-title' }, prompt.title),
+          h('div', { className: 'dsh-ide-modal-text' }, prompt.label),
+          h('input', {
+            className: 'dsh-ide-input',
+            value,
+            spellCheck: false,
+            onChange: (event) => setValue(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') submit()
+              if (event.key === 'Escape') onClose()
+            },
+          }),
+          h(
+            'div',
+            { className: 'dsh-ide-modal-actions' },
+            h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Отмена'),
+            h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: submit }, prompt.action === undefined ? 'Создать' : prompt.action),
+          ),
+        ),
+      )
+    }
+
+    function InfoDialog({ info, onClose }) {
+      return h(
+        'div',
+        { className: 'dsh-ide-modal' },
+        h(
+          'div',
+          { className: 'dsh-ide-modal-card' },
+          h('div', { className: 'dsh-ide-modal-title' }, info.title),
+          info.lines.map((line, index) => h('div', { key: `line-${index}`, className: 'dsh-ide-modal-text' }, line)),
+          h(
+            'div',
+            { className: 'dsh-ide-modal-actions' },
+            h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: onClose }, 'Закрыть'),
+          ),
+        ),
+      )
+    }
 
     function TabStrip(props) {
       const { tabs, activeKey, onActivate, onClose } = props
@@ -1126,7 +1249,12 @@ window.__ModuleLoader__.load({
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
       const [consent, setConsent] = React.useState(undefined)
-      const [menuOpen, setMenuOpen] = React.useState(false)
+      const [menuId, setMenuId] = React.useState('')
+      const [prompt, setPrompt] = React.useState(undefined)
+      const [info, setInfo] = React.useState(undefined)
+      const [reloadSignal, setReloadSignal] = React.useState(0)
+      const [fontSize, setFontSize] = React.useState(13)
+      const [wordWrap, setWordWrap] = React.useState(false)
       const [booted, setBooted] = React.useState(false)
 
       const stateRef = React.useRef({})
@@ -1555,6 +1683,211 @@ window.__ModuleLoader__.load({
 
       handlersRef.current = { saveActive, closeActive, saveAll, openQuick, complete }
 
+      const withEditor = (run) => {
+        const editor = runtime.current.editor
+        if (editor === undefined) return
+        run(editor)
+      }
+
+      const runAction = (actionId) => {
+        withEditor((editor) => {
+          const action = editor.getAction(actionId)
+          if (action !== undefined) void action.run()
+        })
+      }
+
+      const closeAllTabs = () => {
+        const current = stateRef.current.tabs
+        const dirty = current.filter((candidate) => candidate.dirty)
+        if (dirty.length > 0) {
+          setStatus({ kind: 'error', message: `Сначала сохраните изменённые файлы: ${dirty.map((candidate) => candidate.name).join(', ')}` })
+          return
+        }
+        for (const candidate of current) removeTab(candidate.key)
+      }
+
+      const cycleTab = (step) => {
+        const list = stateRef.current.tabs
+        if (list.length < 2) return
+        const index = list.findIndex((candidate) => candidate.key === stateRef.current.activeKey)
+        const next = list[(index + step + list.length) % list.length]
+        setActiveKey(next.key)
+      }
+
+      const zoom = (delta) => {
+        const next = Math.min(28, Math.max(9, fontSize + delta))
+        setFontSize(next)
+        withEditor((editor) => editor.updateOptions({ fontSize: next }))
+      }
+
+      const toggleWordWrap = () => {
+        const next = !wordWrap
+        setWordWrap(next)
+        withEditor((editor) => editor.updateOptions({ wordWrap: next ? 'on' : 'off' }))
+      }
+
+      const createFile = () => {
+        setPrompt({
+          title: 'Новый файл',
+          label: 'Путь относительно рабочей папки',
+          value: '',
+          action: 'Создать',
+          submit: async (value) => {
+            const relative = normalPath(value)
+            if (relative === '') return
+            try {
+              await call('create', { sessionId, path: relative })
+              setReloadSignal((previous) => previous + 1)
+              await openFile(relative)
+              setStatus({ kind: 'ok', message: `Создан файл: ${relative}` })
+            } catch (cause) {
+              setStatus({ kind: 'error', message: describeError(cause) })
+            }
+          },
+        })
+      }
+
+      // The same top-level arrangement as VS Code. Commands the IDE cannot honour
+      // are disabled with the reason in their tooltip instead of being hidden.
+      const menus = [
+        {
+          id: 'file',
+          label: 'Файл',
+          items: [
+            { id: 'new', label: 'Новый файл…', run: createFile },
+            { id: 'open', label: 'Открыть файл…', key: 'Ctrl+P', run: openQuick },
+            { separator: true },
+            { id: 'save', label: 'Сохранить', key: 'Ctrl+S', run: () => void saveActive() },
+            { id: 'save-all', label: 'Сохранить всё', key: 'Ctrl+Shift+S', run: () => void saveAll() },
+            { separator: true },
+            { id: 'close', label: 'Закрыть вкладку', key: 'Ctrl+W', run: closeActive },
+            { id: 'close-all', label: 'Закрыть все вкладки', run: closeAllTabs },
+            { separator: true },
+            { id: 'refresh', label: 'Обновить дерево', run: () => setReloadSignal((previous) => previous + 1) },
+            { id: 'toggle-tree', label: showTree ? 'Скрыть проводник' : 'Показать проводник', run: () => setShowTree(!showTree) },
+            { id: 'open-folder', label: 'Открыть папку…', disabled: true, hint: 'Рабочая папка задаётся сессией DSH; другая папка открывается только в новой сессии.' },
+          ],
+        },
+        {
+          id: 'edit',
+          label: 'Правка',
+          items: [
+            { id: 'undo', label: 'Отменить', key: 'Ctrl+Z', run: () => runAction('undo') },
+            { id: 'redo', label: 'Повторить', key: 'Ctrl+Y', run: () => runAction('redo') },
+            { separator: true },
+            { id: 'cut', label: 'Вырезать', key: 'Ctrl+X', run: () => runAction('editor.action.clipboardCutAction') },
+            { id: 'copy', label: 'Копировать', key: 'Ctrl+C', run: () => runAction('editor.action.clipboardCopyAction') },
+            { id: 'paste', label: 'Вставить', key: 'Ctrl+V', run: () => runAction('editor.action.clipboardPasteAction') },
+            { separator: true },
+            { id: 'find', label: 'Найти', key: 'Ctrl+F', run: () => runAction('actions.find') },
+            { id: 'replace', label: 'Заменить', key: 'Ctrl+H', run: () => runAction('editor.action.startFindReplaceAction') },
+            { id: 'format', label: 'Форматировать документ', disabled: true, hint: 'Форматирование требует языкового сервиса, которого нет в бандле.' },
+          ],
+        },
+        {
+          id: 'selection',
+          label: 'Выделение',
+          items: [
+            { id: 'select-all', label: 'Выделить всё', key: 'Ctrl+A', run: () => runAction('editor.action.selectAll') },
+            { id: 'select-line', label: 'Выделить строку', key: 'Ctrl+L', run: () => runAction('expandLineSelection') },
+            { separator: true },
+            { id: 'expand', label: 'Расширить выделение', key: 'Shift+Alt+→', run: () => runAction('editor.action.smartSelect.expand') },
+            { id: 'shrink', label: 'Сузить выделение', key: 'Shift+Alt+←', run: () => runAction('editor.action.smartSelect.shrink') },
+          ],
+        },
+        {
+          id: 'go',
+          label: 'Переход',
+          items: [
+            { id: 'goto-file', label: 'Перейти к файлу…', key: 'Ctrl+P', run: openQuick },
+            { id: 'goto-line', label: 'Перейти к строке…', key: 'Ctrl+G', run: () => runAction('editor.action.gotoLine') },
+            { separator: true },
+            {
+              id: 'file-start',
+              label: 'В начало файла',
+              key: 'Ctrl+Home',
+              run: () => withEditor((editor) => editor.setPosition({ lineNumber: 1, column: 1 })),
+            },
+            {
+              id: 'file-end',
+              label: 'В конец файла',
+              key: 'Ctrl+End',
+              run: () =>
+                withEditor((editor) => {
+                  const model = editor.getModel()
+                  if (model === undefined) return
+                  const lineNumber = model.getLineCount()
+                  editor.setPosition({ lineNumber, column: model.getLineMaxColumn(lineNumber) })
+                }),
+            },
+            { separator: true },
+            { id: 'next-tab', label: 'Следующая вкладка', key: 'Ctrl+Tab', run: () => cycleTab(1) },
+            { id: 'prev-tab', label: 'Предыдущая вкладка', key: 'Ctrl+Shift+Tab', run: () => cycleTab(-1) },
+            { separator: true },
+            { id: 'definition', label: 'Перейти к определению', disabled: true, hint: 'Нужен языковой сервис (LSP), его в бандле нет; подсказку даёт только модель.' },
+          ],
+        },
+        {
+          id: 'view',
+          label: 'Вид',
+          items: [
+            { id: 'word-wrap', label: wordWrap ? 'Отключить перенос по словам' : 'Включить перенос по словам', run: toggleWordWrap },
+            { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показывать скрытые файлы', run: () => setHidden(!hidden) },
+            { separator: true },
+            { id: 'zoom-in', label: 'Увеличить шрифт', run: () => zoom(1) },
+            { id: 'zoom-out', label: 'Уменьшить шрифт', run: () => zoom(-1) },
+            { id: 'zoom-reset', label: 'Сбросить размер шрифта', run: () => zoom(13 - fontSize) },
+            { separator: true },
+            { id: 'settings', label: 'Настройки IDE…', run: () => setSettingsOpen(true) },
+            { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
+          ],
+        },
+        {
+          id: 'terminal',
+          label: 'Терминал',
+          items: [
+            {
+              id: 'new-terminal',
+              label: 'Новый терминал',
+              disabled: true,
+              hint: 'Терминал DSH открывается отдельной вкладкой правой панели: у плагина нет доступа к PTY, встроить его внутрь IDE нельзя.',
+            },
+          ],
+        },
+        {
+          id: 'help',
+          label: 'Справка',
+          items: [
+            {
+              id: 'about',
+              label: 'О плагине IDE',
+              run: () =>
+                setInfo({
+                  title: 'IDE для DSH',
+                  lines: [
+                    'Отдельный бандл @local/dsh-ide: дерево рабочей папки, вкладки, Monaco, подсказки модели.',
+                    'Проводник, вкладки и настройки свои — встроенный файловый предпросмотр DSH не используется.',
+                    'Исходники и документация: github.com/bmixdev/dsh-code-editor',
+                  ],
+                }),
+            },
+            {
+              id: 'shortcuts',
+              label: 'Горячие клавиши',
+              run: () =>
+                setInfo({
+                  title: 'Горячие клавиши',
+                  lines: [
+                    'Ctrl+S — сохранить файл, Ctrl+Shift+S — сохранить всё',
+                    'Ctrl+W — закрыть вкладку, Ctrl+P — открыть файл по имени',
+                    'Ctrl+G — перейти к строке, Ctrl+Space — подсказка модели',
+                  ],
+                }),
+            },
+          ],
+        },
+      ]
+
       const activeTab = tabs.find((candidate) => candidate.key === activeKey)
       const segments = activeTab === undefined ? [] : activeTab.path.split('/')
       const statusMessage = status.kind === 'error' || status.kind === 'ok' || status.kind === 'busy' ? status.message : ''
@@ -1562,19 +1895,20 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { className: 'dsh-ide-root', 'data-theme': themeName() },
+        menuId === ''
+          ? null
+          : h('div', {
+              className: 'dsh-ide-menu-shield',
+              onClick: () => setMenuId(''),
+              onContextMenu: (event) => {
+                event.preventDefault()
+                setMenuId('')
+              },
+            }),
         h(
           'div',
           { className: 'dsh-ide-top' },
-          h(
-            'button',
-            {
-              type: 'button',
-              className: `dsh-ide-icon-button${menuOpen ? ' dsh-ide-icon-button-active' : ''}`,
-              title: 'Меню IDE',
-              onClick: () => setMenuOpen(!menuOpen),
-            },
-            '☰',
-          ),
+          h(MenuBar, { menus, openId: menuId, onOpen: setMenuId }),
           h('span', { className: 'dsh-ide-top-title', title: activeTab === undefined ? 'IDE' : activeTab.path }, activeTab === undefined ? 'IDE' : activeTab.name),
           h('span', { className: 'dsh-ide-top-spacer' }),
           h('button', { type: 'button', className: 'dsh-ide-button', title: 'Быстрое открытие (Ctrl+P)', onClick: openQuick }, 'Открыть файл'),
@@ -1592,78 +1926,6 @@ window.__ModuleLoader__.load({
             'Сохранить всё',
           ),
         ),
-        menuOpen
-          ? h(
-              'div',
-              { className: 'dsh-ide-menu', role: 'menu' },
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dsh-ide-menu-item',
-                  onClick: () => {
-                    setMenuOpen(false)
-                    void saveActive()
-                  },
-                },
-                h('span', null, 'Сохранить'),
-                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+S'),
-              ),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dsh-ide-menu-item',
-                  onClick: () => {
-                    setMenuOpen(false)
-                    void saveAll()
-                  },
-                },
-                h('span', null, 'Сохранить всё'),
-                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+Shift+S'),
-              ),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dsh-ide-menu-item',
-                  onClick: () => {
-                    setMenuOpen(false)
-                    closeActive()
-                  },
-                },
-                h('span', null, 'Закрыть вкладку'),
-                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+W'),
-              ),
-              h('div', { className: 'dsh-ide-menu-sep' }),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dsh-ide-menu-item',
-                  onClick: () => {
-                    setMenuOpen(false)
-                    openQuick()
-                  },
-                },
-                h('span', null, 'Открыть файл по имени'),
-                h('span', { className: 'dsh-ide-menu-key' }, 'Ctrl+P'),
-              ),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dsh-ide-menu-item',
-                  onClick: () => {
-                    setMenuOpen(false)
-                    setSettingsOpen(true)
-                  },
-                },
-                h('span', null, 'Настройки IDE'),
-                h('span', { className: 'dsh-ide-menu-key' }, ''),
-              ),
-            )
-          : null,
         h(
           'div',
           { className: 'dsh-ide-body' },
@@ -1729,6 +1991,7 @@ window.__ModuleLoader__.load({
                 h(Explorer, {
                   sessionId,
                   hidden,
+                  reloadSignal,
                   activePath: activeTab === undefined ? '' : activeTab.path,
                   onOpenFile: (path) => {
                     void openFile(path, { activate: true })
@@ -1836,6 +2099,8 @@ window.__ModuleLoader__.load({
               },
             })
           : null,
+        prompt === undefined ? null : h(PromptDialog, { prompt, onClose: () => setPrompt(undefined) }),
+        info === undefined ? null : h(InfoDialog, { info, onClose: () => setInfo(undefined) }),
       )
     }
 
@@ -1854,9 +2119,18 @@ window.__ModuleLoader__.load({
   border-bottom:1px solid var(--ide-border); flex:0 0 auto; min-height:32px; }
 .dsh-ide-top-title { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-top-spacer { flex:1 1 auto; }
-.dsh-ide-menu { position:absolute; top:31px; left:8px; z-index:8; min-width:230px; display:flex; flex-direction:column;
+.dsh-ide-menu { display:flex; flex-direction:column; }
+.dsh-ide-menubar { display:flex; align-items:stretch; gap:1px; position:relative; z-index:9; }
+.dsh-ide-menubar-slot { position:relative; }
+.dsh-ide-menubar-button { border:0; background:transparent; color:var(--ide-text); font:inherit; padding:3px 8px;
+  border-radius:4px; cursor:pointer; white-space:nowrap; }
+.dsh-ide-menubar-button:hover, .dsh-ide-menubar-button-active { background:var(--ide-active); }
+.dsh-ide-dropdown { position:absolute; top:100%; left:0; z-index:9; min-width:250px; display:flex; flex-direction:column;
   padding:4px; background:var(--ide-panel-2); border:1px solid var(--ide-border); border-radius:6px;
   box-shadow:0 8px 24px rgba(0,0,0,.45); }
+.dsh-ide-menu-shield { position:fixed; inset:0; z-index:7; }
+.dsh-ide-menu-item:disabled { opacity:.5; cursor:default; }
+.dsh-ide-menu-item:disabled:hover { background:transparent; color:var(--ide-text); }
 .dsh-ide-menu-item { display:flex; align-items:center; justify-content:space-between; gap:18px; border:0; border-radius:4px;
   background:transparent; color:inherit; text-align:left; cursor:pointer; padding:5px 8px; font:inherit; }
 .dsh-ide-menu-item:hover { background:var(--ide-accent); color:#ffffff; }

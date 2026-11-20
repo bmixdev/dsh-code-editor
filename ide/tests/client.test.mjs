@@ -218,4 +218,7 @@ test('every registered component renders its first pass without throwing', async
   const pane = host.registrations.find((entry) => entry.config.name === 'sidebar.right.pane.tab')
   const text = renderText(pane.component({ tab: { contentId: 'dsh-resource://ide/session/session-1', id: 'tab-1' } }))
   assert.match(text, /IDE/)
+  assert.match(text, /Файл/)
+  assert.match(text, /Правка/)
+  assert.match(text, /Справка/)
 })

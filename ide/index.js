@@ -22,7 +22,7 @@
  * layer serves only to the owner principal (this machine's GUI page).
  */
 import { appendFileSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -194,6 +194,7 @@ export function apply(ctx, config) {
     resolve: (body) => resolveSession(body),
     tree: (body, signal) => treeRoute(body, signal),
     files: (body, signal) => filesRoute(body, signal),
+    create: (body, signal) => createRoute(body, signal),
     state: (body) => stateRoute(body),
     catalog: () => buildCatalog(ctx),
     credentials: (body) => credentialsRoute(body),
@@ -677,6 +678,34 @@ export function apply(ctx, config) {
       limit: typeof body.limit === 'number' ? body.limit : undefined,
       signal,
     })
+  }
+
+  // ----------------------------------------------------------------- create
+
+  async function createRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
+    const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
+    if (mode === 'read-only') return fail('read-only', 'Рабочая папка открыта только для чтения.')
+    const relative = typeof body.path === 'string' ? body.path.trim() : ''
+    const segments = relative.split(/[\\/]+/)
+    if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
+      return fail('bad-request', 'Укажите путь к новому файлу внутри рабочей папки.')
+    }
+    const root = await ctx.fs.resolve(scope.cwd, { signal })
+    const target = await ctx.fs.resolve(path.resolve(scope.cwd, relative), { signal })
+    if (!ctx.fs.contains(root, target)) return fail('outside-workspace', 'Файл должен находиться внутри рабочей папки.')
+    const nativePath = ctx.fs.processPath(target)
+    await mkdir(path.dirname(nativePath), { recursive: true })
+    try {
+      await writeFile(nativePath, '', { flag: 'wx' })
+    } catch (error) {
+      if (error !== null && typeof error === 'object' && error.code === 'EEXIST') {
+        return fail('exists', 'Файл с таким путём уже существует — откройте его через Ctrl+P.')
+      }
+      throw error
+    }
+    return { path: relative, created: true }
   }
 
   async function stateRoute(body) {
