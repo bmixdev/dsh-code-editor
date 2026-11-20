@@ -815,7 +815,7 @@ window.__ModuleLoader__.load({
       return `${String(provider || 'PROVIDER').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`
     }
 
-    function SettingsPanel({ preferences, onClose, onSave }) {
+    function SettingsPanel({ preferences, sessionModel, onClose, onSave }) {
       const [provider, setProvider] = React.useState(preferences.completionProvider || '')
       const [model, setModel] = React.useState(preferences.completionModel || '')
       const [autoSuggest, setAutoSuggest] = React.useState(preferences.autoSuggest !== false)
@@ -828,6 +828,8 @@ window.__ModuleLoader__.load({
       const [keyStatus, setKeyStatus] = React.useState(undefined)
       const [keyBusy, setKeyBusy] = React.useState(false)
       const [message, setMessage] = React.useState('')
+      const [query, setQuery] = React.useState('')
+      const [section, setSection] = React.useState('completion')
       const initialProvider = React.useRef(provider).current
 
       const refreshCatalog = React.useCallback(async () => {
@@ -845,10 +847,17 @@ window.__ModuleLoader__.load({
         void refreshCatalog()
       }, [refreshCatalog])
 
-      const group = catalog !== undefined && Array.isArray(catalog.groups) ? catalog.groups.find((entry) => entry.id === provider) : undefined
-      const profile = catalog !== undefined && Array.isArray(catalog.configurable) ? catalog.configurable.find((entry) => entry.provider === provider) : undefined
+      const sessionInfo = sessionModel !== undefined && sessionModel !== null
+        ? sessionModel
+        : catalog !== undefined && catalog !== null && catalog.default !== undefined
+          ? catalog.default
+          : undefined
+      const sessionProvider = sessionInfo === undefined ? '' : sessionInfo.provider
+      const effectiveProvider = provider !== '' ? provider : sessionProvider
+      const group = catalog !== undefined && Array.isArray(catalog.groups) ? catalog.groups.find((entry) => entry.id === effectiveProvider) : undefined
+      const profile = catalog !== undefined && Array.isArray(catalog.configurable) ? catalog.configurable.find((entry) => entry.provider === effectiveProvider) : undefined
       const models = group !== undefined ? group.models : []
-      const sessionModel = catalog !== undefined ? catalog.default : undefined
+      const failures = catalog !== undefined && Array.isArray(catalog.failures) ? catalog.failures : []
 
       const refreshKey = React.useCallback(async (ref) => {
         if (typeof ref !== 'string' || ref === '') {
@@ -864,10 +873,10 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         const saved = preferences.apiKeyRef || ''
-        const suggested = provider === initialProvider && saved !== '' ? saved : providerKeyName(profile, provider)
+        const suggested = provider === initialProvider && saved !== '' ? saved : providerKeyName(profile, effectiveProvider)
         setKeyRef(suggested)
         void refreshKey(suggested)
-      }, [provider, profile === undefined ? '' : profile.settingsNs, preferences.apiKeyRef, initialProvider, refreshKey])
+      }, [effectiveProvider, profile === undefined ? '' : profile.settingsNs, preferences.apiKeyRef, initialProvider, refreshKey])
 
       const saveKey = async () => {
         if (keyValue.trim() === '') {
@@ -948,12 +957,172 @@ window.__ModuleLoader__.load({
       if (model !== '' && !knownModels.has(model)) modelOptions.push(h('option', { key: model, value: model }, `${model} (сохранена ранее)`))
 
       const keyHint = keyStatus === undefined
-        ? ''
+        ? 'Проверяю хранилище ключей…'
         : keyStatus.supported === false
           ? 'Хранилище ключей недоступно: ключ задаётся через окружение (apiKeyEnv профиля).'
           : keyStatus.configured
             ? `Ключ задан${keyStatus.source ? ` (${keyStatus.source})` : ''}${keyStatus.masked ? ` · ${keyStatus.masked}` : ''}`
             : 'Ключ не задан — автодополнение может не работать.'
+
+      const q = query.trim().toLowerCase()
+      const matches = (text) => q === '' || String(text).toLowerCase().includes(q)
+      const searching = q !== ''
+
+      const setting = (id, title, description, control) => {
+        if (!matches(`${title} ${description}`)) return null
+        return h(
+          'div',
+          { className: 'dsh-ide-setting', key: id },
+          h(
+            'div',
+            { className: 'dsh-ide-setting-text' },
+            h('div', { className: 'dsh-ide-setting-title' }, title),
+            description === '' ? null : h('div', { className: 'dsh-ide-setting-desc' }, description),
+          ),
+          h('div', { className: 'dsh-ide-setting-control' }, control),
+        )
+      }
+
+      const block = (id, title, rows) => {
+        const visible = rows.filter((row) => row !== null)
+        if (visible.length === 0) return null
+        return h(
+          'section',
+          { className: 'dsh-ide-settings-section', key: id },
+          h('div', { className: 'dsh-ide-settings-section-title' }, title),
+          visible,
+        )
+      }
+
+      const completionRows = [
+        setting(
+          'provider',
+          'Автодополнение: провайдер',
+          'Пустое значение — провайдер текущей сессии.',
+          h(
+            'select',
+            { className: 'dsh-ide-input dsh-ide-setting-input', value: provider, onChange: (event) => setProvider(event.target.value) },
+            h('option', { value: '' }, sessionInfo !== undefined ? `Как у сессии (${sessionInfo.provider})` : 'Как у сессии'),
+            providerOptions,
+          ),
+        ),
+        setting(
+          'model',
+          'Автодополнение: модель',
+          'Пустое значение — первая модель провайдера.',
+          h('select', { className: 'dsh-ide-input dsh-ide-setting-input', value: model, onChange: (event) => setModel(event.target.value) }, modelOptions),
+        ),
+        setting(
+          'catalog',
+          'Автодополнение: каталог моделей',
+          sessionInfo !== undefined ? `Модель сессии: ${sessionInfo.provider} / ${sessionInfo.model}` : '',
+          h(
+            'button',
+            { type: 'button', className: 'dsh-ide-button', onClick: refreshCatalog, disabled: refreshing },
+            refreshing ? 'Обновляю…' : 'Обновить',
+          ),
+        ),
+        setting(
+          'auto-suggest',
+          'Автодополнение: автоподсказки',
+          'Предлагать подсказку по паузе 200 мс; выключено — только по Ctrl+Space.',
+          h(
+            'label',
+            { className: 'dsh-ide-setting-check' },
+            h('input', { type: 'checkbox', checked: autoSuggest, onChange: (event) => setAutoSuggest(event.target.checked) }),
+            h('span', {}, 'Предлагать по паузе'),
+          ),
+        ),
+        failures.length === 0
+          ? null
+          : setting(
+              'failures',
+              'Автодополнение: ошибки провайдеров',
+              failures.map((failure) => `${failure.name || failure.id}: ${failure.message}`).join('; '),
+              null,
+            ),
+      ]
+
+      const keyRows = [
+        setting(
+          'key-name',
+          'API-ключ: имя переменной',
+          'Переменная окружения из apiKeyEnv профиля DSH.',
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input',
+            type: 'text',
+            value: keyRef,
+            spellCheck: false,
+            placeholder: 'OPENROUTER_API_KEY',
+            onChange: (event) => setKeyRef(event.target.value.trim().toUpperCase()),
+            onBlur: () => void refreshKey(keyRef),
+          }),
+        ),
+        setting(
+          'key-value',
+          'API-ключ: значение',
+          keyHint,
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input',
+            type: 'password',
+            value: keyValue,
+            autoComplete: 'off',
+            spellCheck: false,
+            placeholder: 'оставьте пустым, чтобы не менять',
+            onChange: (event) => setKeyValue(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') void saveKey()
+            },
+          }),
+        ),
+        setting(
+          'key-actions',
+          '',
+          '',
+          h(
+            'div',
+            { className: 'dsh-ide-settings-actions' },
+            h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: saveKey, disabled: keyBusy }, 'Сохранить ключ'),
+            h('button', { type: 'button', className: 'dsh-ide-button', onClick: clearKey, disabled: keyBusy }, 'Удалить ключ'),
+          ),
+        ),
+      ]
+
+      const contextRows = [
+        setting(
+          'context-left',
+          'Контекст: символов до курсора',
+          'От 200 до 20000.',
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-input-number',
+            type: 'number',
+            min: 200,
+            max: 20000,
+            value: contextLeft,
+            onChange: (event) => setContextLeft(event.target.value),
+          }),
+        ),
+        setting(
+          'context-right',
+          'Контекст: символов после курсора',
+          'От 0 до 8000.',
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-input-number',
+            type: 'number',
+            min: 0,
+            max: 8000,
+            value: contextRight,
+            onChange: (event) => setContextRight(event.target.value),
+          }),
+        ),
+      ]
+
+      const sections = [
+        { id: 'completion', label: 'Автодополнение', rows: completionRows },
+        { id: 'key', label: 'API-ключ', rows: keyRows },
+        { id: 'context', label: 'Контекст', rows: contextRows },
+      ]
+      const shown = sections.filter((entry) => searching || entry.id === section)
 
       return h(
         'div',
@@ -961,146 +1130,55 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsh-ide-settings-head' },
-          h('span', {}, 'Настройки IDE'),
+          h('div', { className: 'dsh-ide-settings-head-title' }, 'Параметры'),
+          h('input', {
+            className: 'dsh-ide-settings-search',
+            type: 'search',
+            placeholder: 'Параметры поиска',
+            value: query,
+            spellCheck: false,
+            onChange: (event) => setQuery(event.target.value),
+          }),
           h('button', { type: 'button', className: 'dsh-ide-icon-button', title: 'Закрыть настройки', onClick: onClose }, '✕'),
         ),
         h(
           'div',
-          { className: 'dsh-ide-settings-body' },
+          { className: 'dsh-ide-settings-tabs' },
+          h('span', { className: 'dsh-ide-settings-tab dsh-ide-settings-tab-active' }, 'Пользователь'),
+          h('span', { className: 'dsh-ide-settings-tabs-spacer' }),
+          h('span', { className: 'dsh-ide-settings-tabs-note' }, 'Файл настроек: ~/.dsh/code-editor.json'),
+        ),
+        h(
+          'div',
+          { className: 'dsh-ide-settings-main' },
           h(
-            'section',
-            { className: 'dsh-ide-section' },
-            h('div', { className: 'dsh-ide-legend' }, 'Автодополнение'),
-            h(
-              'label',
-              { className: 'dsh-ide-field' },
-              h('span', { className: 'dsh-ide-field-label' }, 'Провайдер'),
+            'nav',
+            { className: 'dsh-ide-settings-nav' },
+            sections.map((entry) =>
               h(
-                'select',
-                { className: 'dsh-ide-input', value: provider, onChange: (event) => setProvider(event.target.value) },
-                h(
-                  'option',
-                  { value: '' },
-                  sessionModel !== undefined ? `Как у сессии (${sessionModel.provider})` : 'Как у сессии',
-                ),
-                providerOptions,
-              ),
-            ),
-            h(
-              'label',
-              { className: 'dsh-ide-field' },
-              h('span', { className: 'dsh-ide-field-label' }, 'Модель'),
-              h('select', { className: 'dsh-ide-input', value: model, onChange: (event) => setModel(event.target.value) }, modelOptions),
-            ),
-            h(
-              'div',
-              { className: 'dsh-ide-row' },
-              h('button', { type: 'button', className: 'dsh-ide-button', onClick: refreshCatalog, disabled: refreshing }, refreshing ? 'Обновляю…' : 'Обновить каталог'),
-              sessionModel !== undefined
-                ? h('span', { className: 'dsh-ide-hint' }, `Модель сессии: ${sessionModel.provider} / ${sessionModel.model}`)
-                : null,
-            ),
-            catalog !== undefined && Array.isArray(catalog.failures) && catalog.failures.length > 0
-              ? h(
-                  'div',
-                  { className: 'dsh-ide-warn' },
-                  'Не ответили: ',
-                  catalog.failures.map((failure) => `${failure.name || failure.id}: ${failure.message}`).join('; '),
-                )
-              : null,
-            h(
-              'label',
-              { className: 'dsh-ide-check' },
-              h('input', { type: 'checkbox', checked: autoSuggest, onChange: (event) => setAutoSuggest(event.target.checked) }),
-              h('span', {}, 'Автоподсказки по паузе (иначе только Ctrl+Space)'),
-            ),
-          ),
-          h(
-            'section',
-            { className: 'dsh-ide-section' },
-            h('div', { className: 'dsh-ide-legend' }, 'API-ключ провайдера'),
-            h(
-              'label',
-              { className: 'dsh-ide-field' },
-              h('span', { className: 'dsh-ide-field-label' }, 'Имя ключа'),
-              h('input', {
-                className: 'dsh-ide-input',
-                type: 'text',
-                value: keyRef,
-                spellCheck: false,
-                placeholder: 'OPENROUTER_API_KEY',
-                onChange: (event) => setKeyRef(event.target.value.trim().toUpperCase()),
-                onBlur: () => void refreshKey(keyRef),
-              }),
-              h('span', { className: 'dsh-ide-hint' }, 'Имя переменной окружения из apiKeyEnv профиля.'),
-            ),
-            h(
-              'label',
-              { className: 'dsh-ide-field' },
-              h('span', { className: 'dsh-ide-field-label' }, 'Новый ключ'),
-              h('input', {
-                className: 'dsh-ide-input',
-                type: 'password',
-                value: keyValue,
-                autoComplete: 'off',
-                spellCheck: false,
-                placeholder: 'оставьте пустым, чтобы не менять',
-                onChange: (event) => setKeyValue(event.target.value),
-                onKeyDown: (event) => {
-                  if (event.key === 'Enter') void saveKey()
+                'button',
+                {
+                  key: entry.id,
+                  type: 'button',
+                  className: `dsh-ide-settings-nav-item${searching ? '' : section === entry.id ? ' dsh-ide-settings-nav-item-active' : ''}`,
+                  onClick: () => {
+                    setQuery('')
+                    setSection(entry.id)
+                  },
                 },
-              }),
-            ),
-            h(
-              'div',
-              { className: 'dsh-ide-row' },
-              h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: saveKey, disabled: keyBusy }, 'Сохранить ключ'),
-              h('button', { type: 'button', className: 'dsh-ide-button', onClick: clearKey, disabled: keyBusy }, 'Удалить ключ'),
-            ),
-            keyHint === '' ? null : h('div', { className: 'dsh-ide-hint' }, keyHint),
-          ),
-          h(
-            'section',
-            { className: 'dsh-ide-section' },
-            h('div', { className: 'dsh-ide-legend' }, 'Контекст автодополнения'),
-            h(
-              'div',
-              { className: 'dsh-ide-row' },
-              h(
-                'label',
-                { className: 'dsh-ide-field dsh-ide-field-inline' },
-                h('span', { className: 'dsh-ide-field-label' }, 'Символов до курсора'),
-                h('input', {
-                  className: 'dsh-ide-input dsh-ide-input-number',
-                  type: 'number',
-                  min: 200,
-                  max: 20000,
-                  value: contextLeft,
-                  onChange: (event) => setContextLeft(event.target.value),
-                }),
-              ),
-              h(
-                'label',
-                { className: 'dsh-ide-field dsh-ide-field-inline' },
-                h('span', { className: 'dsh-ide-field-label' }, 'После курсора'),
-                h('input', {
-                  className: 'dsh-ide-input dsh-ide-input-number',
-                  type: 'number',
-                  min: 0,
-                  max: 8000,
-                  value: contextRight,
-                  onChange: (event) => setContextRight(event.target.value),
-                }),
+                entry.label,
               ),
             ),
           ),
-          message === '' ? null : h('div', { className: 'dsh-ide-message' }, message),
+          h('div', { className: 'dsh-ide-settings-content' }, shown.map((entry) => block(entry.id, entry.label, entry.rows))),
         ),
         h(
           'div',
           { className: 'dsh-ide-settings-foot' },
-          h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: submit }, 'Сохранить настройки'),
+          message === '' ? null : h('span', { className: 'dsh-ide-settings-message' }, message),
+          h('span', { className: 'dsh-ide-settings-foot-spacer' }),
           h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
+          h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: submit }, 'Сохранить'),
         ),
       )
     }
@@ -1245,6 +1323,7 @@ window.__ModuleLoader__.load({
       const [hidden, setHidden] = React.useState(false)
       const [preferences, setPreferences] = React.useState(undefined)
       const [settingsOpen, setSettingsOpen] = React.useState(false)
+      const [catalog, setCatalog] = React.useState(undefined)
       const [quick, setQuick] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
@@ -1486,6 +1565,7 @@ window.__ModuleLoader__.load({
           void handlersRef.current.saveAll?.()
         })
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => editor.trigger('keyboard', 'editor.action.inlineSuggest.trigger', {}))
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
 
         const provider = monaco.languages.registerInlineCompletionsProvider(
           { pattern: '**' },
@@ -1681,7 +1761,7 @@ window.__ModuleLoader__.load({
         removeTab(current.key)
       }
 
-      handlersRef.current = { saveActive, closeActive, saveAll, openQuick, complete }
+      handlersRef.current = { saveActive, closeActive, saveAll, openQuick, complete, openSettings: () => setSettingsOpen(true) }
 
       const withEditor = (run) => {
         const editor = runtime.current.editor
@@ -1806,7 +1886,7 @@ window.__ModuleLoader__.load({
             { id: 'zoom-out', label: 'Уменьшить шрифт', run: () => zoom(-1) },
             { id: 'zoom-reset', label: 'Сбросить размер шрифта', run: () => zoom(13 - fontSize) },
             { separator: true },
-            { id: 'settings', label: 'Настройки IDE…', run: () => setSettingsOpen(true) },
+            { id: 'settings', label: 'Настройки IDE…', key: 'Ctrl+,', run: () => setSettingsOpen(true) },
             { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
           ],
         },
@@ -2072,7 +2152,12 @@ window.__ModuleLoader__.load({
           ),
         ),
         settingsOpen && preferences !== undefined
-          ? h(SettingsPanel, { preferences, onClose: () => setSettingsOpen(false), onSave: saveSettings })
+          ? h(SettingsPanel, {
+              preferences,
+              sessionModel: catalog === undefined ? undefined : catalog.default,
+              onClose: () => setSettingsOpen(false),
+              onSave: saveSettings,
+            })
           : null,
         quick !== undefined
           ? h(QuickOpen, {
@@ -2215,24 +2300,52 @@ window.__ModuleLoader__.load({
 .dsh-ide-root[data-theme="light"] .dsh-ide-consent { background:#fff4d6; color:#4d3a12; }
 .dsh-ide-consent-text { flex:1 1 auto; min-width:0; }
 .dsh-ide-consent-actions { display:flex; gap:6px; flex:0 0 auto; }
-.dsh-ide-settings { position:absolute; inset:0; z-index:6; display:flex; flex-direction:column; background:var(--ide-panel); }
-.dsh-ide-settings-head { display:flex; align-items:center; justify-content:space-between; padding:8px 10px;
-  border-bottom:1px solid var(--ide-border); font:600 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
-.dsh-ide-settings-body { flex:1 1 auto; overflow:auto; padding:10px 12px 16px; }
-.dsh-ide-section { margin-bottom:16px; }
-.dsh-ide-legend { margin-bottom:6px; color:var(--ide-muted); font:600 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif);
-  letter-spacing:.06em; text-transform:uppercase; }
-.dsh-ide-field { display:flex; flex-direction:column; gap:3px; margin-bottom:9px; }
-.dsh-ide-field-inline { flex:1 1 140px; }
-.dsh-ide-field-label { font-size:11px; color:var(--ide-muted); }
+.dsh-ide-settings { position:absolute; inset:0; z-index:20; display:flex; flex-direction:column;
+  background:var(--ide-bg); color:var(--ide-text); }
+.dsh-ide-settings-head { display:flex; align-items:center; gap:10px; padding:8px 14px;
+  border-bottom:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-settings-head-title { font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); white-space:nowrap; }
+.dsh-ide-settings-search { flex:1 1 auto; max-width:520px; padding:5px 9px; border-radius:4px;
+  border:1px solid var(--ide-border); background:var(--ide-panel-2); color:inherit;
+  font:400 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); outline:none; }
+.dsh-ide-settings-search:focus { border-color:var(--ide-accent); }
+.dsh-ide-settings-tabs { display:flex; align-items:center; gap:14px; padding:0 14px;
+  border-bottom:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-settings-tab { padding:6px 2px 5px; color:var(--ide-muted);
+  font:400 12px/1.4 var(--dsh-font-ui, system-ui, sans-serif); border-bottom:1px solid transparent; }
+.dsh-ide-settings-tab-active { color:var(--ide-text); border-bottom-color:var(--ide-accent); }
+.dsh-ide-settings-tabs-spacer { flex:1 1 auto; }
+.dsh-ide-settings-tabs-note { color:var(--ide-muted); font:400 11px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-settings-main { flex:1 1 auto; display:flex; min-height:0; }
+.dsh-ide-settings-nav { flex:0 0 190px; display:flex; flex-direction:column; gap:1px; padding:10px 8px;
+  border-right:1px solid var(--ide-border); overflow:auto; }
+.dsh-ide-settings-nav-item { text-align:left; border:0; border-radius:4px; background:transparent; color:inherit;
+  cursor:pointer; padding:5px 9px; font:400 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-settings-nav-item:hover { background:var(--ide-hover); }
+.dsh-ide-settings-nav-item-active { background:var(--ide-active); font-weight:600; }
+.dsh-ide-settings-content { flex:1 1 auto; overflow:auto; padding:4px 28px 40px; min-width:0; }
+.dsh-ide-settings-section-title { margin:22px 0 6px; color:var(--ide-text);
+  font:600 18px/1.3 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-settings-section:first-child > .dsh-ide-settings-section-title { margin-top:8px; }
+.dsh-ide-setting { padding:6px 0 14px; }
+.dsh-ide-setting-title { font:600 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-setting-desc { margin-top:2px; max-width:720px; color:var(--ide-muted);
+  font:400 12px/1.55 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-setting-control { margin-top:8px; display:flex; align-items:center; gap:6px; }
+.dsh-ide-setting-input { width:230px; max-width:100%; }
+.dsh-ide-setting-control input[type="checkbox"] { width:14px; height:14px; accent-color:var(--ide-accent); }
+.dsh-ide-setting-check { display:inline-flex; align-items:center; gap:6px; color:var(--ide-text);
+  font:400 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-settings-actions { display:flex; gap:6px; }
+.dsh-ide-settings-foot { display:flex; align-items:center; gap:8px; padding:8px 14px;
+  border-top:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-settings-foot-spacer { flex:1 1 auto; }
+.dsh-ide-settings-message { color:var(--ide-muted); font-size:11px; }
 .dsh-ide-hint { color:var(--ide-muted); font-size:10.5px; line-height:1.45; }
 .dsh-ide-input { width:100%; padding:4px 6px; border-radius:4px; color:inherit; background:var(--ide-bg);
   border:1px solid var(--ide-border); font:400 12px/1.4 var(--dsh-font-ui, system-ui, sans-serif); outline:none; }
 .dsh-ide-input:focus { border-color:var(--ide-accent); }
 .dsh-ide-input-number { width:110px; }
-.dsh-ide-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:8px; }
-.dsh-ide-check { display:flex; align-items:center; gap:6px; font-size:11.5px; }
-.dsh-ide-check input { accent-color:var(--ide-accent); }
 .dsh-ide-button { border:1px solid var(--ide-border); background:var(--ide-panel-2); color:inherit; cursor:pointer;
   border-radius:4px; padding:3px 9px; font:400 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-button:hover:not(:disabled) { background:var(--ide-hover); }
@@ -2240,8 +2353,7 @@ window.__ModuleLoader__.load({
 .dsh-ide-button-primary { background:var(--ide-accent); border-color:var(--ide-accent); color:#fff; }
 .dsh-ide-warn { margin:6px 0; color:#d7ba7d; font-size:10.5px; line-height:1.45; }
 .dsh-ide-message { margin-top:8px; font-size:11px; }
-.dsh-ide-settings-foot { display:flex; gap:8px; padding:8px 12px; border-top:1px solid var(--ide-border); }
-.dsh-ide-modal { position:absolute; inset:0; z-index:9; display:flex; align-items:center; justify-content:center;
+.dsh-ide-modal { position:absolute; inset:0; z-index:30; display:flex; align-items:center; justify-content:center;
   padding:18px; background:rgba(0,0,0,.42); }
 .dsh-ide-modal-top { align-items:flex-start; padding-top:32px; background:rgba(0,0,0,.28); }
 .dsh-ide-modal-card { width:100%; max-width:520px; background:var(--ide-panel); color:var(--ide-text);
