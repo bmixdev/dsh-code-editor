@@ -171,3 +171,32 @@ test('the styles element is tagged and removed on dispose', async () => {
   assert.ok(style, 'a style element is injected')
   assert.match(style.textContent, /\.dsh-ide-root/)
 })
+
+/**
+ * Walks the element tree the stubbed `createElement` produced and calls every
+ * function component once. Effects are skipped, so this exercises the first
+ * render pass only - enough to catch a broken render path.
+ */
+function renderText(element) {
+  if (element === null || element === undefined || element === false) return ''
+  if (typeof element === 'string' || typeof element === 'number') return String(element)
+  if (Array.isArray(element)) return element.map(renderText).join('')
+  const { type, props, children } = element
+  if (typeof type === 'function') return renderText(type({ ...props, children }))
+  return (children ?? []).map(renderText).join('')
+}
+
+test('every registered component renders its first pass without throwing', async () => {
+  const { plugin } = await loadPlugin()
+  const host = createHost()
+  plugin.apply(host.ctx)
+
+  for (const entry of host.registrations) {
+    const props = entry.config.name === 'sidebar.right.pane.tab' ? { tab: { contentId: 'dsh-ide://session/session-1', id: 'tab-1' } } : {}
+    assert.doesNotThrow(() => renderText(entry.component(props)), `${entry.config.name} renders`)
+  }
+
+  const pane = host.registrations.find((entry) => entry.config.name === 'sidebar.right.pane.tab')
+  const text = renderText(pane.component({ tab: { contentId: 'dsh-ide://session/session-1', id: 'tab-1' } }))
+  assert.match(text, /IDE/)
+})
