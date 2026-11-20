@@ -1924,22 +1924,8 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'dsh-ide-top' },
           h(MenuBar, { menus, openId: menuId, onOpen: setMenuId }),
-          h('span', { className: 'dsh-ide-top-title', title: activeTab === undefined ? 'IDE' : activeTab.path }, activeTab === undefined ? 'IDE' : activeTab.name),
           h('span', { className: 'dsh-ide-top-spacer' }),
-          h('button', { type: 'button', className: 'dsh-ide-button', title: 'Быстрое открытие (Ctrl+P)', onClick: openQuick }, 'Открыть файл'),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-ide-button',
-              title: 'Сохранить все изменённые файлы (Ctrl+Shift+S)',
-              disabled: !tabs.some((candidate) => candidate.dirty),
-              onClick: () => {
-                void saveAll()
-              },
-            },
-            'Сохранить всё',
-          ),
+          h('span', { className: 'dsh-ide-top-title', title: activeTab === undefined ? 'IDE' : activeTab.path }, activeTab === undefined ? 'IDE' : activeTab.name),
         ),
         h(
           'div',
@@ -2132,7 +2118,7 @@ window.__ModuleLoader__.load({
 .dsh-ide-root * { box-sizing:border-box; }
 .dsh-ide-top { display:flex; align-items:center; gap:6px; padding:3px 8px; background:var(--ide-panel);
   border-bottom:1px solid var(--ide-border); flex:0 0 auto; min-height:32px; }
-.dsh-ide-top-title { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-top-title { min-width:0; max-width:50%; font-weight:600; color:var(--ide-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-top-spacer { flex:1 1 auto; }
 .dsh-ide-menu { display:flex; flex-direction:column; }
 .dsh-ide-menubar { display:flex; align-items:stretch; gap:1px; position:relative; z-index:9; }
