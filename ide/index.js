@@ -22,7 +22,7 @@
  * layer serves only to the owner principal (this machine's GUI page).
  */
 import { appendFileSync } from 'node:fs'
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -196,6 +196,8 @@ export function apply(ctx, config) {
     files: (body, signal) => filesRoute(body, signal),
     create: (body, signal) => createRoute(body, signal),
     mkdir: (body, signal) => mkdirRoute(body, signal),
+    rename: (body, signal) => renameRoute(body, signal),
+    remove: (body, signal) => removeRoute(body, signal),
     state: (body) => stateRoute(body),
     catalog: () => buildCatalog(ctx),
     credentials: (body) => credentialsRoute(body),
@@ -727,6 +729,56 @@ export function apply(ctx, config) {
     if (existing !== undefined) return fail('exists', 'Папка с таким путём уже существует.')
     await mkdir(nativePath, { recursive: true })
     return { path: relative, created: true }
+  }
+
+  async function renameRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
+    const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
+    if (mode === 'read-only') return fail('read-only', 'Рабочая папка открыта только для чтения.')
+    const from = typeof body.path === 'string' ? body.path.trim() : ''
+    const to = typeof body.to === 'string' ? body.to.trim() : ''
+    for (const relative of [from, to]) {
+      const segments = relative.split(/[\\/]+/)
+      if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
+        return fail('bad-request', 'Укажите путь внутри рабочей папки.')
+      }
+    }
+    const root = await ctx.fs.resolve(scope.cwd, { signal })
+    const targetFrom = await ctx.fs.resolve(path.resolve(scope.cwd, from), { signal })
+    const targetTo = await ctx.fs.resolve(path.resolve(scope.cwd, to), { signal })
+    if (!ctx.fs.contains(root, targetFrom) || !ctx.fs.contains(root, targetTo)) {
+      return fail('outside-workspace', 'Переименование возможно только внутри рабочей папки.')
+    }
+    const nativeFrom = ctx.fs.processPath(targetFrom)
+    const nativeTo = ctx.fs.processPath(targetTo)
+    const existingFrom = await stat(nativeFrom).catch(() => undefined)
+    if (existingFrom === undefined) return fail('not-found', 'Такого файла или папки больше нет — обновите дерево.')
+    const existingTo = await stat(nativeTo).catch(() => undefined)
+    if (existingTo !== undefined) return fail('exists', 'По новому пути уже что-то есть — выберите другое имя.')
+    await mkdir(path.dirname(nativeTo), { recursive: true })
+    await rename(nativeFrom, nativeTo)
+    return { path: to, renamed: true }
+  }
+
+  async function removeRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
+    const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
+    if (mode === 'read-only') return fail('read-only', 'Рабочая папка открыта только для чтения.')
+    const relative = typeof body.path === 'string' ? body.path.trim() : ''
+    const segments = relative.split(/[\\/]+/)
+    if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
+      return fail('bad-request', 'Нельзя удалить рабочую папку целиком — укажите файл или вложенную папку.')
+    }
+    const root = await ctx.fs.resolve(scope.cwd, { signal })
+    const target = await ctx.fs.resolve(path.resolve(scope.cwd, relative), { signal })
+    if (!ctx.fs.contains(root, target)) return fail('outside-workspace', 'Удаление возможно только внутри рабочей папки.')
+    const nativePath = ctx.fs.processPath(target)
+    const info = await stat(nativePath).catch(() => undefined)
+    if (info === undefined) return fail('not-found', 'Такого файла или папки больше нет — обновите дерево.')
+    await rm(nativePath, { recursive: true, force: false })
+    return { path: relative, removed: true }
   }
 
   async function stateRoute(body) {

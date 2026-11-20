@@ -24,6 +24,8 @@ const ROUTES = [
   'files',
   'create',
   'mkdir',
+  'rename',
+  'remove',
   'state',
   'catalog',
   'credentials',
@@ -209,6 +211,37 @@ test('a new folder is created inside the workspace and never replaces one', asyn
 
     const listing = await app.call('tree', { sessionId: SESSION_ID, path: 'notes' })
     assert.deepEqual(listing.body.entries.map((entry) => entry.name), ['draft'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rename and remove stay inside the workspace', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+
+    const renamed = await app.call('rename', { sessionId: SESSION_ID, path: 'README.md', to: 'docs/readme.md' })
+    assert.equal(renamed.status, 200)
+    assert.equal(renamed.body.renamed, true)
+    assert.equal(await readFile(path.join(root, 'docs', 'readme.md'), 'utf8'), '# demo\n')
+
+    const clash = await app.call('rename', { sessionId: SESSION_ID, path: 'docs/readme.md', to: 'src/index.js' })
+    assert.equal(errorCode(clash.body), 'exists')
+
+    const outside = await app.call('rename', { sessionId: SESSION_ID, path: 'docs/readme.md', to: '../escape.md' })
+    assert.equal(errorCode(outside.body), 'bad-request')
+
+    const removed = await app.call('remove', { sessionId: SESSION_ID, path: 'src/util.ts' })
+    assert.equal(removed.status, 200)
+    assert.equal(removed.body.removed, true)
+    await assert.rejects(() => stat(path.join(root, 'src', 'util.ts')))
+
+    const again = await app.call('remove', { sessionId: SESSION_ID, path: 'src/util.ts' })
+    assert.equal(errorCode(again.body), 'not-found')
+
+    const rootRemove = await app.call('remove', { sessionId: SESSION_ID, path: '' })
+    assert.equal(errorCode(rootRemove.body), 'bad-request')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -345,6 +345,64 @@ window.__ModuleLoader__.load({
       const [flat, setFlat] = React.useState(undefined)
       const [flatError, setFlatError] = React.useState('')
       const [reloadKey, setReloadKey] = React.useState(0)
+      const [rowMenu, setRowMenu] = React.useState(undefined)
+      const [moreMenu, setMoreMenu] = React.useState(undefined)
+
+      const workspaceRoot = (() => {
+        const root = cache.get('')
+        return root !== undefined && typeof root.workspaceRoot === 'string' ? root.workspaceRoot : ''
+      })()
+
+      const copy = (value) => {
+        if (typeof props.onCopy === 'function') props.onCopy(value)
+      }
+
+      const menuPoint = (event) => {
+        const width = typeof window === 'undefined' ? 1024 : window.innerWidth
+        const height = typeof window === 'undefined' ? 768 : window.innerHeight
+        return {
+          x: Math.max(4, Math.min(event.clientX, width - 240)),
+          y: Math.max(4, Math.min(event.clientY, height - 280)),
+        }
+      }
+
+      const rowMenuItems = (target) => {
+        if (target === undefined) return []
+        const items = []
+        if (target.type === 'directory') {
+          items.push({ id: 'toggle', label: expanded.has(target.path) ? 'Свернуть' : 'Развернуть', run: () => toggle(target.path, cache.has(target.path)) })
+          items.push({ id: 'new-file', label: 'Новый файл…', run: () => props.onNewFile(target.path) })
+          items.push({ id: 'new-folder', label: 'Новая папка…', run: () => props.onNewFolder(target.path) })
+          items.push({ separator: true })
+        } else {
+          items.push({ id: 'open', label: 'Открыть', run: () => onOpenFile(target.path) })
+          items.push({ separator: true })
+        }
+        items.push({
+          id: 'copy-path',
+          label: 'Копировать путь',
+          run: () => copy(workspaceRoot === '' ? target.path : `${workspaceRoot.replace(/[\\/]+$/, '')}/${target.path}`),
+        })
+        items.push({ id: 'copy-relative', label: 'Копировать относительный путь', run: () => copy(target.path) })
+        items.push({ separator: true })
+        items.push({ id: 'rename', label: 'Переименовать…', key: 'F2', run: () => props.onRename(target.path, target.name, target.type) })
+        items.push({ id: 'delete', label: 'Удалить', key: 'Delete', run: () => props.onDelete(target.path, target.name, target.type) })
+        items.push({ separator: true })
+        items.push({ id: 'terminal', label: 'Открыть во встроенном терминале', disabled: true, hint: 'Встроенного терминала в IDE нет: плагин не получает PTY.' })
+        items.push({ id: 'reveal', label: 'Показать в проводнике ОС', disabled: true, hint: 'Плагин не имеет доступа к оболочке рабочей машины.' })
+        return items
+      }
+
+      const moreMenuItems = [
+        { id: 'new-file', label: 'Новый файл…', run: () => props.onNewFile('') },
+        { id: 'new-folder', label: 'Новая папка…', run: () => props.onNewFolder('') },
+        { separator: true },
+        { id: 'refresh', label: 'Обновить дерево', run: () => setReloadKey((value) => value + 1) },
+        { id: 'collapse', label: 'Свернуть все папки', run: () => setExpanded(new Set()) },
+        { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показать скрытые файлы', run: () => onToggleHidden(!hidden) },
+        workspaceRoot === '' ? null : { separator: true },
+        workspaceRoot === '' ? null : { id: 'copy-root', label: 'Копировать путь рабочей папки', run: () => copy(workspaceRoot) },
+      ].filter(Boolean)
 
       const load = React.useCallback(
         async (relativePath) => {
@@ -427,6 +485,10 @@ window.__ModuleLoader__.load({
                   style: { paddingLeft: '8px' },
                   title: file.path,
                   onClick: () => onOpenFile(file.path),
+                  onContextMenu: (event) => {
+                    event.preventDefault()
+                    setRowMenu({ ...menuPoint(event), path: file.path, name: file.name, type: file.type === 'directory' ? 'directory' : 'file' })
+                  },
                 },
                 h(FileBadge, { name: file.name }),
                 h('span', { className: 'dsh-ide-row-dim' }, dirName(file.path) === '' ? '' : `${dirName(file.path)}/`),
@@ -459,6 +521,10 @@ window.__ModuleLoader__.load({
                   style: { paddingLeft: `${6 + depth * 12}px` },
                   title: path,
                   onClick: () => (isDirectory ? toggle(path, cache.has(path)) : onOpenFile(path)),
+                  onContextMenu: (event) => {
+                    event.preventDefault()
+                    setRowMenu({ ...menuPoint(event), path, name: entry.name, type: isDirectory ? 'directory' : 'file' })
+                  },
                 },
                 ...Array.from({ length: depth }, (_unused, index) => h('span', { key: `g${index}`, className: 'dsh-ide-guide' })),
                 isDirectory
@@ -547,6 +613,20 @@ window.__ModuleLoader__.load({
               },
               hidden ? '◉' : '◎',
             ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-icon-button',
+                title: 'Дополнительные действия',
+                'aria-label': 'Дополнительные действия',
+                onClick: (event) => {
+                  const rect = event.currentTarget.getBoundingClientRect()
+                  setMoreMenu({ x: Math.max(4, rect.right - 240), y: rect.bottom + 4 })
+                },
+              },
+              '⋯',
+            ),
           ),
         ),
         h(
@@ -565,6 +645,8 @@ window.__ModuleLoader__.load({
           }),
         ),
         h('div', { className: 'dsh-ide-tree', role: 'tree' }, rows),
+        rowMenu === undefined ? null : h(TabContextMenu, { menu: rowMenu, items: rowMenuItems(rowMenu), onClose: () => setRowMenu(undefined) }),
+        moreMenu === undefined ? null : h(TabContextMenu, { menu: moreMenu, items: moreMenuItems, onClose: () => setMoreMenu(undefined) }),
       )
     }
 
@@ -785,13 +867,17 @@ window.__ModuleLoader__.load({
                     key: item.id,
                     type: 'button',
                     role: 'menuitem',
-                    className: 'dsh-ide-menu-item',
+                    disabled: item.disabled === true,
+                    title: item.hint === undefined ? undefined : item.hint,
+                    className: item.disabled === true ? 'dsh-ide-menu-item dsh-ide-menu-item-disabled' : 'dsh-ide-menu-item',
                     onClick: () => {
+                      if (item.disabled === true) return
                       onClose()
                       item.run()
                     },
                   },
-                  item.label,
+                  h('span', { className: 'dsh-ide-menu-label' }, item.label),
+                  item.key === undefined ? null : h('span', { className: 'dsh-ide-menu-key' }, item.key),
                 ),
           ),
         ),
@@ -1469,6 +1555,25 @@ window.__ModuleLoader__.load({
     }
 
     function ConfirmDialog({ dialog, onSave, onDiscard, onCancel }) {
+      if (dialog.mode === 'delete') {
+        const kind = dialog.type === 'directory' ? 'папку' : 'файл'
+        return h(
+          'div',
+          { className: 'dsh-ide-modal' },
+          h(
+            'div',
+            { className: 'dsh-ide-modal-card' },
+            h('div', { className: 'dsh-ide-modal-title' }, `Удалить ${kind} «${dialog.name}»?`),
+            h('div', { className: 'dsh-ide-modal-text' }, 'Удаление безвозвратное: корзины в IDE нет. Изменения из открытых вкладок будут потеряны.'),
+            h(
+              'div',
+              { className: 'dsh-ide-modal-actions' },
+              h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: onDiscard }, 'Удалить'),
+              h('button', { type: 'button', className: 'dsh-ide-button', onClick: onCancel }, 'Отмена'),
+            ),
+          ),
+        )
+      }
       const pane = dialog.mode === 'close-pane'
       const many = dialog.mode === 'close-many'
       const count = many && Array.isArray(dialog.keys) ? dialog.keys.length : 0
@@ -2051,6 +2156,21 @@ window.__ModuleLoader__.load({
         setDialog(undefined)
         if (current === undefined) return
         if (mode === 'cancel') return
+        if (current.mode === 'delete') {
+          if (mode !== 'discard') return
+          try {
+            await call('remove', { sessionId, path: current.path })
+            const removed = stateRef.current.tabs.filter(
+              (candidate) => candidate.path === current.path || candidate.path.startsWith(`${current.path}/`),
+            )
+            if (removed.length > 0) removeTabs(removed.map((candidate) => candidate.key))
+            setReloadSignal((previous) => previous + 1)
+            setStatus({ kind: 'ok', message: `Удалено: ${current.path}` })
+          } catch (cause) {
+            setStatus({ kind: 'error', message: describeError(cause) })
+          }
+          return
+        }
         if (current.mode === 'close-pane') {
           if (mode === 'save') await saveAll()
           for (const candidate of stateRef.current.tabs) dirtyTabs.delete(candidate.key)
@@ -2172,6 +2292,36 @@ window.__ModuleLoader__.load({
             }
           },
         })
+      }
+
+      const renamePath = (path, name) => {
+        setPrompt({
+          title: 'Переименовать',
+          label: `Новый путь для «${name}» относительно рабочей папки`,
+          value: path,
+          action: 'Переименовать',
+          submit: async (value) => {
+            const to = normalPath(value)
+            if (to === '' || to === path) return
+            const open = stateRef.current.tabs.find((candidate) => candidate.path === path)
+            try {
+              await call('rename', { sessionId, path, to })
+              if (open !== undefined) {
+                dirtyTabs.delete(open.key)
+                removeTab(open.key)
+              }
+              setReloadSignal((previous) => previous + 1)
+              if (open !== undefined) await openFile(to)
+              setStatus({ kind: 'ok', message: `Переименовано: ${path} → ${to}` })
+            } catch (cause) {
+              setStatus({ kind: 'error', message: describeError(cause) })
+            }
+          },
+        })
+      }
+
+      const deletePath = (path, name, type) => {
+        setDialog({ mode: 'delete', path, name, type })
       }
 
       const createDirectory = (directory = '') => {
@@ -2464,6 +2614,9 @@ window.__ModuleLoader__.load({
                   onToggleHidden: setHidden,
                   onNewFile: createFile,
                   onNewFolder: createDirectory,
+                  onRename: renamePath,
+                  onDelete: deletePath,
+                  onCopy: copyText,
                 }),
               )
             : null,
@@ -2619,6 +2772,9 @@ window.__ModuleLoader__.load({
 .dsh-ide-menu-shield { position:fixed; inset:0; z-index:7; }
 .dsh-ide-menu-item:disabled { opacity:.5; cursor:default; }
 .dsh-ide-menu-item:disabled:hover { background:transparent; color:var(--ide-text); }
+.dsh-ide-menu-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-menu-item-disabled { opacity:.5; cursor:default; }
+.dsh-ide-menu-item-disabled:hover { background:transparent; color:var(--ide-text); }
 .dsh-ide-menu-item { display:flex; align-items:center; justify-content:space-between; gap:18px; border:0; border-radius:4px;
   background:transparent; color:inherit; text-align:left; cursor:pointer; padding:5px 8px; font:inherit; }
 .dsh-ide-menu-item:hover { background:var(--ide-accent); color:#ffffff; }
