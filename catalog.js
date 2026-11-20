@@ -31,6 +31,25 @@ function providerKeyNames(profile) {
 }
 
 /**
+ * The credential seam, looked up on demand.
+ *
+ * It is deliberately not part of the plugin's `inject` list: the editor must
+ * start even where no credential provider is installed, and a missing seam only
+ * turns the key field into a "not available" hint instead of blocking the tab.
+ * @param {object} ctx - Host context.
+ */
+function credentialsOf(ctx) {
+  if (typeof ctx?.get === 'function') {
+    try {
+      return ctx.get('credentials')
+    } catch {
+      return undefined
+    }
+  }
+  return ctx?.credentials
+}
+
+/**
  * Live provider/model catalog plus the credential metadata the drawer displays.
  * @param {object} ctx - Host context carrying `llm` and `agentDefaultModel`.
  */
@@ -75,13 +94,13 @@ export async function buildCatalog(ctx) {
 
 /** Credential status for one key name, or a clear "not available" answer. */
 export async function credentialStatus(ctx, name) {
-  if (typeof ctx.credentials === 'undefined') {
+  if (typeof credentialsOf(ctx) === 'undefined') {
     return { ref: name ?? '', supported: false, message: 'Хранилище ключей недоступно в этой сборке.' }
   }
   const ref = String(name ?? '').trim()
   if (ref === '') return { ref: '', supported: true, configured: false }
   try {
-    const info = await ctx.credentials.describe(ref)
+    const info = await credentialsOf(ctx)?.describe(ref)
     return {
       ref,
       supported: true,
@@ -113,12 +132,12 @@ export async function saveCredential(ctx, { ref, value }) {
       code: 'bad-request',
     })
   }
-  if (typeof ctx.credentials === 'undefined') {
+  if (typeof credentialsOf(ctx) === 'undefined') {
     throw Object.assign(new Error('Хранилище ключей недоступно в этой сборке.'), { code: 'no-credentials' })
   }
   const checked = validateSecret(value)
   if (!checked.ok) throw Object.assign(new Error(checked.message), { code: 'bad-request' })
-  await ctx.credentials.set(name, checked.value)
+  await credentialsOf(ctx)?.set(name, checked.value)
   return credentialStatus(ctx, name)
 }
 
@@ -128,9 +147,9 @@ export async function clearCredential(ctx, { ref }) {
   if (!/^[A-Z][A-Z0-9_]*$/.test(name)) {
     throw Object.assign(new Error('Не указано имя ключа.'), { code: 'bad-request' })
   }
-  if (typeof ctx.credentials === 'undefined') {
+  if (typeof credentialsOf(ctx) === 'undefined') {
     throw Object.assign(new Error('Хранилище ключей недоступно в этой сборке.'), { code: 'no-credentials' })
   }
-  await ctx.credentials.unset(name)
+  await credentialsOf(ctx)?.unset(name)
   return credentialStatus(ctx, name)
 }

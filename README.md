@@ -16,7 +16,8 @@ API, размер контекста, дерево файлов и автопо�
   ресурсной строкой (`dsh-resource://file/session/<sessionId>/<path>`), но
   собственным `kind`, поэтому превью и редактор одного файла — разные вкладки.
 * **Дерево файлов** (кнопка «Файлы»). Папки раскрываются по клику, файл
-  открывается в редакторе. Генерируемые каталоги (`node_modules`, `dist`,
+  открывается в редакторе, фильтр по имени подсвечивает совпадения в уже
+  загруженных каталогах. Генерируемые каталоги (`node_modules`, `dist`,
   `.git`, `target`, …) пропускаются, точка-файлы скрыты по умолчанию.
 * **Строчные подсказки** модели: `Tab` принимает, `Esc` отклоняет,
   `Ctrl+Space` просит подсказку вручную. Подсказки включаются для рабочей папки
@@ -128,11 +129,13 @@ plugin_manager action=install_bundle target=<абсолютный путь к э
 ## Тесты
 
 ```
-node --test tests/completion.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs
+node --test tests/completion.test.mjs tests/client-smoke.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs
 ```
 
 `tests/host-smoke.mjs` — открытие/сохранение/подсказки через фейковый Host,
 `tests/editor-state.test.mjs` — настройки, дерево, каталог моделей и ключи,
+`tests/client-smoke.test.mjs` — загрузка клиентского бандла через
+`__ModuleLoader__` и регистрация вкладки, слотов и защиты от закрытия,
 `tests/completion.test.mjs` — фильтры постобработки ответа.
 
 ## Структура

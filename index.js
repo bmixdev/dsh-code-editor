@@ -148,7 +148,6 @@ export const inject = [
   'sandboxPolicy',
   'llm',
   'agentDefaultModel',
-  'credentials',
 ]
 
 export function apply(ctx, config) {

@@ -240,6 +240,7 @@ window.__ModuleLoader__.load({
       const [cache, setCache] = React.useState(() => new Map())
       const [error, setError] = React.useState('')
       const [pending, setPending] = React.useState('')
+      const [query, setQuery] = React.useState('')
 
       const load = React.useCallback(
         async (relativePath) => {
@@ -268,12 +269,41 @@ window.__ModuleLoader__.load({
         void load('')
       }, [load])
 
+      // A filter narrows the rows already loaded; directories that hold a match
+      // stay on screen with their matching children, whatever the accordion state.
+      const needle = query.trim().toLowerCase()
+      const filtering = needle !== ''
+      const visible = new Set()
+      if (filtering) {
+        const collect = (directory) => {
+          const listing = cache.get(directory)
+          if (listing === undefined) return false
+          let found = false
+          for (const entry of listing.entries) {
+            const path = directory === '' ? entry.name : `${directory}/${entry.name}`
+            const nested = entry.type === 'directory' ? collect(path) : false
+            if (nested || entry.name.toLowerCase().includes(needle)) {
+              visible.add(path)
+              found = true
+            }
+          }
+          return found
+        }
+        collect('')
+      }
+
       const rows = []
       const walk = (directory, depth) => {
         const listing = cache.get(directory)
         if (listing === undefined) return
         for (const entry of listing.entries) {
           const path = directory === '' ? entry.name : `${directory}/${entry.name}`
+          if (filtering) {
+            if (!visible.has(path)) continue
+            rows.push({ entry, path, depth })
+            if (entry.type === 'directory') walk(path, depth + 1)
+            continue
+          }
           rows.push({ entry, path, depth })
           if (entry.type === 'directory' && expanded.has(path)) walk(path, depth + 1)
         }
@@ -315,15 +345,27 @@ window.__ModuleLoader__.load({
             '⟳',
           ),
         ),
+        h(
+          'div',
+          { className: 'dsh-ce-tree-search' },
+          h('input', {
+            className: 'dsh-ce-tree-input',
+            value: query,
+            placeholder: 'Фильтр по имени',
+            spellCheck: false,
+            'aria-label': 'Фильтр файлов по имени',
+            onChange: (event) => setQuery(event.target.value),
+          }),
+        ),
         error === '' ? null : h('div', { className: 'dsh-ce-tree-error' }, error),
         root === undefined
           ? h('div', { className: 'dsh-ce-tree-empty' }, pending === '' ? 'Загрузка…' : '…')
           : rows.length === 0
-            ? h('div', { className: 'dsh-ce-tree-empty' }, 'Пустая папка')
+            ? h('div', { className: 'dsh-ce-tree-empty' }, filtering ? 'Ничего не найдено' : 'Пустая папка')
             : rows.map((row) => {
                 const entry = row.entry
                 const isDirectory = entry.type === 'directory'
-                const open = expanded.has(row.path)
+                const open = filtering || expanded.has(row.path)
                 return h(
                   'button',
                   {
@@ -392,6 +434,9 @@ window.__ModuleLoader__.load({
       const groups = catalog && Array.isArray(catalog.groups) ? catalog.groups : []
       const configurable = catalog && Array.isArray(catalog.configurable) ? catalog.configurable : []
       const profile = configurable.find((item) => item.provider === provider)
+      // The saved key name outlives the suggested one: only a deliberate
+      // provider switch replaces it, so reopening the drawer keeps the choice.
+      const initialProvider = React.useRef(provider).current
 
       const refreshCatalog = React.useCallback(async () => {
         setRefreshing(true)
@@ -421,7 +466,8 @@ window.__ModuleLoader__.load({
       }, [])
 
       React.useEffect(() => {
-        const suggested = providerKeyName(profile, provider)
+        const saved = preferences.apiKeyRef || ''
+        const suggested = provider === initialProvider && saved !== '' ? saved : providerKeyName(profile, provider)
         setKeyRef(suggested)
         void refreshKey(suggested)
       }, [provider, profile && profile.settingsNs])
@@ -459,6 +505,10 @@ window.__ModuleLoader__.load({
       }, [keyRef])
 
       const submit = React.useCallback(async () => {
+        const toNumber = (value, fallback) => {
+          const parsed = Number(value)
+          return Number.isFinite(parsed) ? parsed : fallback
+        }
         setSaving(true)
         setMessage('')
         try {
@@ -468,8 +518,8 @@ window.__ModuleLoader__.load({
             fileTree,
             hiddenFiles,
             autoSuggest,
-            contextLeft: Number(contextLeft),
-            contextRight: Number(contextRight),
+            contextLeft: toNumber(contextLeft, preferences.contextLeft),
+            contextRight: toNumber(contextRight, preferences.contextRight),
             apiKeyRef: keyRef,
           })
           setMessage('Настройки сохранены.')
@@ -520,6 +570,9 @@ window.__ModuleLoader__.load({
                 },
                 h('option', { value: '' }, `Как у сессии${sessionModel ? ` (${sessionModel.provider})` : ''}`),
                 groups.map((group) => h('option', { key: group.id, value: group.id }, group.name)),
+                provider !== '' && !groups.some((group) => group.id === provider)
+                  ? h('option', { key: `configured-${provider}`, value: provider }, `${provider} (нет в каталоге)`)
+                  : null,
               ),
               'Пусто — модель сессии, та же, что отвечает в чате.',
             ),
@@ -534,6 +587,9 @@ window.__ModuleLoader__.load({
                 },
                 h('option', { value: '' }, 'Первая доступная у провайдера'),
                 modelOptions.map((item) => h('option', { key: item.id, value: item.id }, item.name)),
+                model !== '' && !modelOptions.some((item) => item.id === model)
+                  ? h('option', { key: `saved-${model}`, value: model }, `${model} (сохранена ранее)`)
+                  : null,
               ),
               profile === undefined && provider !== '' ? 'Провайдер не найден в каталоге.' : undefined,
             ),
@@ -1517,6 +1573,9 @@ window.__ModuleLoader__.load({
 .dsh-ce-tree-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 6px 4px; font: 600 11px/1.4 var(--dsh-font-ui, system-ui, sans-serif); opacity: .8; }
 .dsh-ce-tree-refresh { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 12px; padding: 0 4px; opacity: .7; }
 .dsh-ce-tree-refresh:hover { opacity: 1; }
+.dsh-ce-tree-search { padding: 0 6px 4px; }
+.dsh-ce-tree-input { width: 100%; box-sizing: border-box; border: 1px solid var(--dsh-border, rgba(127,127,127,.3)); border-radius: 4px; background: var(--dsh-input-bg, rgba(127,127,127,.1)); color: inherit; font: 400 11px/1.5 var(--dsh-font-ui, system-ui, sans-serif); padding: 2px 6px; }
+.dsh-ce-tree-input:focus { outline: none; border-color: var(--dsh-accent, #4c8bf5); }
 .dsh-ce-tree-row { display: flex; align-items: center; width: 100%; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; padding: 1px 6px; font: inherit; }
 .dsh-ce-tree-row:hover { background: var(--dsh-hover, rgba(127,127,127,.14)); }
 .dsh-ce-tree-active { background: var(--dsh-hover, rgba(127,127,127,.2)); }
