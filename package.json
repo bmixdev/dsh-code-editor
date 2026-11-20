@@ -34,9 +34,11 @@
     "locale/*.json",
     "icon.svg",
     "vendor",
-    "tests"
+    "tests",
+    "scripts"
   ],
   "scripts": {
+    "check": "node scripts/check-manifests.mjs",
     "test": "node --test tests/completion.test.mjs tests/client-smoke.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs"
   },
   "engines": {

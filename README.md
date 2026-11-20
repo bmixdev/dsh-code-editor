@@ -136,9 +136,39 @@ plugin_manager action=install_bundle target=<абсолютный путь к э
 3. Кнопка «⚙» открывает настройки: провайдер и модель подсказок, ключ API, размер контекста.
 4. «Сохранить настройки» пишет `~/.dsh/code-editor.json` (или файл из переменной `DSH_CODE_EDITOR_PREFS`).
 
+### Манифест профиля: только UTF-8 без BOM
+
+DSH читает `~/.dsh/profiles/<profile>/package.json` как `JSON.parse` от строки из
+`readFileSync(..., 'utf8')`, а `JSON.parse` не снимает BOM. Один
+`Set-Content -Encoding utf8` в Windows PowerShell добавляет `EF BB BF` — и
+следующий старт падает с `DesktopHostFatalError: Unexpected token '\uFEFF'`, ещё до
+загрузки плагинов. Поэтому манифест профиля правьте так:
+
+```powershell
+# PowerShell 5.1: .NET API, без BOM
+$json = Get-Content -Raw -Encoding UTF8 .\package.json
+[IO.File]::WriteAllText((Resolve-Path .\package.json), $json, [Text.UTF8Encoding]::new($false))
+```
+
+```js
+// Node
+await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+```
+
+Проверка перед выпуском и после правки профиля:
+
+```
+npm run check
+```
+
+`scripts/check-manifests.mjs` обходит репозиторий и профили в `~/.dsh`, ищет BOM
+в текстовых файлах, проверяет `package.json` через `JSON.parse` и падает с
+кодом 1, если что-то не так.
+
 ## Тесты
 
 ```
+npm run check
 node --test tests/completion.test.mjs tests/client-smoke.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs
 ```
 
