@@ -433,7 +433,11 @@ window.__ModuleLoader__.load({
 
       const groups = catalog && Array.isArray(catalog.groups) ? catalog.groups : []
       const configurable = catalog && Array.isArray(catalog.configurable) ? catalog.configurable : []
-      const profile = configurable.find((item) => item.provider === provider)
+      // An empty choice means "whatever the session uses", so the key name and
+      // the model list must follow the session's provider rather than nothing.
+      const sessionProvider = sessionModel && typeof sessionModel.provider === 'string' ? sessionModel.provider : ''
+      const effectiveProvider = provider !== '' ? provider : sessionProvider
+      const profile = configurable.find((item) => item.provider === effectiveProvider)
       // The saved key name outlives the suggested one: only a deliberate
       // provider switch replaces it, so reopening the drawer keeps the choice.
       const initialProvider = React.useRef(provider).current
@@ -467,13 +471,25 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         const saved = preferences.apiKeyRef || ''
-        const suggested = provider === initialProvider && saved !== '' ? saved : providerKeyName(profile, provider)
+        const suggested = provider === initialProvider && saved !== '' ? saved : providerKeyName(profile, effectiveProvider)
         setKeyRef(suggested)
         void refreshKey(suggested)
-      }, [provider, profile && profile.settingsNs])
+      }, [provider, effectiveProvider, profile && profile.settingsNs])
 
-      const selectedGroup = groups.find((group) => group.id === provider)
+      const selectedGroup = groups.find((group) => group.id === effectiveProvider)
       const modelOptions = selectedGroup === undefined ? [] : selectedGroup.models
+      // Providers with a key but no discovered models still belong in the list:
+      // otherwise the API-key section would be unreachable exactly when the key
+      // is missing.
+      const providerOptions = (() => {
+        const seen = new Map()
+        for (const group of groups) seen.set(group.id, group.name)
+        for (const item of configurable) {
+          if (!seen.has(item.provider)) seen.set(item.provider, item.displayName || item.provider)
+        }
+        if (provider !== '' && !seen.has(provider)) seen.set(provider, `${provider} (нет в каталоге)`)
+        return Array.from(seen, ([id, name]) => ({ id, name }))
+      })()
 
       const saveKey = React.useCallback(async () => {
         setKeyBusy(true)
@@ -569,10 +585,7 @@ window.__ModuleLoader__.load({
                   },
                 },
                 h('option', { value: '' }, `Как у сессии${sessionModel ? ` (${sessionModel.provider})` : ''}`),
-                groups.map((group) => h('option', { key: group.id, value: group.id }, group.name)),
-                provider !== '' && !groups.some((group) => group.id === provider)
-                  ? h('option', { key: `configured-${provider}`, value: provider }, `${provider} (нет в каталоге)`)
-                  : null,
+                providerOptions.map((item) => h('option', { key: item.id, value: item.id }, item.name)),
               ),
               'Пусто — модель сессии, та же, что отвечает в чате.',
             ),
@@ -625,7 +638,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dsh-ce-settings-section' },
-            h('div', { className: 'dsh-ce-settings-legend' }, 'API-ключ провайдера'),
+            h('div', { className: 'dsh-ce-settings-legend' }, effectiveProvider === '' ? 'API-ключ провайдера' : `API-ключ провайдера ${effectiveProvider}`),
             row(
               'Имя ключа',
               h('input', {
