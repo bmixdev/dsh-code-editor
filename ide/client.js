@@ -23,6 +23,11 @@ window.__ModuleLoader__.load({
     const TAB_ID = '@local/dsh-ide'
     const TAB_KIND = 'dsh-ide'
     const ACTION_ID = 'dsh-ide.open'
+    const ACTION_SLOTS = [
+      ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
+      ['sidebar.right.tab.files.actions', `${ACTION_ID}.files`, 30, 'IDE'],
+      ['sidebar.right.tab.guide.actions', `${ACTION_ID}.guide`, 30, 'IDE'],
+    ]
     const API_BASE = '/api/ide/'
     const ASSET_BASE = '/ide/vs'
     const ADDRESS_PREFIX = 'dsh-ide://session/'
@@ -938,13 +943,14 @@ window.__ModuleLoader__.load({
       const absolutePath =
         props && typeof props.absolutePath === 'string' ? props.absolutePath : parsed !== undefined ? parsed.path : ''
       const label = props && typeof props.label === 'string' ? props.label : 'IDE'
+      const providedSession = props && typeof props.sessionId === 'string' ? props.sessionId : ''
 
       const open = React.useCallback(
         async (event) => {
           setError('')
           setBusy(true)
           try {
-            let sessionId = sessionIdFromElement(event && event.currentTarget)
+            let sessionId = providedSession !== '' ? providedSession : sessionIdFromElement(event && event.currentTarget)
             if (sessionId === undefined) {
               if (absolutePath === '') {
                 setError('Не удалось определить сессию')
@@ -969,7 +975,7 @@ window.__ModuleLoader__.load({
             setBusy(false)
           }
         },
-        [absolutePath],
+        [absolutePath, providedSession],
       )
 
       return h(
@@ -1724,9 +1730,9 @@ window.__ModuleLoader__.load({
           'dsh-ide: unsaved close guard',
         )
 
-        ctx.slots.inject('sidebar.right.tab.document.actions', () =>
-          ctx.slots.register({ name: 'sidebar.right.tab.document.actions', id: ACTION_ID, order: 30 }, OpenIdeButton),
-        )
+        for (const [slot, id, order, label] of ACTION_SLOTS) {
+          ctx.slots.inject(slot, () => ctx.slots.register({ name: slot, id, order, label }, OpenIdeButton))
+        }
       },
     }
 

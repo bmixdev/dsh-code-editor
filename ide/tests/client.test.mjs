@@ -129,12 +129,22 @@ test('apply registers the tab type, its slots, the action and the close guard', 
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab.title',
     'sidebar.right.tab.document.actions',
+    'sidebar.right.tab.files.actions',
+    'sidebar.right.tab.guide.actions',
   ])
 
   const action = host.registrations.find((entry) => entry.config.name === 'sidebar.right.tab.document.actions')
   assert.ok(action, 'the document toolbar action is registered')
   assert.equal(action.config.id, 'dsh-ide.open')
   assert.equal(action.config.order, 30)
+
+  const filesAction = host.registrations.find((entry) => entry.config.name === 'sidebar.right.tab.files.actions')
+  assert.ok(filesAction, 'the files toolbar action is registered')
+  assert.equal(filesAction.config.id, 'dsh-ide.open.files')
+
+  const guideAction = host.registrations.find((entry) => entry.config.name === 'sidebar.right.tab.guide.actions')
+  assert.ok(guideAction, 'the guide toolbar action is registered')
+  assert.equal(guideAction.config.id, 'dsh-ide.open.guide')
 
   assert.equal(host.closeHandlers.length, 1)
   assert.equal(host.closeHandlers[0].kind, 'dsh-ide')
