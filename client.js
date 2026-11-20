@@ -1408,7 +1408,6 @@ window.__ModuleLoader__.load({
                 setTreeOpen(next)
                 void call('prefs', { patch: { fileTree: next } }).catch(() => {})
               },
-              disabled: document === undefined,
               title: 'Дерево файлов рабочей папки',
             },
             'Файлы',
@@ -1419,8 +1418,7 @@ window.__ModuleLoader__.load({
               type: 'button',
               className: 'dsh-ce-button',
               onClick: openSettings,
-              disabled: document === undefined,
-              title: 'Настройки: провайдер и модель подсказок, API-ключ, контекст',
+              title: 'Настройки: провайдер и модель подсказок, ключ API, контекст',
             },
             '⚙',
           ),

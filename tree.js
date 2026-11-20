@@ -7,7 +7,7 @@
  * path outside the session workspace is rejected by exactly the same check that
  * guards opening a file.
  */
-import { readdir, lstat } from 'node:fs/promises'
+import { readdir, lstat, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
 /** Folders that are never worth walking in an editor tree. */
@@ -47,6 +47,15 @@ function fail(code, message) {
   return Object.assign(new Error(message), { code })
 }
 
+/** Real path of a local path, or undefined when the platform or link refuses to say. */
+async function safeRealpath(local) {
+  try {
+    return await realpath(local)
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * List one directory inside the session workspace.
  * @param {object} ctx - Host context carrying `fs`.
@@ -68,6 +77,17 @@ export async function listTree(ctx, { cwd, relativePath = '', hidden = false, si
   if (info.type !== 'directory') throw fail('not-a-directory', `Это не папка: ${requested}`)
 
   const native = ctx.fs.processPath(target)
+  // `contains` compares paths as text, so a symlink inside the workspace can
+  // still point at /etc or C:\Windows. A link is listed (the tree marks it) but
+  // its target must resolve inside the workspace before the folder is walked.
+  const real = await safeRealpath(native)
+  const realRoot = await safeRealpath(ctx.fs.processPath(root))
+  if (real !== undefined && realRoot !== undefined) {
+    const prefix = realRoot.endsWith(path.sep) ? realRoot : `${realRoot}${path.sep}`
+    if (real !== realRoot && !real.startsWith(prefix)) {
+      throw fail('outside-workspace', `Ссылка выводит за рабочую область: ${requested}`)
+    }
+  }
   let dirents
   try {
     dirents = await readdir(native, { withFileTypes: true })
