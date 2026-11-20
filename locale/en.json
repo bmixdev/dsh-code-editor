@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Code editor",
+    "description": "Monaco code editor in the right sidebar: browse the workspace tree, edit the open file, accept an AI suggestion with Tab, tune the completion model and API key in the settings drawer."
+  }
+}

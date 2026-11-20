@@ -1,0 +1,7 @@
+# Scratch files used while extracting the plugin from the original session.
+.tmp-*
+
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

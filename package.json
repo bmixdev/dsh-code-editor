@@ -1,0 +1,60 @@
+﻿{
+  "name": "@local/dsh-code-editor",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Monaco code editor tab for DeepSeek Harness: workspace file tree, AI inline completions with a provider/model chooser, in-app settings, guarded save and quote-to-chat.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bmixdev/dsh-code-editor.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "monaco",
+    "code-editor",
+    "inline-completion"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "completion.js",
+    "tree.js",
+    "catalog.js",
+    "prefs.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "vendor",
+    "tests"
+  ],
+  "scripts": {
+    "test": "node --test tests/completion.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview",
+        "@deepseek-ai/dsh-client-ui-theme"
+      ]
+    }
+  }
+}
