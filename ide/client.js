@@ -662,7 +662,7 @@ window.__ModuleLoader__.load({
     }
 
     function TabStrip(props) {
-      const { tabs, activeKey, onActivate, onClose } = props
+      const { tabs, activeKey, onActivate, onClose, onContextMenu } = props
       return h(
         'div',
         { className: 'dsh-ide-tabs', role: 'tablist' },
@@ -677,6 +677,11 @@ window.__ModuleLoader__.load({
                   role: 'tab',
                   title: tab.path,
                   onClick: () => onActivate(tab.key),
+                  onContextMenu: (event) => {
+                    event.preventDefault()
+                    onActivate(tab.key)
+                    if (typeof onContextMenu === 'function') onContextMenu(tab.key, event)
+                  },
                   onAuxClick: (event) => {
                     if (event.button === 1) {
                       event.preventDefault()
@@ -703,6 +708,50 @@ window.__ModuleLoader__.load({
                 ),
               ),
             ),
+      )
+    }
+
+    // ---------------------------------------------------------- tab context
+
+    function TabContextMenu({ menu, items, onClose }) {
+      return h(
+        'div',
+        {
+          className: 'dsh-ide-menu-shield',
+          onClick: onClose,
+          onContextMenu: (event) => {
+            event.preventDefault()
+            onClose()
+          },
+        },
+        h(
+          'div',
+          {
+            className: 'dsh-ide-context',
+            style: { left: `${menu.x}px`, top: `${menu.y}px` },
+            role: 'menu',
+            onClick: (event) => event.stopPropagation(),
+            onContextMenu: (event) => event.preventDefault(),
+          },
+          items.map((item, index) =>
+            item.separator === true
+              ? h('div', { className: 'dsh-ide-menu-sep', key: `separator-${index}` })
+              : h(
+                  'button',
+                  {
+                    key: item.id,
+                    type: 'button',
+                    role: 'menuitem',
+                    className: 'dsh-ide-menu-item',
+                    onClick: () => {
+                      onClose()
+                      item.run()
+                    },
+                  },
+                  item.label,
+                ),
+          ),
+        ),
       )
     }
 
@@ -1185,18 +1234,26 @@ window.__ModuleLoader__.load({
 
     function ConfirmDialog({ dialog, onSave, onDiscard, onCancel }) {
       const pane = dialog.mode === 'close-pane'
+      const many = dialog.mode === 'close-many'
+      const count = many && Array.isArray(dialog.keys) ? dialog.keys.length : 0
+      const title = pane
+        ? 'Закрыть IDE с несохранёнными файлами?'
+        : many
+          ? `Закрыть ${count} ${count === 1 ? 'вкладку' : 'вкладок'} с изменениями?`
+          : 'Закрыть файл с изменениями?'
+      const text = pane
+        ? 'В панели остались несохранённые файлы. Сохранить их перед закрытием?'
+        : many
+          ? 'В выбранных вкладках есть несохранённые изменения. Сохранить их перед закрытием?'
+          : 'Изменения не сохранены. Сохранить перед закрытием?'
       return h(
         'div',
         { className: 'dsh-ide-modal' },
         h(
           'div',
           { className: 'dsh-ide-modal-card' },
-          h('div', { className: 'dsh-ide-modal-title' }, pane ? 'Закрыть IDE с несохранёнными файлами?' : 'Закрыть файл с изменениями?'),
-          h(
-            'div',
-            { className: 'dsh-ide-modal-text' },
-            pane ? 'В панели остались несохранённые файлы. Сохранить их перед закрытием?' : 'Изменения не сохранены. Сохранить перед закрытием?',
-          ),
+          h('div', { className: 'dsh-ide-modal-title' }, title),
+          h('div', { className: 'dsh-ide-modal-text' }, text),
           h(
             'div',
             { className: 'dsh-ide-modal-actions' },
@@ -1324,6 +1381,7 @@ window.__ModuleLoader__.load({
       const [preferences, setPreferences] = React.useState(undefined)
       const [settingsOpen, setSettingsOpen] = React.useState(false)
       const [catalog, setCatalog] = React.useState(undefined)
+      const [tabMenu, setTabMenu] = React.useState(undefined)
       const [quick, setQuick] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
@@ -1752,6 +1810,15 @@ window.__ModuleLoader__.load({
           closePane()
           return
         }
+        if (current.mode === 'close-many') {
+          if (mode === 'save') {
+            for (const key of current.keys) await saveKey(key)
+          } else {
+            for (const key of current.keys) dirtyTabs.delete(key)
+          }
+          for (const key of current.keys) removeTab(key)
+          return
+        }
         if (mode === 'save') {
           const saved = await saveKey(current.key)
           if (!saved) return
@@ -1776,14 +1843,39 @@ window.__ModuleLoader__.load({
         })
       }
 
-      const closeAllTabs = () => {
-        const current = stateRef.current.tabs
-        const dirty = current.filter((candidate) => candidate.dirty)
+      const closeMany = (keys) => {
+        const targets = stateRef.current.tabs.filter((candidate) => keys.includes(candidate.key))
+        if (targets.length === 0) return
+        const dirty = targets.filter((candidate) => candidate.dirty)
         if (dirty.length > 0) {
-          setStatus({ kind: 'error', message: `Сначала сохраните изменённые файлы: ${dirty.map((candidate) => candidate.name).join(', ')}` })
+          setDialog({ mode: 'close-many', keys: targets.map((candidate) => candidate.key) })
           return
         }
-        for (const candidate of current) removeTab(candidate.key)
+        for (const candidate of targets) removeTab(candidate.key)
+      }
+
+      const closeAllTabs = () => closeMany(stateRef.current.tabs.map((candidate) => candidate.key))
+
+      const closeOtherTabs = (key) => closeMany(stateRef.current.tabs.filter((candidate) => candidate.key !== key).map((candidate) => candidate.key))
+
+      const copyText = async (value) => {
+        try {
+          if (navigator.clipboard === undefined) throw new Error('Буфер обмена недоступен')
+          await navigator.clipboard.writeText(value)
+          setStatus({ kind: 'ok', message: `Скопировано: ${value}` })
+        } catch {
+          setStatus({ kind: 'error', message: 'Буфер обмена недоступен в этом окне.' })
+        }
+      }
+
+      const openTabMenu = (key, event) => {
+        const width = typeof window === 'undefined' ? 1024 : window.innerWidth
+        const height = typeof window === 'undefined' ? 768 : window.innerHeight
+        setTabMenu({
+          key,
+          x: Math.max(4, Math.min(event.clientX, width - 220)),
+          y: Math.max(4, Math.min(event.clientY, height - 200)),
+        })
       }
 
       const cycleTab = (step) => {
@@ -1987,6 +2079,20 @@ window.__ModuleLoader__.load({
       const segments = activeTab === undefined ? [] : activeTab.path.split('/')
       const statusMessage = status.kind === 'error' || status.kind === 'ok' || status.kind === 'busy' ? status.message : ''
 
+      const tabMenuTarget = tabMenu === undefined ? undefined : tabs.find((candidate) => candidate.key === tabMenu.key)
+      const tabMenuItems = tabMenuTarget === undefined
+        ? []
+        : [
+            tabMenuTarget.dirty
+              ? { id: 'save', label: 'Сохранить', run: () => void saveKey(tabMenuTarget.key) }
+              : null,
+            { id: 'close', label: 'Закрыть', run: () => closeTab(tabMenuTarget.key) },
+            { id: 'close-others', label: 'Закрыть другие', run: () => closeOtherTabs(tabMenuTarget.key) },
+            { id: 'close-all', label: 'Закрыть все', run: () => closeAllTabs() },
+            { separator: true },
+            { id: 'copy-path', label: 'Копировать путь', run: () => void copyText(tabMenuTarget.path) },
+          ].filter(Boolean)
+
       return h(
         'div',
         { className: 'dsh-ide-root', 'data-theme': themeName() },
@@ -2087,7 +2193,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dsh-ide-editor' },
-            h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab }),
+            h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab, onContextMenu: openTabMenu }),
             consent === undefined
               ? null
               : h(
@@ -2185,6 +2291,9 @@ window.__ModuleLoader__.load({
               },
             })
           : null,
+        tabMenu === undefined || tabMenuItems.length === 0
+          ? null
+          : h(TabContextMenu, { menu: tabMenu, items: tabMenuItems, onClose: () => setTabMenu(undefined) }),
         prompt === undefined ? null : h(PromptDialog, { prompt, onClose: () => setPrompt(undefined) }),
         info === undefined ? null : h(InfoDialog, { info, onClose: () => setInfo(undefined) }),
       )
@@ -2223,6 +2332,9 @@ window.__ModuleLoader__.load({
 .dsh-ide-menu-key { color:var(--ide-muted); font-size:10.5px; }
 .dsh-ide-menu-item:hover .dsh-ide-menu-key { color:#ffffff; }
 .dsh-ide-menu-sep { height:1px; margin:4px 2px; background:var(--ide-border); }
+.dsh-ide-context { position:fixed; z-index:31; min-width:210px; display:flex; flex-direction:column; padding:4px;
+  background:var(--ide-panel-2); border:1px solid var(--ide-border); border-radius:6px;
+  box-shadow:0 8px 24px rgba(0,0,0,.45); }
 .dsh-ide-body { display:flex; flex:1 1 auto; min-height:0; }
 .dsh-ide-activity { display:flex; flex-direction:column; align-items:center; gap:2px; flex:0 0 36px; width:36px;
   padding:4px 0; background:var(--ide-panel-2); border-right:1px solid var(--ide-border); }
