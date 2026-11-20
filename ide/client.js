@@ -1947,6 +1947,12 @@ function IdeBody(props) {
         activeKey: '',
         autoSuggest: true,
         lastCompletion: '',
+        ghost: '',
+        ghostPosition: undefined,
+        ghostNode: undefined,
+        ghostWidget: undefined,
+        ghostTimer: 0,
+        ghostKey: undefined,
       })
       const pendingOpens = React.useRef(new Set())
       const handlersRef = React.useRef({})
@@ -2176,7 +2182,7 @@ function IdeBody(props) {
             }
             return { items: [] }
           }
-          return { items: [{ insertText: payload.text }] }
+          return { items: [{ insertText: payload.text }], text: payload.text }
         } catch (cause) {
           if (cause instanceof Error && (cause.name === 'AbortError' || cause.code === 'cancelled')) return { items: [] }
           if (cause instanceof Error && cause.code === 'not-opted-in') {
@@ -2203,6 +2209,74 @@ function IdeBody(props) {
           return { items: [] }
         }
       }, [pushTrace])
+
+      const clearGhost = React.useCallback(() => {
+        runtime.current.ghost = ''
+        runtime.current.ghostPosition = undefined
+        const node = runtime.current.ghostNode
+        if (node !== undefined) node.style.display = 'none'
+        const editor = runtime.current.editor
+        const widget = runtime.current.ghostWidget
+        if (editor !== undefined && widget !== undefined) editor.layoutContentWidget(widget)
+        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(false)
+      }, [])
+
+      const showGhost = React.useCallback((position, ghostText) => {
+        const node = runtime.current.ghostNode
+        const editor = runtime.current.editor
+        const widget = runtime.current.ghostWidget
+        if (node === undefined || editor === undefined || widget === undefined || ghostText === '') return
+        runtime.current.ghost = ghostText
+        runtime.current.ghostPosition = position
+        node.textContent = ghostText
+        node.style.display = 'block'
+        editor.layoutContentWidget(widget)
+        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(true)
+      }, [])
+
+      const acceptGhost = React.useCallback(() => {
+        const editor = runtime.current.editor
+        const monacoInstance = runtime.current.monaco
+        const ghostText = runtime.current.ghost
+        const position = runtime.current.ghostPosition
+        if (editor === undefined || monacoInstance === undefined || ghostText === '' || position === undefined) return false
+        clearGhost()
+        editor.pushUndoStop()
+        editor.executeEdits('dsh-ide', [
+          {
+            range: new monacoInstance.Range(position.lineNumber, position.column, position.lineNumber, position.column),
+            text: ghostText,
+            forceMoveMarkers: true,
+          },
+        ])
+        editor.pushUndoStop()
+        return true
+      }, [clearGhost])
+
+      const requestGhost = React.useCallback(async (explicit) => {
+        const editor = runtime.current.editor
+        if (editor === undefined) return
+        const model = editor.getModel()
+        const position = editor.getPosition()
+        if (model === null || position === null) return
+        const result = await complete(model, position, { triggerKind: explicit ? 1 : 0 }, undefined)
+        const ghostText = result !== undefined && typeof result.text === 'string' ? result.text : ''
+        if (ghostText === '') {
+          clearGhost()
+          return
+        }
+        const current = editor.getPosition()
+        if (current === null || current.lineNumber !== position.lineNumber || current.column !== position.column) return
+        showGhost(position, ghostText)
+      }, [complete, clearGhost, showGhost])
+
+      const scheduleGhost = React.useCallback(() => {
+        window.clearTimeout(runtime.current.ghostTimer)
+        if (runtime.current.autoSuggest !== true) return
+        runtime.current.ghostTimer = window.setTimeout(() => {
+          void requestGhost(false)
+        }, 320)
+      }, [requestGhost])
 
       const enableSuggestions = React.useCallback(async () => {
         const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
@@ -2276,14 +2350,36 @@ function IdeBody(props) {
         runtime.current.editor = editor
         runtime.current.monaco = monaco
 
+        const ghostNode = document.createElement('span')
+        ghostNode.className = 'dsh-ide-ghost'
+        ghostNode.style.display = 'none'
+        const ghostWidget = {
+          getId: () => 'dsh-ide.ghost',
+          getDomNode: () => ghostNode,
+          getPosition: () =>
+            runtime.current.ghostPosition === undefined
+              ? null
+              : { position: runtime.current.ghostPosition, preference: [monaco.editor.ContentWidgetPositionPreference.EXACT] },
+        }
+        editor.addContentWidget(ghostWidget)
+        runtime.current.ghostNode = ghostNode
+        runtime.current.ghostWidget = ghostWidget
+        runtime.current.ghostKey = editor.createContextKey('dshIdeGhostVisible', false)
+
         const change = editor.onDidChangeModelContent(() => {
           const model = editor.getModel()
           if (model === null) return
+          clearGhost()
           const key = runtime.current.modelTabs.get(model.uri.toString())
           if (key === undefined) return
           setTabs((previous) => previous.map((candidate) => (candidate.key === key && !candidate.dirty ? { ...candidate, dirty: true } : candidate)))
+          scheduleGhost()
         })
-        const cursorChange = editor.onDidChangeCursorPosition((event) => setCursor({ line: event.position.lineNumber, column: event.position.column }))
+        const cursorChange = editor.onDidChangeCursorPosition((event) => {
+          setCursor({ line: event.position.lineNumber, column: event.position.column })
+          const shown = runtime.current.ghostPosition
+          if (shown !== undefined && (shown.lineNumber !== event.position.lineNumber || shown.column !== event.position.column)) clearGhost()
+        })
 
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
           void handlersRef.current.saveActive?.()
@@ -2295,24 +2391,15 @@ function IdeBody(props) {
         })
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => {
           handlersRef.current.openOutput?.()
-          editor.trigger('keyboard', 'editor.action.inlineSuggest.trigger', {})
+          void handlersRef.current.requestGhost?.(true)
         })
+        editor.addCommand(monaco.KeyCode.Tab, () => acceptGhost(), 'editorTextFocus && dshIdeGhostVisible')
+        editor.addCommand(monaco.KeyCode.Escape, () => clearGhost(), 'editorTextFocus && dshIdeGhostVisible')
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
 
-        const provider = monaco.languages.registerInlineCompletionsProvider(
-          { pattern: '**' },
-          {
-            provideInlineCompletions(model, position, context, cancelToken) {
-              const run = handlersRef.current.complete
-              if (run === undefined) return Promise.resolve({ items: [] })
-              return run(model, position, context, cancelToken)
-            },
-          },
-        )
-
         return () => {
-          provider.dispose()
+          window.clearTimeout(runtime.current.ghostTimer)
           change.dispose()
           cursorChange.dispose()
           editor.dispose()
@@ -2322,6 +2409,7 @@ function IdeBody(props) {
 
       // Keep the active tab bound to the editor, one model per tab.
       React.useEffect(() => {
+        clearGhost()
         const editor = runtime.current.editor
         if (!editor || !monaco || activeKey === '') return
         const entry = tabs.find((candidate) => candidate.key === activeKey)
@@ -2539,6 +2627,7 @@ function IdeBody(props) {
         toggleOutput,
         openOutput: () => setPanel({ tab: 'trajectory', index: 0 }),
         openSettings: () => setSettingsOpen(true),
+        requestGhost: (explicit) => void requestGhost(explicit === true),
       }
 
       const withEditor = (run) => {
@@ -3218,6 +3307,8 @@ function IdeBody(props) {
   letter-spacing:-.02em; }
 .dsh-ide-tree-error { padding:3px 10px; color:var(--ide-error); font-size:11px; }
 .dsh-ide-tree-empty { padding:3px 10px; color:var(--ide-muted); font-size:11px; }
+.dsh-ide-ghost { display:none; pointer-events:none; white-space:pre; opacity:.5; color:var(--ide-fg);
+  font-family:var(--ide-font-mono, Consolas, 'Courier New', monospace); font-size:13px; line-height:20px; }
 .dsh-ide-icon-button { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:4px;
   padding:2px 5px; font:400 12px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-icon-button:hover { background:var(--ide-hover); }
