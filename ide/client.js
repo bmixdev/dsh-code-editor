@@ -2364,7 +2364,8 @@ function IdeBody(props) {
         editor.addContentWidget(ghostWidget)
         runtime.current.ghostNode = ghostNode
         runtime.current.ghostWidget = ghostWidget
-        runtime.current.ghostKey = editor.createContextKey('dshIdeGhostVisible', false)
+        runtime.current.ghostKey =
+          typeof editor.createContextKey === 'function' ? editor.createContextKey('dshIdeGhostVisible', false) : undefined
 
         const change = editor.onDidChangeModelContent(() => {
           const model = editor.getModel()
@@ -2375,6 +2376,7 @@ function IdeBody(props) {
           setTabs((previous) => previous.map((candidate) => (candidate.key === key && !candidate.dirty ? { ...candidate, dirty: true } : candidate)))
           scheduleGhost()
         })
+        const blur = editor.onDidBlurEditorWidget(() => clearGhost())
         const cursorChange = editor.onDidChangeCursorPosition((event) => {
           setCursor({ line: event.position.lineNumber, column: event.position.column })
           const shown = runtime.current.ghostPosition
@@ -2393,13 +2395,16 @@ function IdeBody(props) {
           handlersRef.current.openOutput?.()
           void handlersRef.current.requestGhost?.(true)
         })
-        editor.addCommand(monaco.KeyCode.Tab, () => acceptGhost(), 'editorTextFocus && dshIdeGhostVisible')
-        editor.addCommand(monaco.KeyCode.Escape, () => clearGhost(), 'editorTextFocus && dshIdeGhostVisible')
+        if (runtime.current.ghostKey !== undefined) {
+          editor.addCommand(monaco.KeyCode.Tab, () => acceptGhost(), 'editorTextFocus && dshIdeGhostVisible')
+          editor.addCommand(monaco.KeyCode.Escape, () => clearGhost(), 'editorTextFocus && dshIdeGhostVisible')
+        }
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
 
         return () => {
           window.clearTimeout(runtime.current.ghostTimer)
+          blur.dispose()
           change.dispose()
           cursorChange.dispose()
           editor.dispose()
