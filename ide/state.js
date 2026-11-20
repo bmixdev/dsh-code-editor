@@ -25,6 +25,7 @@ const DEFAULTS = Object.freeze({
   panelHeight: 190,
   showTree: true,
   hidden: false,
+  explorerSide: 'left',
 })
 
 export function statePath() {
@@ -75,6 +76,7 @@ export function sanitizeSessionState(raw) {
     panelHeight: clampPanel(source.panelHeight),
     showTree: typeof source.showTree === 'boolean' ? source.showTree : DEFAULTS.showTree,
     hidden: typeof source.hidden === 'boolean' ? source.hidden : DEFAULTS.hidden,
+    explorerSide: source.explorerSide === 'right' ? 'right' : DEFAULTS.explorerSide,
   }
 }
 

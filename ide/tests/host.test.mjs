@@ -281,6 +281,7 @@ test('the open, save and state routes work together', async () => {
       assert.deepEqual(initial.body.state.tabs, [])
       assert.equal(initial.body.state.treeWidth, 220)
     assert.equal(initial.body.state.panelHeight, 190)
+    assert.equal(initial.body.state.explorerSide, 'left')
 
       const written = await app.call('state', {
         sessionId: SESSION_ID,
@@ -289,6 +290,7 @@ test('the open, save and state routes work together', async () => {
         active: 'README.md',
         treeWidth: 900,
         panelHeight: 900,
+        explorerSide: 'right',
         hidden: true,
       },
       })
@@ -296,6 +298,7 @@ test('the open, save and state routes work together', async () => {
       assert.equal(written.body.state.active, 'README.md')
       assert.equal(written.body.state.treeWidth, 640)
     assert.equal(written.body.state.panelHeight, 560)
+    assert.equal(written.body.state.explorerSide, 'right')
       assert.equal(written.body.state.hidden, true)
 
       const reread = await app.call('state', { sessionId: SESSION_ID })

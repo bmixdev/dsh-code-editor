@@ -1957,6 +1957,7 @@ function IdeBody(props) {
       const [status, setStatus] = React.useState({ kind: 'idle', message: '' })
       const [explorerWidth, setExplorerWidth] = React.useState(220)
       const [showTree, setShowTree] = React.useState(true)
+      const [explorerSide, setExplorerSide] = React.useState('left')
       const [hidden, setHidden] = React.useState(false)
       const [preferences, setPreferences] = React.useState(undefined)
       const [settingsOpen, setSettingsOpen] = React.useState(false)
@@ -2377,6 +2378,7 @@ function IdeBody(props) {
             const saved = statePayload.state || {}
             if (typeof saved.treeWidth === 'number') setExplorerWidth(saved.treeWidth)
             if (typeof saved.panelHeight === 'number') setPanelHeight(saved.panelHeight)
+        if (saved.explorerSide === 'right') setExplorerSide('right')
             setShowTree(saved.showTree !== false)
             setHidden(saved.hidden === true)
             const wanted = []
@@ -2436,6 +2438,7 @@ function IdeBody(props) {
               tabs: tabs.map((candidate) => candidate.path),
               active: (tabs.find((candidate) => candidate.key === activeKey) || {}).path || '',
               treeWidth: explorerWidth,
+              explorerSide,
               panelHeight,
               showTree,
               hidden,
@@ -2443,7 +2446,7 @@ function IdeBody(props) {
           }).catch(() => {})
         }, STATE_WRITE_DELAY_MS)
         return () => window.clearTimeout(timer)
-      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, panelHeight, showTree, hidden])
+      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, panelHeight, showTree, hidden, explorerSide])
 
       const saveSettings = async (patch) => {
         try {
@@ -2463,7 +2466,8 @@ function IdeBody(props) {
         const startX = event.clientX
         const startWidth = explorerWidth
         const move = (moveEvent) => {
-          setExplorerWidth(Math.min(640, Math.max(150, startWidth + (moveEvent.clientX - startX))))
+          const delta = explorerSide === 'right' ? startX - moveEvent.clientX : moveEvent.clientX - startX
+          setExplorerWidth(Math.min(640, Math.max(150, startWidth + delta)))
         }
         const stop = () => {
           window.removeEventListener('mousemove', move)
@@ -2682,6 +2686,11 @@ function IdeBody(props) {
             { separator: true },
             { id: 'refresh', label: 'Обновить дерево', run: () => setReloadSignal((previous) => previous + 1) },
             { id: 'toggle-tree', label: showTree ? 'Скрыть проводник' : 'Показать проводник', run: () => setShowTree(!showTree) },
+        {
+          id: 'swap-explorer',
+          label: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
+          run: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
+        },
             { id: 'open-folder', label: 'Открыть папку…', disabled: true, hint: 'Рабочая папка задаётся сессией DSH; другая папка открывается только в новой сессии.' },
           ],
         },
@@ -2864,6 +2873,17 @@ function IdeBody(props) {
           { className: 'dsh-ide-top' },
           h(MenuBar, { menus, openId: menuId, onOpen: setMenuId }),
           h('span', { className: 'dsh-ide-top-spacer' }),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-icon-button',
+              title: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
+              'aria-label': 'Поменять местами проводник и редактор',
+              onClick: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
+            },
+            h('span', { className: 'dsh-ide-activity-glyph' }, '⇄'),
+          ),
           h('span', { className: 'dsh-ide-top-title', title: activeTab === undefined ? 'IDE' : activeTab.path }, activeTab === undefined ? 'IDE' : activeTab.name),
         ),
         h(
@@ -2927,7 +2947,10 @@ function IdeBody(props) {
           showTree && typeof sessionId === 'string'
             ? h(
                 'div',
-                { className: 'dsh-ide-explorer-wrap', style: { width: `${explorerWidth}px` } },
+                {
+                  className: `dsh-ide-explorer-wrap${explorerSide === 'right' ? ' dsh-ide-explorer-right' : ''}`,
+                  style: { width: `${explorerWidth}px`, order: explorerSide === 'left' ? 0 : 2 },
+                },
                 h(Explorer, {
                   sessionId,
                   hidden,
@@ -2950,11 +2973,16 @@ function IdeBody(props) {
               )
             : null,
           showTree && typeof sessionId === 'string'
-            ? h('div', { className: 'dsh-ide-divider', title: 'Потяните, чтобы изменить ширину', onMouseDown: startResize })
+            ? h('div', {
+                className: explorerSide === 'right' ? 'dsh-ide-divider dsh-ide-divider-flip' : 'dsh-ide-divider',
+                style: { order: 1 },
+                title: 'Потяните, чтобы изменить ширину',
+                onMouseDown: startResize,
+              })
             : null,
           h(
             'div',
-            { className: 'dsh-ide-editor' },
+            { className: 'dsh-ide-editor', style: { order: explorerSide === 'left' ? 2 : 0 } },
             h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab, onContextMenu: openTabMenu }),
             consent === undefined
               ? null
@@ -3001,7 +3029,7 @@ function IdeBody(props) {
                   { className: 'dsh-ide-empty' },
                   h('div', { className: 'dsh-ide-watermark' }, 'IDE'),
                   h('div', { className: 'dsh-ide-empty-title' }, 'Файл не открыт'),
-                  h('div', { className: 'dsh-ide-empty-text' }, 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.'),
+                  h('div', { className: 'dsh-ide-empty-text' }, explorerSide === 'left' ? 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.' : 'Ctrl+P — открыть файл по имени, или выберите его в проводнике справа.'),
                 )
               : null,
             h('div', { className: 'dsh-ide-stage', ref: hostRef }),
@@ -3158,6 +3186,8 @@ function IdeBody(props) {
 .dsh-ide-explorer-wrap { flex:0 0 auto; min-width:0; display:flex; background:var(--ide-panel); }
 .dsh-ide-divider { flex:0 0 4px; width:4px; cursor:col-resize; background:transparent; border-right:1px solid var(--ide-border); }
 .dsh-ide-divider:hover { background:var(--ide-accent); }
+.dsh-ide-divider-flip { border-right:none; border-left:1px solid var(--ide-border); }
+.dsh-ide-explorer-right { border-right:none; border-left:1px solid var(--ide-border); }
 .dsh-ide-explorer { display:flex; flex-direction:column; width:100%; min-width:0; }
 .dsh-ide-explorer-head { display:flex; align-items:center; justify-content:space-between; padding:6px 8px 4px;
   font:600 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.06em; text-transform:uppercase; color:var(--ide-muted); }
