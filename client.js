@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-21.5'
+    const UI_BUILD = '2026-11-21.6'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -2624,67 +2624,91 @@ function IdeBody(props) {
         const monacoInstance = runtime.current.monaco
         const edits = Array.isArray(plan.edits) ? plan.edits : []
         if (editor === undefined || monacoInstance === undefined || edits.length === 0) return
-        const decorations = []
+        const eol = eolOf(model)
+        const value = model.getValue()
         const blocks = []
         for (const edit of edits) {
-          // The hover carries the whole proposal, so the hint is readable even
-          // where the staged lines are not.
+          // The hover carries the whole proposal, so the hint stays readable
+          // wherever the staged lines sit.
           const hover =
             (edit.why === '' ? 'Правка подсказки' : edit.why) + '\n\n```\n' + edit.newText + '\n```'
-          blocks.push({ edit, hover })
+          // Grow the change to whole lines. Inserting in the middle of a line
+          // pushes the rest of that line into a new row, and the result reads as
+          // text printed over its neighbour; a whole-line region keeps every
+          // row where the reader expects it.
+          const startPosition = model.getPositionAt(edit.start)
+          const endPosition = model.getPositionAt(edit.end)
+          const lineStart = model.getOffsetAt({ lineNumber: startPosition.lineNumber, column: 1 })
+          const lineEnd = model.getOffsetAt({
+            lineNumber: endPosition.lineNumber,
+            column: model.getLineMaxColumn(endPosition.lineNumber),
+          })
+          blocks.push({
+            edit,
+            hover,
+            start: lineStart,
+            end: lineEnd,
+            original: value.slice(lineStart, lineEnd),
+            replacement: value.slice(lineStart, edit.start) + edit.newText + value.slice(edit.end, lineEnd),
+          })
         }
-        runtime.current.tab.editDecorations = editor.deltaDecorations([], decorations)
-        if (blocks.length === 0) return
-        const eol = eolOf(model)
+        // Two edits that share a line would expand onto the same rows; the Host
+        // already refuses overlapping ranges, and this keeps the staging honest
+        // when a model repeats a snippet in two proposals.
+        const staged = []
+        for (const block of blocks) {
+          if (staged.some((entry) => block.start < entry.end && entry.start < block.end)) continue
+          staged.push(block)
+        }
+        if (staged.length === 0) return
         const operations = []
         const added = []
         const removed = []
         const replaced = []
         let shift = 0
-        for (const block of blocks) {
-          const original = model.getValue().slice(block.edit.start, block.edit.end)
-          const ops = diffLinesLocal(original, block.edit.newText)
+        for (const block of staged) {
+          const ops = diffLinesLocal(block.original, block.replacement)
           // Where every line of the replaced block starts, relative to its start.
           const starts = [0]
-          for (let index = 0; index < original.length; index += 1) {
-            if (original[index] === '\n') starts.push(index + 1)
+          for (let index = 0; index < block.original.length; index += 1) {
+            if (block.original[index] === '\n') starts.push(index + 1)
           }
           let line = 0
           let localAdd = 0
           let pending = []
-          const flush = (anchor, hover) => {
+          const flush = (anchor) => {
             if (pending.length === 0) return
             const text = pending.join(eol) + eol
             operations.push({ start: anchor, end: anchor, text })
-            added.push({ start: anchor + shift + localAdd, end: anchor + shift + localAdd + text.length, text, hover })
+            added.push({ start: anchor + shift + localAdd, end: anchor + shift + localAdd + text.length, text })
             localAdd += text.length
             pending = []
           }
           for (const op of ops) {
-            const anchor = block.edit.start + (line < starts.length ? starts[line] : original.length)
+            const anchor = block.start + (line < starts.length ? starts[line] : block.original.length)
             if (op.type === 'add') {
               pending.push(op.text)
               continue
             }
-            if (pending.length > 0) flush(block.edit.start + (line < starts.length ? starts[line] : original.length), block.hover)
+            if (pending.length > 0) flush(block.start + (line < starts.length ? starts[line] : block.original.length))
             if (op.type === 'del') {
-              const next = line < starts.length - 1 ? starts[line + 1] : original.length
+              const next = line < starts.length - 1 ? starts[line + 1] : block.original.length
               removed.push({
-                start: block.edit.start + starts[line] + shift + localAdd,
-                end: block.edit.start + next + shift + localAdd,
+                start: block.start + starts[line] + shift + localAdd,
+                end: block.start + next + shift + localAdd,
                 hover: block.hover,
               })
             }
             line += 1
           }
-          if (pending.length > 0) flush(block.edit.start + original.length, block.hover)
+          if (pending.length > 0) flush(block.start + block.original.length)
           // Tab rewrites the whole staged region with the proposed text, so the
           // inserted lines and the old ones are replaced in one operation.
           replaced.push({
-            start: block.edit.start + shift,
-            end: block.edit.end + shift + localAdd,
-            text: block.edit.newText,
-            original,
+            start: block.start + shift,
+            end: block.end + shift + localAdd,
+            text: block.replacement,
+            original: block.original,
             edit: block.edit,
           })
           shift += localAdd
@@ -2713,8 +2737,6 @@ function IdeBody(props) {
           decorations: editor.deltaDecorations([], stagedDecorations),
         }
         runtime.current.tab.edits = edits
-        // An answer that is only edits has no ghost text at the caret, but Tab
-        // must still accept it: the command is guarded by this context key.
         if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(true)
       }
 
