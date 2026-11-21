@@ -135,6 +135,34 @@ export function reasonLabel(reason) {
   return PLAN_REASONS[reason] ?? 'Подсказка отклонена проверкой.'
 }
 
+/** Leading whitespace shared by every non-blank line. */
+function commonIndent(text) {
+  const lines = text.split('\n')
+  let indent
+  for (const line of lines) {
+    if (line.trim() === '') continue
+    const match = /^[ \t]*/.exec(line)?.[0] ?? ''
+    if (indent === undefined) {
+      indent = match
+      continue
+    }
+    let shared = 0
+    while (shared < indent.length && shared < match.length && indent[shared] === match[shared]) shared += 1
+    indent = indent.slice(0, shared)
+    if (indent === '') return ''
+  }
+  return indent ?? ''
+}
+
+/** Removes one exact indentation prefix from every line that carries it. */
+function dedent(text, indent) {
+  if (indent === '') return text
+  return text
+    .split('\n')
+    .map((line) => (line.startsWith(indent) ? line.slice(indent.length) : line.trim() === '' ? '' : line))
+    .join('\n')
+}
+
 /**
  * Decide what the suggestion would change and where.
  *
@@ -167,6 +195,40 @@ export function planEdit({ text, offset, suggestion, options = {} }) {
 
   const empty = { kind: 'insert', startOffset: at, endOffset: at, insertText: '', removedText: '', eol }
   if (insert === '') return empty
+
+  // `f = ` is an empty right-hand side, and a model asked to continue it often
+  // answers with the whole statement and its body. Inserting that after the `=`
+  // would leave a double statement; the line itself is the right-hand side, so
+  // the line is rewritten and re-indented to the buffer's own indentation.
+  const lineText = buffer.slice(lineStart, lineEnd === -1 ? buffer.length : lineEnd)
+  const lineIndent = /^[ \t]*/.exec(lineText)?.[0] ?? ''
+  const beforeInLine = buffer.slice(lineStart, at)
+  const assignmentLine = /^[ \t]*[A-Za-z_$][\w$.[\]'"]*[ \t]*=[ \t]*$/.test(beforeInLine) && restOfLine.trim() === ''
+  const blockLines = insert.split('\n')
+  if (assignmentLine && blockLines.length > 1 && /:$/.test(blockLines[0].trim())) {
+    const body = dedent(insert, commonIndent(insert))
+    // Re-indent every line: the answer was written relative to the line it
+    // replaces, so the buffer's own indentation goes in front of each of them.
+    const text = body
+      .split('\n')
+      .map((line) => (line === '' ? line : `${lineIndent}${line}`))
+      .join('\n')
+    return {
+      kind: 'replace',
+      startOffset: lineStart,
+      endOffset: lineEnd === -1 ? buffer.length : lineEnd,
+      insertText: text,
+      removedText: lineText,
+      eol,
+    }
+  }
+
+  // At the start of an indent-only line the cursor already sits after the
+  // indentation, so an answer that repeats it would be indented twice.
+  if (beforeInLine.trim() === '' && lineIndent !== '') {
+    const answerIndent = commonIndent(insert)
+    if (answerIndent === lineIndent) insert = dedent(insert, answerIndent)
+  }
 
   // A model that re-emits the tail of the line it was asked to continue is
   // answering with the whole line, not with an addition to it: rewrite the tail

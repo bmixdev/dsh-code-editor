@@ -11,6 +11,31 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+/**
+ * The instruction sent to the completion model when the settings field is empty.
+ *
+ * It is a template: `{{answerLines}}`, `{{language}}` and `{{file}}` are filled
+ * per request, so a user-edited instruction can keep using the same words.
+ */
+export const DEFAULT_SYSTEM_PROMPT =
+  'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
+  'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
+  'уже написанного кода. Продолжение должно быть коротким (1–{{answerLines}} строк) и синтаксически уместным. ' +
+  'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
+  'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
+  'Если уместного продолжения нет, ответь пустой строкой.'
+
+/** Placeholders the instruction may use; unknown ones stay as written. */
+export const PROMPT_PLACEHOLDERS = Object.freeze(['answerLines', 'language', 'file'])
+
+/** Fill `{{name}}` placeholders, leaving the unknown ones untouched. */
+export function fillPrompt(template, values = {}) {
+  return String(template ?? '').replace(/\{\{\s*([a-zA-Z]+)\s*\}\}/g, (match, key) => {
+    const value = Object.prototype.hasOwnProperty.call(values, key) ? values[key] : undefined
+    return value === undefined || value === null ? match : String(value)
+  })
+}
+
 /** Everything the drawer can change, with the value used before the first save. */
 export const DEFAULT_PREFERENCES = Object.freeze({
   /** Provider id for inline completions; empty means "the session default". */
@@ -31,6 +56,11 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   apiKeyRef: '',
   /** Workspace roots whose owner allowed sending buffer context to the model. */
   completionOptIn: [],
+  /**
+   * The instruction sent before the buffer. Empty means "use the shipped one",
+   * which the settings drawer shows as the placeholder of the field.
+   */
+  systemPrompt: '',
 
   // Tab mechanics. Every value below is a knob of the suggestion engine ported
   // from the observed behaviour of Cursor's Tab (see tab.js and
@@ -124,6 +154,9 @@ const BOOLEAN_KEYS = [
 /** How many workspaces may stay opted in at once. */
 const MAX_OPT_IN = 20
 
+/** Longest custom instruction accepted from the settings field. */
+const MAX_SYSTEM_PROMPT = 8000
+
 /** Absolute path of the preferences file, overridable for tests and portable profiles. */
 export function preferencesPath() {
   const override = process.env.DSH_CODE_EDITOR_PREFS
@@ -154,6 +187,15 @@ function sanitize(patch) {
     if (patch[key] !== undefined) {
       result[key] = clampInteger(patch[key], PREFERENCE_LIMITS[key], DEFAULT_PREFERENCES[key])
     }
+  }
+  // The instruction is free text with line breaks, so it does not go through the
+  // trimmed 200-character string keys above.
+  if (patch.systemPrompt !== undefined) {
+    const value = String(patch.systemPrompt ?? '').trim()
+    if (value.length > MAX_SYSTEM_PROMPT) {
+      throw Object.assign(new Error('Системная инструкция слишком длинная.'), { code: 'bad-request' })
+    }
+    result.systemPrompt = value
   }
   if (patch.completionOptIn !== undefined) {
     if (!Array.isArray(patch.completionOptIn)) {

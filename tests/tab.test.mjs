@@ -168,3 +168,32 @@ test('context windows can be bounded by lines', () => {
   assert.equal(boundLines(text, 10, 'end'), text)
   assert.equal(boundLines(text, 0, 'end'), '')
 })
+
+test('a block answer to an empty assignment rewrites the line', () => {
+  // `f = ` on its own line: the model answers with the whole statement and its
+  // body, indented to the file. Inserting that after the `=` would leave a
+  // dangling assignment, so the line itself is replaced and re-indented.
+  const text = 'def main():\n    f = \n\nmain()\n'
+  const offset = 'def main():\n    f = '.length
+  const suggestion = '    with open("data.json") as f:\n        data = json.load(f)'
+  const plan = planEdit({ text, offset, suggestion })
+  assert.equal(plan.kind, 'replace')
+  assert.equal(plan.removedText, '    f = ')
+  assert.equal(plan.insertText, '    with open("data.json") as f:\n        data = json.load(f)')
+  const applied = text.slice(0, plan.startOffset) + plan.insertText + text.slice(plan.endOffset)
+  assert.equal(applied, 'def main():\n    with open("data.json") as f:\n        data = json.load(f)\n\nmain()\n')
+})
+
+test('a plain expression answer to an assignment stays an insertion', () => {
+  const text = 'const total = '
+  const plan = planEdit({ text, offset: text.length, suggestion: 'sum(1, 2)' })
+  assert.equal(plan.kind, 'insert')
+  assert.equal(plan.insertText, 'sum(1, 2)')
+})
+
+test('an answer indented like the empty line is not indented twice', () => {
+  const text = 'def main():\n    '
+  const plan = planEdit({ text, offset: text.length, suggestion: '    return 1' })
+  assert.equal(plan.kind, 'insert')
+  assert.equal(plan.insertText, 'return 1')
+})

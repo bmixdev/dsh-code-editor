@@ -449,3 +449,56 @@ test('a route without the off level falls back to the next cheap effort', async 
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('the system instruction is a setting and its placeholders are filled', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+
+      // The drawer shows the shipped instruction as the placeholder of the field.
+      const initial = await app.call('prefs', {})
+      assert.ok(initial.body.promptDefault.includes('{{answerLines}}'))
+
+      await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 42\n',
+        offset: 'export const answer = 42\n'.length,
+      })
+      assert.ok(app.streamCalls[0].system.includes('1–5 строк'))
+      assert.ok(!app.streamCalls[0].system.includes('{{'))
+
+      const saved = await app.call('prefs', {
+        patch: { systemPrompt: 'Дополни {{file}} на {{language}}; не больше {{answerLines}} строк.' },
+      })
+      assert.equal(saved.status, 200)
+      assert.equal(saved.body.preferences.systemPrompt, 'Дополни {{file}} на {{language}}; не больше {{answerLines}} строк.')
+
+      await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 42\n',
+        offset: 'export const answer = 42\n'.length,
+      })
+      assert.match(app.streamCalls[1].system, /^Дополни .*src[\\/]index\.js на javascript; не больше 5 строк\.$/)
+
+      // Emptying the field restores the shipped instruction.
+      await app.call('prefs', { patch: { systemPrompt: '' } })
+      await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 42\n',
+        offset: 'export const answer = 42\n'.length,
+      })
+      assert.ok(app.streamCalls[2].system.startsWith('Ты — движок строчных подсказок'))
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

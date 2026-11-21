@@ -73,6 +73,23 @@ test('cleanLines cuts prose at the start and after the code', () => {
   assert.equal(cleanLines('const a = 1\n```\nExplanation: it does x'), 'const a = 1')
 })
 
+test('cleanLines keeps a code block line that ends with a colon', () => {
+  // Regression: the prose rule used to treat any line ending with `:` as an
+  // English lead-in, which deleted the first line of every block answer.
+  assert.equal(cleanLines('with open("data.json") as f:\n    data = 1'), 'with open("data.json") as f:\n    data = 1')
+  assert.equal(cleanLines('if value:\n    return 1'), 'if value:\n    return 1')
+  assert.equal(cleanLines('else:\n    pass'), 'else:\n    pass')
+  // A sentence of plain words is still prose.
+  assert.equal(cleanLines('This reads the file:\n    data = 1'), '    data = 1')
+})
+
+test('postprocessCompletion keeps the indentation of a block answer', () => {
+  const answer = '    with open("data.json") as f:\n        data = json.load(f)'
+  assert.equal(postprocessCompletion({ completion: answer, prefix: '    f = ' }), answer)
+  // One duplicated space at the join is still dropped.
+  assert.equal(postprocessCompletion({ completion: ' sum(1, 2)', prefix: 'const total = ' }), 'sum(1, 2)')
+})
+
 test('cleanLines cuts a line repeated three times but keeps the first', () => {
   const repeated = 'process(item)\nprocess(item)\nprocess(item)\nprocess(item)'
   assert.equal(cleanLines(repeated), 'process(item)')

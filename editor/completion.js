@@ -119,8 +119,13 @@ function isStopLine(line) {
 
 function isEnglishStartLine(line) {
   const trimmed = line.trim().toLowerCase()
-  if (trimmed.endsWith(':') && !trimmed.startsWith('def')) return true
-  return ENGLISH_START_PHRASES.some((phrase) => trimmed.startsWith(phrase))
+  if (ENGLISH_START_PHRASES.some((phrase) => trimmed.startsWith(phrase))) return true
+  // An English lead-in is a sentence, not a statement: several plain words and a
+  // colon. A line of code also ends with `:`, but it carries punctuation the
+  // sentence pattern below cannot match (`with open(...) as f:`), which is why
+  // the earlier blanket "ends with a colon" rule silently deleted the first line
+  // of every block the model returned.
+  return /^[a-z][a-z'-]*(?: [a-z'-]+){2,}:$/.test(trimmed)
 }
 
 function isEnglishEndLine(line) {
@@ -301,7 +306,10 @@ export function postprocessCompletion({ completion, prefix = '', suffix = '', to
   if (isExtremeRepetition(text)) return ''
   text = cleanLines(text, { topLevelKeywords })
   if (text.trim() === '') return ''
-  if (prefix.endsWith(' ') && text.startsWith(' ')) text = text.slice(1)
+  // Only a single duplicated space at the join is dropped. An answer that starts
+  // with a deeper indent is a block written relative to the line, and taking one
+  // space off it breaks the alignment of every line below.
+  if (prefix.endsWith(' ') && /^ [^ \t]/.test(text)) text = text.slice(1)
   // A comment above the cursor asks for code on the next line, so the answer
   // has to keep the line break that separates it from the comment. `cleanLines`
   // drops leading blank lines by design, which erased that break and glued the

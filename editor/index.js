@@ -31,7 +31,7 @@ import {
   saveCredential,
 } from './catalog.js'
 import { buildContext, postprocessCompletion } from './completion.js'
-import { optedInRoots, readPreferences, writePreferences } from './prefs.js'
+import { DEFAULT_SYSTEM_PROMPT, fillPrompt, optedInRoots, readPreferences, writePreferences } from './prefs.js'
 import { listTree } from './tree.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -505,16 +505,10 @@ export function apply(ctx, config) {
       for await (const chunk of ctx.llm.stream({
         provider: attempt.provider,
         model: attempt.model,
-      system:
-        'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
-        'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
-        'уже написанного кода. Продолжение должно быть коротким (1–5 строк) и синтаксически уместным. ' +
-        // A comment that asks for code is the most common way a programmer
-        // starts a block, so the answer has to begin with a line break and
-        // contain the code itself rather than a repeat of the comment.
-        'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
-        'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
-        'Если уместного продолжения нет, ответь пустой строкой.',
+      system: fillPrompt(
+        String(preferences.systemPrompt ?? '').trim() === '' ? DEFAULT_SYSTEM_PROMPT : preferences.systemPrompt,
+        { answerLines: preferences.answerLines, language: document.language, file: document.displayPath },
+      ),
       // Message content is a list of typed blocks, not a bare string: every
       // other host-side caller in this installation passes
       // `[{ type: 'text', text }]`, and a string content made the adapter end

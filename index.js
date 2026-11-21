@@ -35,7 +35,7 @@ import {
   saveCredential,
 } from './catalog.js'
 import { buildContext, postprocessCompletion } from './completion.js'
-import { optedInRoots, readPreferences, writePreferences } from './prefs.js'
+import { DEFAULT_SYSTEM_PROMPT, fillPrompt, optedInRoots, readPreferences, writePreferences } from './prefs.js'
 import { boundLines, evaluateSuggestion, planEdit, reasonLabel } from './tab.js'
 import { listFiles, listTree } from './tree.js'
 import { readSessionState, writeSessionState } from './state.js'
@@ -546,13 +546,16 @@ export function apply(ctx, config) {
       attempts.push({ provider: selection.provider, model: selection.model })
     }
 
-    const systemPrompt =
-      'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
-      'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
-      `уже написанного кода. Продолжение должно быть коротким (1–${preferences.answerLines} строк) и синтаксически уместным. ` +
-      'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
-      'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
-      'Если уместного продолжения нет, ответь пустой строкой.'
+    // The instruction is a setting. Empty means the shipped text; a saved one
+    // may use the same placeholders, so the user can keep "1–{{answerLines}}
+    // строк" working while changing the rest of the wording.
+    const promptTemplate =
+      String(preferences.systemPrompt ?? '').trim() === '' ? DEFAULT_SYSTEM_PROMPT : preferences.systemPrompt
+    const systemPrompt = fillPrompt(promptTemplate, {
+      answerLines: preferences.answerLines,
+      language: document.language,
+      file: document.displayPath,
+    })
     // The suffix must follow its own header: an inverted layout tells the model to
     // continue past the text that comes after the cursor, which produced empty
     // answers for every request of the first benchmark.
@@ -1001,10 +1004,12 @@ export function apply(ctx, config) {
   }
 
   async function prefsRoute(body) {
+    // The shipped instruction travels with the preferences so the drawer can show
+    // it as the placeholder of the field: an empty field means "this text".
     if (body.patch !== undefined && typeof body.patch === 'object' && body.patch !== null) {
-      return { preferences: await writePreferences(body.patch) }
+      return { preferences: await writePreferences(body.patch), promptDefault: DEFAULT_SYSTEM_PROMPT }
     }
-    return { preferences: await readPreferences() }
+    return { preferences: await readPreferences(), promptDefault: DEFAULT_SYSTEM_PROMPT }
   }
 
   // ----------------------------------------------------------------- assets

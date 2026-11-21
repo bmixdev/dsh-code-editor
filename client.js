@@ -1337,9 +1337,10 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function SettingsPanel({ preferences, sessionModel, onClose, onSave, onAddModel }) {
+    function SettingsPanel({ preferences, sessionModel, promptDefault, onClose, onSave, onAddModel }) {
       const [provider, setProvider] = React.useState(preferences.completionProvider || '')
       const [model, setModel] = React.useState(preferences.completionModel || '')
+      const [systemPrompt, setSystemPrompt] = React.useState(preferences.systemPrompt || '')
       const [autoSuggest, setAutoSuggest] = React.useState(preferences.autoSuggest !== false)
       const [contextLeft, setContextLeft] = React.useState(String(preferences.contextLeft ?? 4000))
       const [contextRight, setContextRight] = React.useState(String(preferences.contextRight ?? 1000))
@@ -1453,6 +1454,7 @@ window.__ModuleLoader__.load({
           contextLeft: toNumber(contextLeft, 4000),
           contextRight: toNumber(contextRight, 1000),
           apiKeyRef: keyRef,
+          systemPrompt: systemPrompt.trim(),
         }
         for (const entry of TAB_PREFERENCES) {
           patch[entry.key] =
@@ -1746,7 +1748,20 @@ window.__ModuleLoader__.load({
           .filter((entry) => entry !== undefined)
           .map(optionRow)
 
-      const hintsRows = rowsForKeyList(REQUEST_KEYS)
+      const promptRow = setting(
+        'system-prompt',
+        'Системная инструкция',
+        'С чем редактор обращается к модели. Пустое поле — стандартная инструкция (она показана серым). Подстановки: {{answerLines}}, {{language}}, {{file}}.',
+        h('textarea', {
+          className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-setting-textarea',
+          rows: 6,
+          placeholder: promptDefault === undefined ? '' : promptDefault,
+          value: systemPrompt,
+          onChange: (event) => setSystemPrompt(event.target.value),
+        }),
+      )
+
+      const hintsRows = [promptRow, ...rowsForKeyList(REQUEST_KEYS)]
       const hintFilterRows = rowsForKeyList(CHECK_KEYS)
 
       const sections = [
@@ -2184,6 +2199,7 @@ function IdeBody(props) {
       const [explorerSide, setExplorerSide] = React.useState('left')
       const [hidden, setHidden] = React.useState(false)
       const [preferences, setPreferences] = React.useState(undefined)
+      const [promptDefault, setPromptDefault] = React.useState('')
       const [settingsOpen, setSettingsOpen] = React.useState(false)
       const [modelDialog, setModelDialog] = React.useState(false)
       const [createRequest, setCreateRequest] = React.useState(undefined)
@@ -3021,6 +3037,7 @@ function IdeBody(props) {
             if (cancelled) return
             const loaded = prefsPayload.preferences || {}
             setPreferences(loaded)
+            if (typeof prefsPayload.promptDefault === 'string') setPromptDefault(prefsPayload.promptDefault)
             runtime.current.autoSuggest = loaded.autoSuggest !== false
             const saved = statePayload.state || {}
             if (typeof saved.treeWidth === 'number') setExplorerWidth(saved.treeWidth)
@@ -3100,6 +3117,7 @@ function IdeBody(props) {
           const payload = await call('prefs', { patch })
           const loaded = payload.preferences || {}
           setPreferences(loaded)
+          if (typeof payload.promptDefault === 'string') setPromptDefault(payload.promptDefault)
           runtime.current.autoSuggest = loaded.autoSuggest !== false
           setSettingsOpen(false)
           setStatus({ kind: 'ok', message: 'Настройки сохранены' })
@@ -3713,6 +3731,7 @@ function IdeBody(props) {
           ? h(SettingsPanel, {
               preferences,
               sessionModel: catalog === undefined ? undefined : catalog.default,
+              promptDefault,
               onClose: () => setSettingsOpen(false),
               onSave: saveSettings,
               onAddModel: () => setModelDialog(true),
@@ -3974,6 +3993,7 @@ function IdeBody(props) {
   font:400 12px/1.55 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-setting-control { margin-top:8px; display:flex; align-items:center; gap:6px; }
 .dsh-ide-setting-input { width:230px; max-width:100%; }
+.dsh-ide-setting-textarea { width:100%; min-height:96px; resize:vertical; font:400 12.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); padding:6px 8px; }
 .dsh-ide-setting-control input[type="checkbox"] { width:14px; height:14px; accent-color:var(--ide-accent); }
 .dsh-ide-setting-check { display:inline-flex; align-items:center; gap:6px; color:var(--ide-text);
   font:400 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
