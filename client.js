@@ -2485,20 +2485,45 @@ function IdeBody(props) {
         for (const edit of edits) {
           const start = model.getPositionAt(edit.start)
           const end = model.getPositionAt(edit.end)
+          // The hover carries the whole proposal, so a edit whose card was
+          // skipped as too close to the previous one is still readable.
+          const hover =
+            (edit.why === '' ? 'Правка подсказки' : edit.why) +
+            '\n\n```\n' +
+            edit.newText +
+            '\n```'
           decorations.push({
             range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
             options: {
               inlineClassName: 'dsh-ide-edit-old',
-              hoverMessage: { value: edit.why === '' ? 'Правка подсказки' : edit.why },
+              hoverMessage: { value: hover },
             },
           })
         }
         runtime.current.tab.editDecorations = editor.deltaDecorations([], decorations)
         const widgets = []
+        // Two cards anchored a line apart would cover each other, so only the
+        // first of a cluster keeps a card; the rest stay highlighted, and their
+        // replacement is in the hover.
+        let lastCardLine = -Infinity
         edits.forEach((edit, index) => {
+          const start = model.getPositionAt(edit.start)
           const node = document.createElement('div')
           node.className = 'dsh-ide-edit-new'
-          node.textContent = edit.newText
+          // A card, not a line of loose text: an overlay of plain characters sat
+          // exactly on top of the code below it and the two texts merged into an
+          // unreadable mess. The card is opaque, so it hides what it covers, and
+          // it names the keys that accept or cancel the proposal.
+          const hint = document.createElement('div')
+          hint.className = 'dsh-ide-edit-hint'
+          hint.textContent = 'Tab — принять · Esc — отменить'
+          const code = document.createElement('div')
+          code.className = 'dsh-ide-edit-code'
+          code.textContent = edit.newText
+          node.appendChild(hint)
+          node.appendChild(code)
+          if (start.lineNumber - lastCardLine < 7) return
+          lastCardLine = start.lineNumber
           const widget = {
             getId: () => `dsh-ide.edit.${plan.requestId}.${index}`,
             getDomNode: () => node,
@@ -4069,10 +4094,15 @@ function IdeBody(props) {
 .dsh-ide-ghost { display:none; pointer-events:none; white-space:pre; opacity:.5; color:var(--ide-fg);
   font-family:var(--ide-font-mono, Consolas, 'Courier New', monospace); font-size:13px; line-height:20px; }
 .dsh-ide-ghost-removed { background:rgba(224, 108, 117, .18); border-bottom:1px solid rgba(224, 108, 117, .55); }
-.dsh-ide-edit-old { background:rgba(224, 108, 117, .16); border-bottom:1px solid rgba(224, 108, 117, .5); }
-.dsh-ide-edit-new { margin:0 0 0 14px; padding:1px 0 1px 8px; border-left:2px solid rgba(106, 190, 120, .8);
-  color:rgba(140, 220, 155, .95); white-space:pre; font:400 13px/1.45 var(--dsh-font-mono, ui-monospace, monospace);
-  pointer-events:none; opacity:.9; }
+.dsh-ide-edit-old { background:rgba(224, 108, 117, .18); border-bottom:1px solid rgba(224, 108, 117, .55); }
+.dsh-ide-edit-new { position:relative; z-index:30; margin:2px 0 0 10px; padding:4px 10px 5px;
+  background:var(--ide-panel, #1f2228); border:1px solid rgba(106, 190, 120, .5);
+  border-left:3px solid rgba(106, 190, 120, .9); border-radius:4px;
+  box-shadow:0 6px 18px rgba(0, 0, 0, .55); pointer-events:none; }
+.dsh-ide-edit-hint { color:rgba(150, 200, 160, .75); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif);
+  margin-bottom:2px; letter-spacing:.01em; }
+.dsh-ide-edit-code { color:rgba(160, 230, 175, .98); white-space:pre;
+  font:400 13px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
 .dsh-ide-icon-button { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:4px;
   padding:2px 5px; font:400 12px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-icon-button:hover { background:var(--ide-hover); }
