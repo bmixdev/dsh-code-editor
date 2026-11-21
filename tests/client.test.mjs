@@ -202,6 +202,19 @@ function renderText(element) {
   return (children ?? []).map(renderText).join('')
 }
 
+test('a replacement is offered as pink removal plus green phantom text', async () => {
+  const source = await readFile(CLIENT_SOURCE, 'utf8')
+
+  // The removed fragment keeps a pink background, and the replacement follows it
+  // on the same line as green phantom text. Both live in one ranking decoration,
+  // so a single-line edit never needs an overlay.
+  assert.ok(source.includes("inlineClassName: 'dsh-ide-edit-old'"), 'the removed range is highlighted')
+  assert.ok(source.includes("after: { content: edit.newText, inlineClassName: 'dsh-ide-edit-inline' }"), 'the replacement is inline phantom text')
+  assert.ok(source.includes("if (singleLine) inlineOnly.add(index)"), 'a single-line edit skips the overlay')
+  assert.ok(source.includes('.dsh-ide-edit-inline {'), 'the phantom text has its own style')
+  assert.ok(source.includes('.dsh-ide-edit-new {'), 'a multi-line edit still has a block')
+})
+
 test('every registered component renders its first pass without throwing', async () => {
   const { plugin } = await loadPlugin()
   const host = createHost()
