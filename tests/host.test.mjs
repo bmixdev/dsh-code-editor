@@ -400,9 +400,14 @@ test('the completion pins the least reasoning effort and reports its trajectory'
       })
       assert.equal(answered.status, 200)
       assert.equal(answered.body.text, 'return 1')
-      assert.equal(app.streamCalls[0].reasoningEffort, 'low')
+      // `off` is adapter-owned: it never appears in `info.reasoning.efforts`,
+      // yet it is the only level that stops a DeepSeek-style gateway from
+      // spending the whole budget on reasoning.
+      assert.equal(app.streamCalls[0].reasoningEffort, 'off')
       assert.equal(app.streamCalls[0].maxTokens, 900)
       assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
+      assert.equal(answered.body.trajectory.effort, 'off')
+      assert.equal(answered.body.modelSource, 'session')
       assert.equal(answered.body.trajectory.before, 'export const answer = 42\n'.length)
       assert.equal(answered.body.trajectory.finishReason, 'stop')
       assert.equal(answered.body.conversation.answer, 'return 1')

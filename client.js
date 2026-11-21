@@ -1455,7 +1455,12 @@ window.__ModuleLoader__.load({
           apiKeyRef: keyRef,
         }
         for (const entry of TAB_PREFERENCES) {
-          patch[entry.key] = entry.kind === 'boolean' ? options[entry.key] === true : toNumber(options[entry.key], entry.value)
+          patch[entry.key] =
+            entry.kind === 'boolean'
+              ? options[entry.key] === true
+              : entry.kind === 'text'
+                ? String(options[entry.key] ?? entry.value)
+                : toNumber(options[entry.key], entry.value)
         }
         onSave(patch)
       }
@@ -1483,7 +1488,9 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const modelOptions = [h('option', { key: '', value: '' }, 'Первая доступная у провайдера')]
+      const modelOptions = [
+        h('option', { key: '', value: '' }, sessionInfo !== undefined ? `Как у сессии (${sessionInfo.model})` : 'Как у сессии'),
+      ]
       const knownModels = new Set()
       for (const entry of models) {
         modelOptions.push(h('option', { key: entry.id, value: entry.id }, entry.name || entry.id))
@@ -1544,7 +1551,7 @@ window.__ModuleLoader__.load({
         setting(
           'model',
           'Автодополнение: модель',
-          'Пустое значение — первая модель провайдера.',
+          'Пустое значение — модель сессии; для другого провайдера — его первая модель.',
           h('select', { className: 'dsh-ide-input dsh-ide-setting-input', value: model, onChange: (event) => setModel(event.target.value) }, modelOptions),
         ),
         setting(
@@ -1560,7 +1567,7 @@ window.__ModuleLoader__.load({
         setting(
           'auto-suggest',
           'Автодополнение: автоподсказки',
-          'Предлагать подсказку по паузе 200 мс; выключено — только по Ctrl+Space.',
+          'Предлагать подсказку по паузе из настройки «Задержка запроса»; выключено — только по Ctrl+Space.',
           h(
             'label',
             { className: 'dsh-ide-setting-check' },
@@ -1653,41 +1660,64 @@ window.__ModuleLoader__.load({
       ]
 
       const optionValue = (entry) => (options[entry.key] === undefined ? entry.value : options[entry.key])
-      const optionRow = (entry) =>
-        entry.kind === 'boolean'
-          ? setting(
-              entry.key,
-              entry.title,
-              entry.hint,
-              h(
-                'label',
-                { className: 'dsh-ide-setting-check' },
-                h('input', {
-                  type: 'checkbox',
-                  checked: optionValue(entry) === true,
-                  onChange: (event) => setOptions((previous) => ({ ...previous, [entry.key]: event.target.checked })),
-                }),
-                h('span', {}, 'Включено'),
-              ),
-            )
-          : setting(
-              entry.key,
-              entry.title,
-              entry.hint,
+      const optionRow = (entry) => {
+        if (entry.kind === 'boolean') {
+          return setting(
+            entry.key,
+            entry.title,
+            entry.hint,
+            h(
+              'label',
+              { className: 'dsh-ide-setting-check' },
               h('input', {
-                className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-input-number',
-                type: 'number',
-                min: entry.min,
-                max: entry.max,
+                type: 'checkbox',
+                checked: optionValue(entry) === true,
+                onChange: (event) => setOptions((previous) => ({ ...previous, [entry.key]: event.target.checked })),
+              }),
+              h('span', {}, 'Включено'),
+            ),
+          )
+        }
+        if (entry.kind === 'text') {
+          return setting(
+            entry.key,
+            entry.title,
+            entry.hint,
+            h(
+              'select',
+              {
+                className: 'dsh-ide-input dsh-ide-setting-input',
                 value: String(optionValue(entry)),
                 onChange: (event) => setOptions((previous) => ({ ...previous, [entry.key]: event.target.value })),
-              }),
-            )
+              },
+              (entry.choices === undefined ? [] : entry.choices).map((choice) =>
+                h('option', { key: choice.value, value: choice.value }, choice.label),
+              ),
+            ),
+          )
+        }
+        return setting(
+          entry.key,
+          entry.title,
+          entry.hint,
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-input-number',
+            type: 'number',
+            min: entry.min,
+            max: entry.max,
+            value: String(optionValue(entry)),
+            onChange: (event) => setOptions((previous) => ({ ...previous, [entry.key]: event.target.value })),
+          }),
+        )
+      }
 
       // Two groups because they answer different questions: "when and what do we
       // ask" versus "what do we refuse to show".
       const REQUEST_KEYS = [
+        'completionEffort',
         'debounceMs',
+        'deadlineMs',
+        'flushAfterMs',
         'aboveLines',
         'belowLines',
         'answerLines',
@@ -1926,6 +1956,24 @@ window.__ModuleLoader__.load({
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
+/**
+ * Why this row shows the model it shows.
+ *
+ * An empty `completionModel` preference means "the session's model", so the
+ * trajectory naming the session model looked like the settings were ignored.
+ * The row now says where the model came from, and the tooltip spells it out.
+ */
+function traceModelHint(row) {
+  if (row === undefined || row === null) return ''
+  const parts = []
+  if (row.modelSource === 'session') parts.push('Своя модель подсказок не выбрана — взята модель сессии.')
+  if (row.modelSource === 'settings') parts.push('Модель выбрана в настройках подсказок.')
+  if (row.modelSource === 'request') parts.push('Модель передана запросом.')
+  if (row.fellBack === true) parts.push('Первая модель не ответила — сработала запасная.')
+  if (typeof row.effort === 'string' && row.effort !== '') parts.push(`Рассуждения: ${row.effort}.`)
+  return parts.join(' ')
+}
+
 // The editor bundle cannot import the Host modules, so the two primitives the
 // Tab controller needs are duplicated here. Keep them identical to the ones in
 // `tab.js`; `tests/tab.test.mjs` guards the Host side.
@@ -1953,6 +2001,22 @@ function nextWordEndLocal(text, start) {
 // new knob cannot be shown without also being saved. Bounds here are only for
 // the inputs: `prefs.js` clamps the stored value again on the Host.
 const TAB_PREFERENCES = [
+  {
+    key: 'completionEffort',
+    kind: 'text',
+    value: 'off',
+    choices: [
+      { value: 'off', label: 'off — без рассуждений (быстро)' },
+      { value: 'low', label: 'low — минимум рассуждений' },
+      { value: 'medium', label: 'medium — средне' },
+      { value: 'high', label: 'high — подробные рассуждения' },
+      { value: '', label: 'по умолчанию у провайдера' },
+    ],
+    title: 'Подсказки: уровень рассуждений',
+    hint: 'off отключает «размышления» и в разы ускоряет ответ; на некоторых моделях недоступен, тогда сработает запасной уровень.',
+  },
+  { key: 'deadlineMs', kind: 'number', value: 6000, min: 1000, max: 60000, title: 'Подсказки: предел ожидания', hint: 'Сколько миллисекунд ждать ответ, прежде чем сдаться (1000–60000).' },
+  { key: 'flushAfterMs', kind: 'number', value: 250, min: 0, max: 5000, title: 'Подсказки: показывать начало ответа', hint: 'Сколько миллисекунд собирать текст после первого символа, прежде чем показать его.' },
   { key: 'debounceMs', kind: 'number', value: 320, min: 50, max: 3000, title: 'Подсказки: задержка', hint: 'Пауза после последней правки перед запросом, мс (50–3000).' },
   { key: 'aboveLines', kind: 'number', value: 60, min: 0, max: 400, title: 'Подсказки: строк до курсора', hint: 'Сколько строк перед курсором видит модель (0–400).' },
   { key: 'belowLines', kind: 'number', value: 20, min: 0, max: 200, title: 'Подсказки: строк после курсора', hint: 'Сколько строк после курсора видит модель (0–200).' },
@@ -2029,7 +2093,16 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                   },
                   h('span', { className: 'dsh-ide-trace-time' }, row.at),
                   h('span', { className: 'dsh-ide-trace-path' }, row.path),
-                  h('span', { className: 'dsh-ide-trace-model' }, `${row.provider} / ${row.model}`),
+                  h(
+                    'span',
+                    {
+                      className: 'dsh-ide-trace-model',
+                      title: traceModelHint(row),
+                    },
+                    `${row.provider} / ${row.model}${
+                      row.fellBack === true ? ' · запасная' : row.modelSource === 'session' ? ' · из сессии' : ''
+                    }`,
+                  ),
                   h('span', { className: 'dsh-ide-trace-mode' }, row.explicit ? 'Ctrl+Space' : 'авто'),
                   h('span', { className: 'dsh-ide-trace-meta' }, `${row.before}/${row.after} символов`),
                   h('span', { className: 'dsh-ide-trace-meta' }, `${row.durationMs} мс`),
@@ -2396,6 +2469,9 @@ function IdeBody(props) {
             path: entry.path,
             provider: payload.provider,
             model: payload.model,
+            modelSource: typeof payload.modelSource === 'string' ? payload.modelSource : '',
+            fellBack: payload.fellBack === true,
+            effort: typeof payload.effort === 'string' ? payload.effort : '',
             explicit,
             before: asNumber(trajectory.before),
             after: asNumber(trajectory.after),

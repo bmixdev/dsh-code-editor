@@ -43,6 +43,16 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   belowLines: 20,
   /** Longest answer asked for, in lines. */
   answerLines: 5,
+  /**
+   * Reasoning level asked of the completion model; empty means "the cheap
+   * chain" (`off`, then `low`, then the provider default). `off` is what makes a
+   * thinking model answer in about a second instead of returning nothing.
+   */
+  completionEffort: 'off',
+  /** How long one completion may take before the request is dropped. */
+  deadlineMs: 6000,
+  /** Once text has started, how long to keep collecting before showing it. */
+  flushAfterMs: 250,
   /** Let an answer rewrite the rest of the cursor line instead of only inserting. */
   rangeReplace: true,
   /** How many lines from the cursor a rewrite may cover. 0 disables rewrites. */
@@ -85,6 +95,8 @@ export const PREFERENCE_LIMITS = Object.freeze({
   aboveLines: [0, 400],
   belowLines: [0, 200],
   answerLines: [1, 20],
+  deadlineMs: [1000, 60000],
+  flushAfterMs: [0, 5000],
   rangeReplaceLines: [0, 8],
   snoozeAfterRejectMs: [0, 5000],
   maxFileChars: [1000, 5000000],
@@ -129,7 +141,7 @@ function clampInteger(value, [min, max], fallback) {
 function sanitize(patch) {
   const result = {}
   if (typeof patch !== 'object' || patch === null) return result
-  for (const key of ['completionProvider', 'completionModel', 'apiKeyRef']) {
+  for (const key of ['completionProvider', 'completionModel', 'completionEffort', 'apiKeyRef']) {
     if (patch[key] === undefined) continue
     const value = String(patch[key] ?? '').trim()
     if (value.length > 200) throw Object.assign(new Error('Слишком длинное значение настройки.'), { code: 'bad-request' })

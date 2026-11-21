@@ -510,6 +510,19 @@ export function apply(ctx, config) {
         process.env.DSH_CODE_EDITOR_MODEL ||
         '',
     ).trim()
+    // Where the model came from, so the trajectory can say why the session's own
+    // model appears in a row: an empty preference means "whatever the session
+    // uses", not "a broken completion setting".
+    const modelSource =
+      (typeof body.model === 'string' && body.model.trim() !== '')
+        ? 'request'
+        : String(preferences.completionModel ?? '').trim() !== ''
+          ? 'settings'
+          : typeof config === 'object' && config !== null && String(config.completionModel ?? '').trim() !== ''
+            ? 'config'
+            : String(process.env.DSH_CODE_EDITOR_MODEL ?? '').trim() !== ''
+              ? 'env'
+              : 'session'
     const requestedProvider = String(
       (typeof body.provider === 'string' ? body.provider : '') || preferences.completionProvider || '',
     ).trim() || selection.provider
@@ -549,25 +562,28 @@ export function apply(ctx, config) {
       `--- текст до курсора ---\n${windowPrefix}\n--- курсор ---\n` +
       `--- текст после курсора ---\n${windowSuffix}`
 
-    const deadline = AbortSignal.timeout(COMPLETION_DEADLINE_MS)
+    const deadline = AbortSignal.timeout(boundedMs(preferences.deadlineMs, COMPLETION_DEADLINE_MS, 1000, 60000))
     const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    const flushAfterMs = boundedMs(preferences.flushAfterMs, 250, 0, 5000)
     const startedAt = Date.now()
 
     // A thinking model spends the output budget on hidden reasoning and then
-    // returns nothing, which reads in the GUI as "completions stopped working".
-    // Pinning the least advertised effort leaves the budget to the code.
-    const leastEffort = async (provider, model) => {
-      try {
-        const info = await ctx.llm.resolveModelInfo(provider, model, combined)
-        const effort = info?.reasoning?.efforts?.[0]
-        return typeof effort?.id === 'string' && effort.id !== '' ? effort.id : undefined
-      } catch {
-        return undefined
-      }
-    }
+    // returns nothing, and it is also what turned a hint into a 20 s wait.
+    // DSH exposes an adapter-owned `off` level that sends `thinking: { type:
+    // disabled }` for routes whose compat declares `thinkingFormat: deepseek`.
+    // Measured against the same gateway on a 20-line Python prompt: `off` put
+    // the first character on the wire in 1.6 s, while the default effort spent
+    // the whole budget on reasoning and never emitted text at all. A level the
+    // route rejects fails before any network I/O, so the chain below falls back
+    // cheaply; `undefined` means "provider default".
+    const effortChain = effortChainFor(preferences.completionEffort)
+    const attemptsForKind = kind === 'explicit' ? attempts : attempts.slice(0, 1)
 
     let text = ''
-    let used = attempts[0]
+    let used = attemptsForKind[0]
+    let effortsAdvertised = []
+    let effortUsed
+    let flushed = false
     // The stream can end without any text and without throwing: a refusal or a
     // transport failure arrives as its own chunk. Collecting the chunk types is
     // what tells that apart from "the model answered nothing" — the empty
@@ -576,68 +592,92 @@ export function apply(ctx, config) {
     let streamError = ''
     let finishReason = ''
     let firstChunk = ''
-    for (const attempt of attempts) {
-      const effort = await leastEffort(attempt.provider, attempt.model)
-      used = effort === undefined ? attempt : { ...attempt, effort }
-      let buffer = ''
-      streamError = ''
-      finishReason = ''
+    for (const attempt of attemptsForKind) {
       try {
-      for await (const chunk of ctx.llm.stream({
-        provider: attempt.provider,
-        model: attempt.model,
-        ...(used.effort === undefined ? {} : { reasoningEffort: used.effort }),
-      system: systemPrompt,
-      // Message content is a list of typed blocks, not a bare string: every
-      // other host-side caller in this installation passes
-      // `[{ type: 'text', text }]`, and a string content made the adapter end
-      // the stream immediately with no chunk at all (2 ms, empty answer).
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: requestText,
-            },
-          ],
-        },
-      ],
-      // 160 tokens was not enough for a reasoning model: it spent the whole
-      // budget on `reasoning_content` and every answer came back empty with
-      // `finish_reason: length`. The effort is pinned to the least advertised
-      // value above and 900 tokens leave room for the five lines of code.
-      maxTokens: 900,
-      temperature: 0.1,
-      signal: combined,
-      sessionId: document.sessionId,
-      purpose: 'code-editor-inline-completion',
-    })) {
-      if (!chunk || typeof chunk !== 'object') continue
-      if (firstChunk === '') {
+        const info = await ctx.llm.resolveModelInfo(attempt.provider, attempt.model, combined)
+        effortsAdvertised = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts.map(effort => effort.id) : []
+      } catch {
+        effortsAdvertised = []
+      }
+      for (const effort of effortChain) {
+        let buffer = ''
+        let firstTextAt = 0
+        let unsupported = false
+        streamError = ''
+        finishReason = ''
         try {
-          firstChunk = JSON.stringify(chunk).slice(0, 400)
-        } catch {
-          firstChunk = '<unserializable chunk>'
+          for await (const chunk of ctx.llm.stream({
+            provider: attempt.provider,
+            model: attempt.model,
+            ...(effort === undefined ? {} : { reasoningEffort: effort }),
+            system: systemPrompt,
+            // Message content is a list of typed blocks, not a bare string:
+            // every other host-side caller in this installation passes
+            // `[{ type: 'text', text }]`, and a string content made the adapter
+            // end the stream immediately with no chunk at all (2 ms, empty).
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: requestText,
+                  },
+                ],
+              },
+            ],
+            // 160 tokens was not enough for a reasoning model: it spent the
+            // whole budget on `reasoning_content` and every answer came back
+            // empty. With reasoning off the budget only holds the code, and 900
+            // tokens cover the five lines this feature is allowed to insert.
+            maxTokens: 900,
+            temperature: 0.1,
+            signal: combined,
+            sessionId: document.sessionId,
+            purpose: 'code-editor-inline-completion',
+          })) {
+            if (!chunk || typeof chunk !== 'object') continue
+            if (firstChunk === '') {
+              try {
+                firstChunk = JSON.stringify(chunk).slice(0, 400)
+              } catch {
+                firstChunk = '<unserializable chunk>'
+              }
+            }
+            if (typeof chunk.type === 'string' && chunkTypes.size < 8) chunkTypes.add(chunk.type)
+            if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+              if (firstTextAt === 0) firstTextAt = Date.now()
+              buffer += chunk.text
+            }
+            if (chunk.type === 'error') {
+              const detail = chunk.message ?? chunk.error?.message ?? chunk.error
+              streamError = typeof detail === 'string' && detail !== '' ? detail : 'stream-error'
+            }
+            if (chunk.type === 'finish') {
+              const reason = chunk.reason?.kind ?? chunk.reason ?? ''
+              finishReason = typeof reason === 'string' ? reason : 'finish'
+            }
+            if (typeof chunk.finishReason === 'string' && chunk.finishReason !== '') finishReason = chunk.finishReason
+            // Cursor draws the beginning of an answer while the rest of the
+            // stream is still arriving. A whole answer is never worth 20 s of
+            // silence, so once text has started, a short grace period ends the
+            // stream and the hint appears with what is already there.
+            if (firstTextAt !== 0 && Date.now() - firstTextAt >= flushAfterMs) {
+              flushed = true
+              break
+            }
+            if (buffer.length > COMPLETION_MAX_CHARS) break
+          }
+        } catch (cause) {
+          streamError = cause instanceof Error ? cause.message : String(cause)
         }
+        unsupported = buffer.trim() === '' && isUnsupportedEffort(streamError)
+        if (unsupported && effortChain.indexOf(effort) < effortChain.length - 1) continue
+        used = { provider: attempt.provider, model: attempt.model, ...(effort === undefined ? {} : { effort }) }
+        effortUsed = effort
+        text = buffer
+        break
       }
-      if (typeof chunk.type === 'string' && chunkTypes.size < 8) chunkTypes.add(chunk.type)
-      if (chunk.type === 'text-delta' && typeof chunk.text === 'string') buffer += chunk.text
-      if (chunk.type === 'error') {
-        const detail = chunk.message ?? chunk.error?.message ?? chunk.error
-        streamError = typeof detail === 'string' && detail !== '' ? detail : 'stream-error'
-      }
-      if (chunk.type === 'finish') {
-        const kind = chunk.reason?.kind ?? chunk.reason ?? ''
-        finishReason = typeof kind === 'string' ? kind : 'finish'
-      }
-      if (typeof chunk.finishReason === 'string' && chunk.finishReason !== '') finishReason = chunk.finishReason
-      if (buffer.length > COMPLETION_MAX_CHARS) break
-      }
-      } catch (cause) {
-        streamError = cause instanceof Error ? cause.message : String(cause)
-      }
-      text = buffer
       if (text.trim() !== '') break
     }
 
@@ -690,10 +730,16 @@ export function apply(ctx, config) {
       language: document.language,
       provider: used.provider,
       model: used.model,
+      modelSource,
+      effort: effortUsed ?? '',
+      flushed,
       rawChars: text.length,
       answerChars: result.length,
       ms: Date.now() - startedAt,
       attempts: attempts.length,
+      effort: effortUsed ?? '',
+      efforts: effortsAdvertised,
+      flushed,
       chunkTypes: [...chunkTypes],
       finishReason,
       error: streamError,
@@ -731,6 +777,11 @@ export function apply(ctx, config) {
       modelVersion,
       provider: used.provider,
       model: used.model,
+      modelSource,
+      effort: effortUsed ?? '',
+      fellBack:
+        attemptsForKind.length > 0 &&
+        (used.provider !== attemptsForKind[0].provider || used.model !== attemptsForKind[0].model),
       durationMs: Date.now() - startedAt,
       reason,
       suppressed: accepted ? undefined : { reason: verdict.reason },
@@ -738,6 +789,10 @@ export function apply(ctx, config) {
       // was attempted and what came back, the conversation shows the exact text.
       trajectory: {
         attempts: attempts.map(attempt => `${attempt.provider} / ${attempt.model}`),
+        modelSource,
+        effort: effortUsed ?? '',
+        efforts: effortsAdvertised,
+        flushed,
         finishReason,
         streamError,
         chunkTypes: [...chunkTypes],
@@ -1044,6 +1099,35 @@ function relativeOf(cwd, displayPath) {
 function clip(text, limit, side) {
   if (text.length <= limit) return text
   return side === 'end' ? text.slice(text.length - limit) : text.slice(0, limit)
+}
+
+/** A preference that must stay inside a range, with a learned default. */
+function boundedMs(value, fallback, min, max) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return fallback
+  return Math.min(max, Math.max(min, Math.round(number)))
+}
+
+/**
+ * Reasoning levels to try, cheapest first.
+ *
+ * `off` is adapter-owned rather than advertised: DSH has no entry for it in
+ * `info.reasoning.efforts`, yet it is the level that serializes as
+ * `thinking: { type: disabled }` for a DeepSeek-style gateway, which is the
+ * difference between a 1.6 s hint and an empty answer 20 s later. A route that
+ * does not accept it rejects the call before any network I/O, so asking first
+ * costs nothing. `undefined` is "provider default" and closes the chain.
+ */
+const EFFORT_CHAIN = ['off', 'low', undefined]
+function effortChainFor(value) {
+  const wanted = typeof value === 'string' ? value.trim() : ''
+  if (wanted === '') return [...EFFORT_CHAIN]
+  if (!EFFORT_CHAIN.includes(wanted)) return [...EFFORT_CHAIN]
+  return [wanted, ...EFFORT_CHAIN.filter(level => level !== wanted)]
+}
+
+function isUnsupportedEffort(message) {
+  return /UNSUPPORTED_REASONING_EFFORT|unsupported reasoning effort|invalid thinking/i.test(String(message ?? ''))
 }
 
 /**
