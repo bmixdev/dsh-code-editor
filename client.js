@@ -2480,94 +2480,185 @@ function IdeBody(props) {
         state.tab.edits = []
       }
 
+      // ---------------------------------------------------------------------
+      // A block proposal takes room in the buffer. Drawing it as an overlay
+      // printed the new text on top of the code underneath (the two lines merged
+      // in the user's screenshot), so the proposed lines are inserted into the
+      // model for real and the replaced lines are painted pink. Tab deletes the
+      // pink lines and keeps the inserted ones, Esc deletes the inserted ones.
+      // Nothing reaches the file until Tab: the buffer is only staged, and any
+      // other edit reverts the staging first.
+      // ---------------------------------------------------------------------
+
+      const eolOf = (model) => (model.getEOL() === '\r\n' ? '\r\n' : '\n')
+
+      // Runs a set of offset edits as one internal transaction, so the content
+      // listener does not mistake the staging for typing and ask the model again.
+      const runModelEdits = (operations) => {
+        const editor = runtime.current.editor
+        const monacoInstance = runtime.current.monaco
+        if (editor === undefined || monacoInstance === undefined) return false
+        const model = editor.getModel()
+        if (model === null || operations.length === 0) return false
+        const ranges = []
+        for (const operation of [...operations].sort((left, right) => left.start - right.start)) {
+          const start = model.getPositionAt(Math.max(0, operation.start))
+          const end = model.getPositionAt(Math.max(operation.start, operation.end))
+          ranges.push({
+            range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+            text: operation.text,
+            forceMoveMarkers: true,
+          })
+        }
+        runtime.current.tab.internalEdit = true
+        try {
+          editor.pushUndoStop()
+          editor.executeEdits('dsh-ide', ranges)
+          editor.pushUndoStop()
+        } finally {
+          runtime.current.tab.internalEdit = false
+        }
+        return true
+      }
+
+      /** Skips `count` line breaks from `from`, returning the offset after them. */
+      const scanLines = (value, from, count, eol) => {
+        let at = from
+        for (let index = 0; index < count; index += 1) {
+          const next = value.indexOf(eol, at)
+          if (next < 0) return value.length
+          at = next + eol.length
+        }
+        return at
+      }
+
+      // Removes the staged lines. With an unchanged buffer the recorded offsets
+      // are exact; after the user typed they are stale, so the staged text is
+      // found again by content and only a unique match is touched.
+      const clearPhantom = () => {
+        const state = runtime.current
+        const editor = state.editor
+        const phantom = state.tab.phantom
+        state.tab.phantom = undefined
+        if (editor !== undefined && phantom !== undefined && Array.isArray(phantom.decorations)) {
+          editor.deltaDecorations(phantom.decorations, [])
+        }
+        if (phantom === undefined || editor === undefined) return false
+        const model = editor.getModel()
+        if (model === null) return false
+        const value = model.getValue()
+        const sameVersion = model.getVersionId() === phantom.version
+        const operations = []
+        for (const entry of phantom.inserted) {
+          let start = -1
+          if (sameVersion) start = entry.start
+          else {
+            const index = value.indexOf(entry.text)
+            if (index >= 0 && value.indexOf(entry.text, index + 1) < 0) start = index
+          }
+          if (start >= 0 && start + entry.text.length <= value.length) {
+            operations.push({ start, end: start + entry.text.length, text: '' })
+          }
+        }
+        if (operations.length === 0) return false
+        return runModelEdits(operations)
+      }
+
       const decorateEdits = (plan, model) => {
+        clearPhantom()
         clearEdits()
         const editor = runtime.current.editor
         const monacoInstance = runtime.current.monaco
         const edits = Array.isArray(plan.edits) ? plan.edits : []
         if (editor === undefined || monacoInstance === undefined || edits.length === 0) return
         const decorations = []
-        const inlineOnly = new Set()
-        for (const [index, edit] of edits.entries()) {
+        const blocks = []
+        for (const edit of edits) {
           const start = model.getPositionAt(edit.start)
           const end = model.getPositionAt(edit.end)
-          // The hover carries the whole proposal, so an edit whose block card was
+          // The hover carries the whole proposal, so a block whose card was
           // skipped as too close to the previous one is still readable.
           const hover =
             (edit.why === '' ? 'Правка подсказки' : edit.why) +
             '\n\n```\n' +
             edit.newText +
             '\n```'
-          const singleLine = !edit.newText.includes('\n')
-          decorations.push({
-            range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
-            options: {
-              inlineClassName: 'dsh-ide-edit-old',
-              hoverMessage: { value: hover },
-              // A one-line replacement is phantom text on the same line: what goes
-              // away stays pink, what arrives follows it in green. That is the
-              // inline behaviour of Cursor, and it needs no overlay at all. The
-              // "after" content sits at the end of the decorated range.
-              ...(singleLine
-                ? { after: { content: edit.newText, inlineClassName: 'dsh-ide-edit-inline' } }
-                : {}),
-            },
-          })
-          if (singleLine) inlineOnly.add(index)
+          if (!edit.newText.includes('\n')) {
+            // A one-line replacement is phantom text on the same line: what goes
+            // away stays pink, what arrives follows it in green. Monaco flows the
+            // "after" content inline, so nothing is printed over anything else.
+            decorations.push({
+              range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+              options: {
+                inlineClassName: 'dsh-ide-edit-old',
+                hoverMessage: { value: hover },
+                after: { content: edit.newText, inlineClassName: 'dsh-ide-edit-inline' },
+              },
+            })
+            continue
+          }
+          blocks.push({ edit, hover, startLine: start.lineNumber, endLine: end.lineNumber })
         }
         runtime.current.tab.editDecorations = editor.deltaDecorations([], decorations)
-        const widgets = []
-        // Two block cards anchored a line apart would cover each other, so only
-        // the first of a cluster keeps a card; the rest stay highlighted, and
-        // their replacement is in the hover.
-        let lastCardLine = -Infinity
-        edits.forEach((edit, index) => {
-          if (inlineOnly.has(index)) return
-          const start = model.getPositionAt(edit.start)
-          const node = document.createElement('div')
-          node.className = 'dsh-ide-edit-new'
-          // A block answer cannot be inline: the phantom lines have to sit over
-          // real ones. The block is drawn as plain code on the editor background
-          // (no dialog chrome), so it reads as extra lines rather than a popup.
-          const code = document.createElement('div')
-          code.className = 'dsh-ide-edit-code'
-          code.textContent = edit.newText
-          node.appendChild(code)
-          node.title = edit.newText
-          // The card may be wider than the text column: scrolling it must not
-          // move the caret or steal focus from the editor.
-          node.addEventListener('mousedown', (event) => event.preventDefault())
-          if (start.lineNumber - lastCardLine < 7) return
-          lastCardLine = start.lineNumber
-          const widget = {
-            getId: () => `dsh-ide.edit.${plan.requestId}.${index}`,
-            getDomNode: () => node,
-            getPosition: () => {
-              // The percentage cap is unreliable inside Monaco's widget layer, so
-              // the usable width comes from the editor layout itself. Without it
-              // the card runs past the right edge and its text is cut off.
-              const width = editor.getLayoutInfo().width
-              node.style.maxWidth = `${Math.max(220, Math.round(width) - 48)}px`
-              // Anchored at the start of the line, not at the column of the edit:
-              // a card that begins mid-line runs off the right edge of a narrow
-              // editor. A multi-line edit anchors after its last line, so the
-              // proposal reads like a diff and does not hide the code it replaces.
-              const anchorLine = start.lineNumber === model.getPositionAt(edit.end).lineNumber
-                ? start.lineNumber
-                : model.getPositionAt(edit.end).lineNumber
-              return {
-                position: { lineNumber: anchorLine, column: 1 },
-                preference: [
-                  monacoInstance.editor.ContentWidgetPositionPreference.BELOW,
-                  monacoInstance.editor.ContentWidgetPositionPreference.ABOVE,
-                ],
-              }
-            },
-          }
-          editor.addContentWidget(widget)
-          widgets.push(widget)
-        })
-        runtime.current.tab.editWidgets = widgets
+        if (blocks.length === 0) return
+        // Insert every proposed block above the lines it replaces. The offsets are
+        // computed against the unchanged buffer and shifted by what earlier
+        // insertions added, then the whole set is applied at once.
+        blocks.sort((left, right) => left.edit.start - right.edit.start)
+        const eol = eolOf(model)
+        const operations = []
+        const inserted = []
+        let delta = 0
+        for (const block of blocks) {
+          // The offsets go to Monaco against the buffer as it is right now, so
+          // every operation uses the unshifted position; only the recorded
+          // result is shifted, because earlier insertions push later lines down.
+          const insertStart = model.getOffsetAt({ lineNumber: block.startLine, column: 1 })
+          const text = block.edit.newText + eol
+          operations.push({ start: insertStart, end: insertStart, text })
+          const placedAt = insertStart + delta
+          inserted.push({ start: placedAt, end: placedAt + text.length, text, block })
+          delta += text.length
+        }
+        if (!runModelEdits(operations)) return
+        const stagedDecorations = []
+        const removed = []
+        const value = model.getValue()
+        for (const entry of inserted) {
+          const lineCount = entry.block.endLine - entry.block.startLine + 1
+          const oldStart = entry.end
+          const oldEnd = scanLines(value, oldStart, lineCount, eol)
+          removed.push({ start: oldStart, end: oldEnd })
+          const insertedStart = model.getPositionAt(entry.start)
+          const insertedEnd = model.getPositionAt(entry.end)
+          const oldStartPos = model.getPositionAt(oldStart)
+          const oldEndPos = model.getPositionAt(oldEnd)
+          // Green marks the lines that stay on Tab, pink the ones Tab deletes.
+          stagedDecorations.push({
+            range: new monacoInstance.Range(
+              insertedStart.lineNumber,
+              1,
+              Math.max(insertedStart.lineNumber, insertedEnd.lineNumber),
+              1,
+            ),
+            options: { isWholeLine: true, className: 'dsh-ide-edit-added' },
+          })
+          stagedDecorations.push({
+            range: new monacoInstance.Range(
+              oldStartPos.lineNumber,
+              1,
+              Math.max(oldStartPos.lineNumber, oldEndPos.lineNumber),
+              1,
+            ),
+            options: { isWholeLine: true, className: 'dsh-ide-edit-old-line', hoverMessage: { value: entry.block.hover } },
+          })
+        }
+        runtime.current.tab.phantom = {
+          version: model.getVersionId(),
+          inserted,
+          removed,
+          decorations: editor.deltaDecorations([], stagedDecorations),
+        }
         runtime.current.tab.edits = edits
         // An answer that is only edits has no ghost text at the caret, but Tab
         // must still accept it: the command is guarded by this context key.
@@ -2718,6 +2809,7 @@ function IdeBody(props) {
         const visible =
           state.ghost !== '' ||
           state.tab.plan !== undefined ||
+          state.tab.phantom !== undefined ||
           (Array.isArray(decorations) && decorations.length > 0) ||
           (Array.isArray(state.tab.editWidgets) && state.tab.editWidgets.length > 0)
         state.ghost = ''
@@ -2731,6 +2823,9 @@ function IdeBody(props) {
         const widget = runtime.current.ghostWidget
         if (editor !== undefined && widget !== undefined) editor.layoutContentWidget(widget)
         if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(false)
+        // The staged block took real lines; dropping the hint has to give them
+        // back, or Esc would leave the proposal in the buffer.
+        clearPhantom()
         clearRemovedDecoration()
         clearEdits()
       }, [])
@@ -2803,28 +2898,68 @@ function IdeBody(props) {
         if (plan === undefined || editor === undefined) return false
         const model = editor.getModel()
         if (model === null) return false
-        if (model.getVersionId() !== plan.modelVersion) {
+        // A staged block was inserted into the buffer already, so the model
+        // version moved past the one the request was built on; the staged
+        // version is the one Tab has to trust.
+        const phantom = runtime.current.tab.phantom
+        const expectedVersion = phantom === undefined ? plan.modelVersion : phantom.version
+        if (model.getVersionId() !== expectedVersion) {
           clearGhost()
           return false
         }
         const accepted = runtime.current.tab.accepted
         const text = plan.insertText.slice(accepted)
         const edits = Array.isArray(plan.edits) ? plan.edits : []
-        if (text === '' && edits.length === 0) {
+        if (text === '' && edits.length === 0 && phantom === undefined) {
           clearGhost()
           return false
         }
+        // Everything that sits below a staged block moved down by the lines it
+        // took, so an offset from the Host is shifted by the staged text above it.
+        const shiftAt = (offset) =>
+          phantom === undefined
+            ? 0
+            : phantom.inserted.reduce(
+                (sum, entry) => (entry.block.edit.start < offset ? sum + entry.text.length : sum),
+                0,
+              )
+        const staged = phantom === undefined ? new Set() : new Set(phantom.inserted.map((entry) => entry.block.edit))
         const tabKey = runtime.current.modelTabs.get(model.uri.toString())
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === tabKey)
         // One transaction: the continuation at the caret plus every phantom edit
         // the Host located. Tab is one undo step, and the offsets stay valid
         // because Monaco applies the whole set together.
         const operations = []
-        if (text !== '') operations.push({ start: plan.range.start + accepted, end: plan.range.end, text })
-        for (const edit of edits) operations.push({ start: edit.start, end: edit.end, text: edit.newText })
-        const edited = applyGhostEdits(operations, plan.range.start + plan.insertText.length)
+        if (text !== '') {
+          operations.push({
+            start: plan.range.start + accepted + shiftAt(plan.range.start + accepted),
+            end: plan.range.end + shiftAt(plan.range.end),
+            text,
+          })
+        }
+        for (const edit of edits) {
+          // A block that was staged is already in the buffer; Tab only has to
+          // delete the lines it replaces, which the staging recorded.
+          if (staged.has(edit)) continue
+          operations.push({
+            start: edit.start + shiftAt(edit.start),
+            end: edit.end + shiftAt(edit.end),
+            text: edit.newText,
+          })
+        }
+        if (phantom !== undefined) {
+          for (const entry of phantom.removed) operations.push({ start: entry.start, end: entry.end, text: '' })
+        }
+        const caret = plan.range.start + plan.insertText.length + shiftAt(plan.range.start)
+        const edited = applyGhostEdits(operations, caret)
         runtime.current.tab.plan = undefined
         runtime.current.tab.accepted = 0
+        // Tab keeps the staged lines: drop the record before clearGhost, which
+        // would otherwise treat them as a cancelled hint and delete them.
+        if (phantom !== undefined) {
+          runtime.current.tab.phantom = undefined
+          if (Array.isArray(phantom.decorations)) editor.deltaDecorations(phantom.decorations, [])
+        }
         clearGhost()
         if (!edited) return false
         pushTrace({
@@ -2865,6 +3000,9 @@ function IdeBody(props) {
         const editor = runtime.current.editor
         if (plan === undefined || editor === undefined) return false
         if (tabPref('partialAccept', true) !== true) return acceptGhost()
+        // A staged block already moved the text under the caret, so a word-by-word
+        // insert would land at an offset that no longer exists: take it all.
+        if (runtime.current.tab.phantom !== undefined) return acceptGhost()
         // A replacement is all or nothing: inserting only its first word would
         // keep the tail it was supposed to rewrite.
         if (plan.range.start !== plan.range.end) return acceptGhost()
@@ -2968,6 +3106,9 @@ function IdeBody(props) {
         if (model === null || position === null) return
         if (kind !== 'explicit' && kind !== 'refetch' && Date.now() < runtime.current.tab.snoozeUntil) return
         if (kind === 'auto' && runtime.current.tab.plan !== undefined) return
+        // A staged block lives in the buffer; the request must describe the file
+        // the user actually has, not the proposal it is still deciding about.
+        if (runtime.current.tab.phantom !== undefined) clearGhost()
         const result = await complete(model, position, { triggerKind: kind === 'explicit' ? 1 : 0, kind }, undefined)
         if (result === undefined || result.plan === undefined) {
           clearGhost()
@@ -4129,11 +4270,9 @@ function IdeBody(props) {
 .dsh-ide-edit-old { background:rgba(224, 108, 117, .22); border-bottom:1px solid rgba(224, 108, 117, .5); }
 .dsh-ide-edit-inline { color:rgba(150, 225, 165, .95); margin-left:6px; opacity:.95;
   font-family:var(--ide-font-mono, ui-monospace, monospace); }
-.dsh-ide-edit-new { position:relative; z-index:30; margin:0 0 0 8px; padding:0 8px 0 6px;
-  max-height:200px; overflow:auto; cursor:auto; opacity:.97;
-  background:var(--ide-bg, #1e1e1e); border-left:2px solid rgba(106, 190, 120, .75);
-  color:rgba(150, 225, 165, .95); white-space:pre;
-  font:400 13px/20px var(--ide-font-mono, ui-monospace, monospace); }
+.dsh-ide-edit-added { background:rgba(106, 190, 120, .14); }
+.dsh-ide-edit-old-line { background:rgba(224, 108, 117, .16); text-decoration:line-through;
+  text-decoration-color:rgba(224, 108, 117, .5); }
 .dsh-ide-edit-code { white-space:pre; }
 .dsh-ide-icon-button { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:4px;
   padding:2px 5px; font:400 12px/1 var(--dsh-font-ui, system-ui, sans-serif); }

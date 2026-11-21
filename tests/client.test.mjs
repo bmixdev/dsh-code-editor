@@ -206,13 +206,17 @@ test('a replacement is offered as pink removal plus green phantom text', async (
   const source = await readFile(CLIENT_SOURCE, 'utf8')
 
   // The removed fragment keeps a pink background, and the replacement follows it
-  // on the same line as green phantom text. Both live in one ranking decoration,
-  // so a single-line edit never needs an overlay.
+  // on the same line as green phantom text. Both live in one decoration, so a
+  // single-line edit never needs an overlay.
   assert.ok(source.includes("inlineClassName: 'dsh-ide-edit-old'"), 'the removed range is highlighted')
   assert.ok(source.includes("after: { content: edit.newText, inlineClassName: 'dsh-ide-edit-inline' }"), 'the replacement is inline phantom text')
-  assert.ok(source.includes("if (singleLine) inlineOnly.add(index)"), 'a single-line edit skips the overlay')
+  // A block answer takes real lines instead of printing over the code below it:
+  // the proposed lines are inserted above the replaced ones and Tab keeps them.
+  assert.ok(source.includes('const text = block.edit.newText + eol'), 'a block is staged as real lines')
+  assert.ok(source.includes("className: 'dsh-ide-edit-added'"), 'the staged lines are marked as arriving')
+  assert.ok(source.includes("className: 'dsh-ide-edit-old-line'"), 'the replaced lines are marked as leaving')
   assert.ok(source.includes('.dsh-ide-edit-inline {'), 'the phantom text has its own style')
-  assert.ok(source.includes('.dsh-ide-edit-new {'), 'a multi-line edit still has a block')
+  assert.ok(source.includes('.dsh-ide-edit-old-line {'), 'the leaving lines have their own style')
 })
 
 test('every registered component renders its first pass without throwing', async () => {
