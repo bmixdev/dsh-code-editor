@@ -44,11 +44,11 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   /** Longest answer asked for, in lines. */
   answerLines: 5,
   /**
-   * Reasoning level asked of the completion model; empty means "the cheap
-   * chain" (`off`, then `low`, then the provider default). `off` is what makes a
-   * thinking model answer in about a second instead of returning nothing.
+   * Reasoning level asked of the completion model; empty means "the level the
+   * provider uses by default". `off` disables hidden reasoning where the route
+   * accepts it, which is what makes a thinking model answer in about a second.
    */
-  completionEffort: 'off',
+  completionEffort: '',
   /** How long one completion may take before the request is dropped. */
   deadlineMs: 6000,
   /** Once text has started, how long to keep collecting before showing it. */

@@ -654,8 +654,19 @@ export function apply(ctx, config) {
               streamError = typeof detail === 'string' && detail !== '' ? detail : 'stream-error'
             }
             if (chunk.type === 'finish') {
-              const reason = chunk.reason?.kind ?? chunk.reason ?? ''
-              finishReason = typeof reason === 'string' ? reason : 'finish'
+              // A failed call finishes the stream with `reason.kind: "error"`
+              // and the cause under `reason.failure`; it is not a thrown error
+              // and not a `type: "error"` chunk, so reading only those two made
+              // a rejected request look like "the model answered nothing".
+              const reason = chunk.reason ?? {}
+              if (reason.kind === 'error' && reason.failure !== undefined && reason.failure !== null) {
+                const message = typeof reason.failure.message === 'string' ? reason.failure.message : ''
+                const code = typeof reason.failure.code === 'string' ? reason.failure.code : ''
+                streamError = message !== '' ? message : code !== '' ? code : 'stream-error'
+                if (code !== '') finishReason = code
+              } else {
+                finishReason = typeof reason.kind === 'string' ? reason.kind : 'finish'
+              }
             }
             if (typeof chunk.finishReason === 'string' && chunk.finishReason !== '') finishReason = chunk.finishReason
             // Cursor draws the beginning of an answer while the rest of the
@@ -1111,23 +1122,34 @@ function boundedMs(value, fallback, min, max) {
 /**
  * Reasoning levels to try, cheapest first.
  *
- * `off` is adapter-owned rather than advertised: DSH has no entry for it in
- * `info.reasoning.efforts`, yet it is the level that serializes as
- * `thinking: { type: disabled }` for a DeepSeek-style gateway, which is the
- * difference between a 1.6 s hint and an empty answer 20 s later. A route that
- * does not accept it rejects the call before any network I/O, so asking first
- * costs nothing. `undefined` is "provider default" and closes the chain.
+ * An empty preference means "whatever the provider does by default": every
+ * extra level costs a rejected request first, and the adapter validates the
+ * level against the model's own declaration. `off` stays available because it
+ * is the only level that stops a DeepSeek-style gateway from spending the whole
+ * budget on hidden reasoning — but a route that does not know it refuses the
+ * call before any network I/O, so the fallback is cheap. `undefined` is
+ * "provider default" and closes the chain.
  */
-const EFFORT_CHAIN = ['off', 'low', undefined]
+const EFFORT_LEVELS = ['off', 'low', 'medium', 'high']
 function effortChainFor(value) {
   const wanted = typeof value === 'string' ? value.trim() : ''
-  if (wanted === '') return [...EFFORT_CHAIN]
-  if (!EFFORT_CHAIN.includes(wanted)) return [...EFFORT_CHAIN]
-  return [wanted, ...EFFORT_CHAIN.filter(level => level !== wanted)]
+  // The empty level is a deliberate choice, not a missing value: asking for it
+  // first is what a provider without a usable `off` needs to answer at all.
+  if (wanted === '') return [undefined]
+  const chain = [wanted]
+  for (const level of EFFORT_LEVELS) {
+    if (!chain.includes(level)) chain.push(level)
+  }
+  // `undefined` closes the chain with "provider default": something has to run
+  // even if every named level is rejected.
+  chain.push(undefined)
+  return chain
 }
 
 function isUnsupportedEffort(message) {
-  return /UNSUPPORTED_REASONING_EFFORT|unsupported reasoning effort|invalid thinking/i.test(String(message ?? ''))
+  return /UNSUPPORTED_REASONING_EFFORT|unsupported reasoning effort|does not support reasoning effort|invalid thinking/i.test(
+    String(message ?? ''),
+  )
 }
 
 /**

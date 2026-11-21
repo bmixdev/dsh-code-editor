@@ -387,7 +387,7 @@ test('the completion permission survives an editor restart', async () => {
   }
 })
 
-test('the completion pins the least reasoning effort and reports its trajectory', async () => {
+test('the completion sends the provider default effort and reports its trajectory', async () => {
   const root = await makeWorkspace()
   try {
     await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
@@ -405,13 +405,12 @@ test('the completion pins the least reasoning effort and reports its trajectory'
       })
       assert.equal(answered.status, 200)
       assert.equal(answered.body.text, 'return 1')
-      // `off` is adapter-owned: it never appears in `info.reasoning.efforts`,
-      // yet it is the only level that stops a DeepSeek-style gateway from
-      // spending the whole budget on reasoning.
-      assert.equal(app.streamCalls[0].reasoningEffort, 'off')
+      // No level is pinned by default: every extra level would cost a rejected
+      // request first, and a provider rejects an unknown level before the network.
+      assert.equal(app.streamCalls[0].reasoningEffort, undefined)
       assert.equal(app.streamCalls[0].maxTokens, 900)
       assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
-      assert.equal(answered.body.trajectory.effort, 'off')
+      assert.equal(answered.body.trajectory.effort, '')
       assert.equal(answered.body.modelSource, 'session')
       assert.equal(answered.body.trajectory.before, 'export const answer = 42\n'.length)
       assert.equal(answered.body.trajectory.finishReason, 'stop')
@@ -430,6 +429,9 @@ test('a route without the off level falls back to the next cheap effort', async 
       const app = setup({ root, rejectEffort: 'off' })
       const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
       await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      await app.call('prefs', { patch: { completionEffort: 'off' } })
+      const saved = await app.call('prefs', {})
+      assert.equal(saved.body.preferences.completionEffort, 'off')
       const answered = await app.call('complete', {
         id: opened.body.id,
         sessionId: SESSION_ID,
