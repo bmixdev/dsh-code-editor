@@ -46,7 +46,7 @@ async function makeWorkspace() {
   return root
 }
 
-function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' } }) {
+function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '' }) {
   const routes = new Map()
   const streamCalls = []
   const session = { id: SESSION_ID }
@@ -81,6 +81,11 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
       },
       async *stream(request) {
         streamCalls.push(request)
+        // A route that does not know the adapter-owned `off` level refuses the
+        // call before any network I/O; the Host must then retry the next level.
+        if (rejectEffort !== '' && request.reasoningEffort === rejectEffort) {
+          throw new Error('UNSUPPORTED_REASONING_EFFORT: this route has no such level')
+        }
         yield { type: 'text-delta', index: 0, text: 'return 1' }
         yield { type: 'finish', reason: { kind: 'stop' } }
       },
@@ -412,6 +417,30 @@ test('the completion pins the least reasoning effort and reports its trajectory'
       assert.equal(answered.body.trajectory.finishReason, 'stop')
       assert.equal(answered.body.conversation.answer, 'return 1')
       assert.ok(answered.body.conversation.message.includes('--- текст до курсора ---'))
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a route without the off level falls back to the next cheap effort', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root, rejectEffort: 'off' })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      const answered = await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 42\n',
+        offset: 'export const answer = 42\n'.length,
+      })
+      assert.equal(answered.body.text, 'return 1')
+      assert.equal(app.streamCalls[0].reasoningEffort, 'off')
+      assert.equal(app.streamCalls[1].reasoningEffort, 'low')
+      assert.equal(answered.body.trajectory.effort, 'low')
     })
   } finally {
     await rm(root, { recursive: true, force: true })
