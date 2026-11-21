@@ -2494,11 +2494,19 @@ function IdeBody(props) {
       // Nothing reaches the file until Tab: the buffer is only staged, and any
       // other edit reverts the staging first.
       // ---------------------------------------------------------------------
+      // A block proposal takes room in the buffer, but only where it differs:
+      // the unchanged lines stay exactly where they are, the lines that go away
+      // keep a pink strikethrough, and the lines that arrive are inserted above
+      // them in green. Inserting the whole new block duplicated every unchanged
+      // line, which is what made the preview unreadable. Tab replaces the whole
+      // staged region with the proposed text, Esc puts the original text back;
+      // nothing reaches the file until Tab.
+      // ---------------------------------------------------------------------
 
       const eolOf = (model) => (model.getEOL() === '\r\n' ? '\r\n' : '\n')
 
       // Runs a set of offset edits as one internal transaction, so the content
-      // listener does not mistake the staging for typing and ask the model again.
+      // listener does not mistake the staging for typing.
       const runModelEdits = (operations) => {
         const editor = runtime.current.editor
         const monacoInstance = runtime.current.monaco
@@ -2531,20 +2539,52 @@ function IdeBody(props) {
         return true
       }
 
-      /** Skips `count` line breaks from `from`, returning the offset after them. */
-      const scanLines = (value, from, count, eol) => {
-        let at = from
-        for (let index = 0; index < count; index += 1) {
-          const next = value.indexOf(eol, at)
-          if (next < 0) return value.length
-          at = next + eol.length
+      /** Line-level diff: the shortest list of keep/delete/insert operations. */
+      const diffLinesLocal = (before, after) => {
+        const left = before.split('\n')
+        const right = after.split('\n')
+        const rows = left.length
+        const columns = right.length
+        const table = Array.from({ length: rows + 1 }, () => new Array(columns + 1).fill(0))
+        for (let row = rows - 1; row >= 0; row -= 1) {
+          for (let column = columns - 1; column >= 0; column -= 1) {
+            table[row][column] =
+              left[row] === right[column]
+                ? table[row + 1][column + 1] + 1
+                : Math.max(table[row + 1][column], table[row][column + 1])
+          }
         }
-        return at
+        const ops = []
+        let row = 0
+        let column = 0
+        while (row < rows && column < columns) {
+          if (left[row] === right[column]) {
+            ops.push({ type: 'same', text: left[row] })
+            row += 1
+            column += 1
+            continue
+          }
+          if (table[row + 1][column] >= table[row][column + 1]) {
+            ops.push({ type: 'del', text: left[row] })
+            row += 1
+          } else {
+            ops.push({ type: 'add', text: right[column] })
+            column += 1
+          }
+        }
+        while (row < rows) {
+          ops.push({ type: 'del', text: left[row] })
+          row += 1
+        }
+        while (column < columns) {
+          ops.push({ type: 'add', text: right[column] })
+          column += 1
+        }
+        return ops
       }
 
-      // Removes the staged lines. With an unchanged buffer the recorded offsets
-      // are exact; after the user typed they are stale, so the staged text is
-      // found again by content and only a unique match is touched.
+      // Cancels the staging: each staged region gets its original text back, so
+      // the buffer is byte-identical to what the user had before the hint.
       const clearPhantom = () => {
         const state = runtime.current
         const editor = state.editor
@@ -2555,21 +2595,12 @@ function IdeBody(props) {
         }
         if (phantom === undefined || editor === undefined) return false
         const model = editor.getModel()
-        if (model === null) return false
-        const value = model.getValue()
-        const sameVersion = model.getVersionId() === phantom.version
-        const operations = []
-        for (const entry of phantom.inserted) {
-          let start = -1
-          if (sameVersion) start = entry.start
-          else {
-            const index = value.indexOf(entry.text)
-            if (index >= 0 && value.indexOf(entry.text, index + 1) < 0) start = index
-          }
-          if (start >= 0 && start + entry.text.length <= value.length) {
-            operations.push({ start, end: start + entry.text.length, text: '' })
-          }
-        }
+        if (model === null || model.getVersionId() !== phantom.version) return false
+        const operations = phantom.replaced.map((entry) => ({
+          start: entry.start,
+          end: entry.end,
+          text: entry.original,
+        }))
         if (operations.length === 0) return false
         return runModelEdits(operations)
       }
@@ -2586,13 +2617,10 @@ function IdeBody(props) {
         for (const edit of edits) {
           const start = model.getPositionAt(edit.start)
           const end = model.getPositionAt(edit.end)
-          // The hover carries the whole proposal, so a block whose card was
+          // The hover carries the whole proposal, so a line whose card was
           // skipped as too close to the previous one is still readable.
           const hover =
-            (edit.why === '' ? 'Правка подсказки' : edit.why) +
-            '\n\n```\n' +
-            edit.newText +
-            '\n```'
+            (edit.why === '' ? 'Правка подсказки' : edit.why) + '\n\n```\n' + edit.newText + '\n```'
           if (!edit.newText.includes('\n')) {
             // A one-line replacement is phantom text on the same line: what goes
             // away stays pink, what arrives follows it in green. Monaco flows the
@@ -2607,66 +2635,85 @@ function IdeBody(props) {
             })
             continue
           }
-          blocks.push({ edit, hover, startLine: start.lineNumber, endLine: end.lineNumber })
+          blocks.push({ edit, hover })
         }
         runtime.current.tab.editDecorations = editor.deltaDecorations([], decorations)
         if (blocks.length === 0) return
-        // Insert every proposed block above the lines it replaces. The offsets are
-        // computed against the unchanged buffer and shifted by what earlier
-        // insertions added, then the whole set is applied at once.
-        blocks.sort((left, right) => left.edit.start - right.edit.start)
         const eol = eolOf(model)
         const operations = []
-        const inserted = []
-        let delta = 0
+        const added = []
+        const removed = []
+        const replaced = []
+        let shift = 0
         for (const block of blocks) {
-          // The offsets go to Monaco against the buffer as it is right now, so
-          // every operation uses the unshifted position; only the recorded
-          // result is shifted, because earlier insertions push later lines down.
-          const insertStart = model.getOffsetAt({ lineNumber: block.startLine, column: 1 })
-          const text = block.edit.newText + eol
-          operations.push({ start: insertStart, end: insertStart, text })
-          const placedAt = insertStart + delta
-          inserted.push({ start: placedAt, end: placedAt + text.length, text, block })
-          delta += text.length
+          const original = model.getValue().slice(block.edit.start, block.edit.end)
+          const ops = diffLinesLocal(original, block.edit.newText)
+          // Where every line of the replaced block starts, relative to its start.
+          const starts = [0]
+          for (let index = 0; index < original.length; index += 1) {
+            if (original[index] === '\n') starts.push(index + 1)
+          }
+          let line = 0
+          let localAdd = 0
+          let pending = []
+          const flush = (anchor, hover) => {
+            if (pending.length === 0) return
+            const text = pending.join(eol) + eol
+            operations.push({ start: anchor, end: anchor, text })
+            added.push({ start: anchor + shift + localAdd, end: anchor + shift + localAdd + text.length, text, hover })
+            localAdd += text.length
+            pending = []
+          }
+          for (const op of ops) {
+            const anchor = block.edit.start + (line < starts.length ? starts[line] : original.length)
+            if (op.type === 'add') {
+              pending.push(op.text)
+              continue
+            }
+            if (pending.length > 0) flush(block.edit.start + (line < starts.length ? starts[line] : original.length), block.hover)
+            if (op.type === 'del') {
+              const next = line < starts.length - 1 ? starts[line + 1] : original.length
+              removed.push({
+                start: block.edit.start + starts[line] + shift + localAdd,
+                end: block.edit.start + next + shift + localAdd,
+                hover: block.hover,
+              })
+            }
+            line += 1
+          }
+          if (pending.length > 0) flush(block.edit.start + original.length, block.hover)
+          // Tab rewrites the whole staged region with the proposed text, so the
+          // inserted lines and the old ones are replaced in one operation.
+          replaced.push({
+            start: block.edit.start + shift,
+            end: block.edit.end + shift + localAdd,
+            text: block.edit.newText,
+            original,
+            edit: block.edit,
+          })
+          shift += localAdd
         }
         if (!runModelEdits(operations)) return
         const stagedDecorations = []
-        const removed = []
-        const value = model.getValue()
-        for (const entry of inserted) {
-          const lineCount = entry.block.endLine - entry.block.startLine + 1
-          const oldStart = entry.end
-          const oldEnd = scanLines(value, oldStart, lineCount, eol)
-          removed.push({ start: oldStart, end: oldEnd })
-          const insertedStart = model.getPositionAt(entry.start)
-          const insertedEnd = model.getPositionAt(entry.end)
-          const oldStartPos = model.getPositionAt(oldStart)
-          const oldEndPos = model.getPositionAt(oldEnd)
-          // Green marks the lines that stay on Tab, pink the ones Tab deletes.
+        for (const entry of added) {
+          const start = model.getPositionAt(entry.start)
+          const end = model.getPositionAt(entry.end)
           stagedDecorations.push({
-            range: new monacoInstance.Range(
-              insertedStart.lineNumber,
-              1,
-              Math.max(insertedStart.lineNumber, insertedEnd.lineNumber),
-              1,
-            ),
+            range: new monacoInstance.Range(start.lineNumber, 1, Math.max(start.lineNumber, end.lineNumber), 1),
             options: { isWholeLine: true, className: 'dsh-ide-edit-added' },
           })
+        }
+        for (const entry of removed) {
+          const start = model.getPositionAt(entry.start)
+          const end = model.getPositionAt(Math.max(entry.start, entry.end - 1))
           stagedDecorations.push({
-            range: new monacoInstance.Range(
-              oldStartPos.lineNumber,
-              1,
-              Math.max(oldStartPos.lineNumber, oldEndPos.lineNumber),
-              1,
-            ),
-            options: { isWholeLine: true, className: 'dsh-ide-edit-old-line', hoverMessage: { value: entry.block.hover } },
+            range: new monacoInstance.Range(start.lineNumber, 1, Math.max(start.lineNumber, end.lineNumber), 1),
+            options: { isWholeLine: true, className: 'dsh-ide-edit-old-line', hoverMessage: { value: entry.hover } },
           })
         }
         runtime.current.tab.phantom = {
           version: model.getVersionId(),
-          inserted,
-          removed,
+          replaced,
           decorations: editor.deltaDecorations([], stagedDecorations),
         }
         runtime.current.tab.edits = edits
@@ -2924,16 +2971,16 @@ function IdeBody(props) {
           clearGhost()
           return false
         }
-        // Everything that sits below a staged block moved down by the lines it
-        // took, so an offset from the Host is shifted by the staged text above it.
+        // Everything that sits below a staged region moved by the difference the
+        // staging made, so an offset from the Host is shifted by it.
         const shiftAt = (offset) =>
           phantom === undefined
             ? 0
-            : phantom.inserted.reduce(
-                (sum, entry) => (entry.block.edit.start < offset ? sum + entry.text.length : sum),
+            : phantom.replaced.reduce(
+                (sum, entry) => (entry.end <= offset ? sum + entry.text.length - entry.original.length : sum),
                 0,
               )
-        const staged = phantom === undefined ? new Set() : new Set(phantom.inserted.map((entry) => entry.block.edit))
+        const staged = phantom === undefined ? new Set() : new Set(phantom.replaced.map((entry) => entry.edit))
         const tabKey = runtime.current.modelTabs.get(model.uri.toString())
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === tabKey)
         // One transaction: the continuation at the caret plus every phantom edit
@@ -2958,7 +3005,11 @@ function IdeBody(props) {
           })
         }
         if (phantom !== undefined) {
-          for (const entry of phantom.removed) operations.push({ start: entry.start, end: entry.end, text: '' })
+          // The staged region already holds the inserted lines and the old ones;
+          // rewriting it with the proposed text leaves exactly the proposal.
+          for (const entry of phantom.replaced) {
+            operations.push({ start: entry.start, end: entry.end, text: entry.text })
+          }
         }
         const caret = plan.range.start + plan.insertText.length + shiftAt(plan.range.start)
         const edited = applyGhostEdits(operations, caret)
@@ -3153,8 +3204,9 @@ function IdeBody(props) {
           const shift =
             phantom === undefined
               ? 0
-              : phantom.inserted.reduce(
-                  (sum, entry) => (entry.block.edit.start < plan.range.start ? sum + entry.text.length : sum),
+              : phantom.replaced.reduce(
+                  (sum, entry) =>
+                    entry.edit.start < plan.range.start ? sum + entry.text.length - entry.original.length : sum,
                   0,
                 )
           showGhost(model.getPositionAt(plan.range.start + shift), plan.insertText)

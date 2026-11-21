@@ -210,11 +210,13 @@ test('a replacement is offered as pink removal plus green phantom text', async (
   // single-line edit never needs an overlay.
   assert.ok(source.includes("inlineClassName: 'dsh-ide-edit-old'"), 'the removed range is highlighted')
   assert.ok(source.includes("after: { content: edit.newText, inlineClassName: 'dsh-ide-edit-inline' }"), 'the replacement is inline phantom text')
-  // A block answer takes real lines instead of printing over the code below it:
-  // the proposed lines are inserted above the replaced ones and Tab keeps them.
-  assert.ok(source.includes('const text = block.edit.newText + eol'), 'a block is staged as real lines')
+  // A block answer takes real lines instead of printing over the code below it,
+  // and only the lines that differ are inserted: the unchanged ones stay put.
+  assert.ok(source.includes('const diffLinesLocal = (before, after) => {'), 'the block is staged from a line diff')
+  assert.ok(source.includes("ops.push({ type: 'add', text: right[column] })"), 'only added lines are inserted')
   assert.ok(source.includes("className: 'dsh-ide-edit-added'"), 'the staged lines are marked as arriving')
   assert.ok(source.includes("className: 'dsh-ide-edit-old-line'"), 'the replaced lines are marked as leaving')
+  assert.ok(source.includes('text: entry.original'), 'cancelling puts the original text back')
   assert.ok(source.includes('.dsh-ide-edit-inline {'), 'the phantom text has its own style')
   assert.ok(source.includes('.dsh-ide-edit-old-line {'), 'the leaving lines have their own style')
 })

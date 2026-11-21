@@ -214,6 +214,55 @@ function withEol(value, eol) {
 }
 
 /**
+ * Remove the surrounding lines the model repeated inside `replace`.
+ *
+ * The protocol says `replace` substitutes `find`, so a `replace` that repeats
+ * the lines above the block (a shebang, an encoding comment, an import) would
+ * put them into the file a second time. Only a whole leading or trailing line
+ * that already sits exactly where it is gets dropped, which keeps a deliberate
+ * reordering of those lines intact.
+ */
+function trimContextEcho(text, at, end, replace, eol) {
+  const lines = replace.split(eol)
+  if (lines.length < 2) return replace
+  const above = text.slice(0, at).split(eol)
+  // The last piece of `above` is the part of the line the block starts on, not a
+  // whole line, so only the pieces before it can be echoed by a whole line.
+  const wholeAbove = above.slice(0, -1)
+  const below = text.slice(end).split(eol).slice(1)
+  let first = 0
+  for (let size = Math.min(wholeAbove.length, lines.length - 1); size > 0; size -= 1) {
+    let same = true
+    for (let index = 0; index < size; index += 1) {
+      if (lines[index] !== wholeAbove[wholeAbove.length - size + index]) {
+        same = false
+        break
+      }
+    }
+    if (same) {
+      first = size
+      break
+    }
+  }
+  let last = lines.length
+  for (let size = Math.min(below.length, lines.length - first - 1); size > 0; size -= 1) {
+    let same = true
+    for (let index = 0; index < size; index += 1) {
+      if (lines[lines.length - size + index] !== below[index]) {
+        same = false
+        break
+      }
+    }
+    if (same) {
+      last = lines.length - size
+      break
+    }
+  }
+  if (first === 0 && last === lines.length) return replace
+  return lines.slice(first, last).join(eol)
+}
+
+/**
  * Find where each proposed edit applies, dropping the ones that do not.
  *
  * `find` must occur exactly once: a snippet that appears twice cannot say which
@@ -242,6 +291,9 @@ export function locateEdits({ text = '', edits = [], maxEdits = DEFAULT_MAX_EDIT
     if (at === -1) continue
     if (text.indexOf(find, at + 1) !== -1) continue
     const end = at + find.length
+    // A repeat of the lines around the block is context, not part of the change.
+    replace = trimContextEcho(text, at, end, replace, eol)
+    if (replace === '') continue
     if (used.some(([start, stop]) => at < stop && start < end)) continue
     if (cursor >= at && cursor <= end) continue
     used.push([at, end])

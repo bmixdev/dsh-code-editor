@@ -164,3 +164,34 @@ test('the edit instruction names the limit and the format', () => {
   assert.ok(text.includes('не больше 2'))
   assert.ok(text.includes('"find"'))
 })
+
+test('the surrounding lines a model repeats are not inserted twice', () => {
+  const text = '#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\ndef main():\n    pass\n'
+  const [edit] = locateEdits({
+    text,
+    edits: [
+      {
+        find: 'def main():',
+        replace: '#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\ndef main(path):',
+      },
+    ],
+  })
+  assert.equal(edit.newText, 'def main(path):')
+})
+
+test('a repeated trailing line stays outside the replacement', () => {
+  const text = 'def main():\n    pass\nmain()\n'
+  const [edit] = locateEdits({
+    text,
+    edits: [{ find: 'def main():\n    pass', replace: 'def main(path):\n    pass\nmain()' }],
+  })
+  assert.equal(edit.newText, 'def main(path):\n    pass')
+})
+
+test('a line that is not an echo stays inside the replacement', () => {
+  const [edit] = locateEdits({
+    text: 'alpha\nbeta\n',
+    edits: [{ find: 'beta', replace: 'import os\nbeta2' }],
+  })
+  assert.equal(edit.newText, 'import os\nbeta2')
+})
