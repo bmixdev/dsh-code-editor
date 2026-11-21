@@ -36,7 +36,7 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   // from the observed behaviour of Cursor's Tab (see tab.js and
   // docs/cursor-tab-mechanics.md); the IDE settings drawer exposes all of them.
   /** Quiet time after the last keystroke before an automatic request. */
-  debounceMs: 320,
+  debounceMs: 500,
   /** Lines of the buffer before the cursor kept in the prompt. */
   aboveLines: 60,
   /** Lines of the buffer after the cursor kept in the prompt. */
@@ -60,7 +60,7 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   /** Ctrl+Right inserts the next word of a pending suggestion. */
   partialAccept: true,
   /** Ask again immediately after accepting, like "next suggestion". */
-  refetchAfterAccept: true,
+  refetchAfterAccept: false,
   /** Ask for suggestions while the cursor is on a comment line. */
   triggerInComments: true,
   /** How long Esc suppresses automatic requests. */

@@ -408,7 +408,8 @@ test('the completion sends the provider default effort and reports its trajector
       // No level is pinned by default: every extra level would cost a rejected
       // request first, and a provider rejects an unknown level before the network.
       assert.equal(app.streamCalls[0].reasoningEffort, undefined)
-      assert.equal(app.streamCalls[0].maxTokens, 900)
+      // The budget follows `answerLines` (5 by default) instead of a flat 900.
+      assert.equal(app.streamCalls[0].maxTokens, 240)
       assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
       assert.equal(answered.body.trajectory.effort, '')
       assert.equal(answered.body.modelSource, 'session')

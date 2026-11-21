@@ -593,11 +593,18 @@ export function apply(ctx, config) {
     let finishReason = ''
     let firstChunk = ''
     for (const attempt of attemptsForKind) {
-      try {
-        const info = await ctx.llm.resolveModelInfo(attempt.provider, attempt.model, combined)
-        effortsAdvertised = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts.map(effort => effort.id) : []
-      } catch {
+      // Asking the route for its reasoning catalogue is only needed when a level
+      // has to be chosen. With the default (empty) preference there is nothing to
+      // choose, and the extra round trip is pure latency on a keystroke.
+      if (effortChain.length === 1 && effortChain[0] === undefined) {
         effortsAdvertised = []
+      } else {
+        try {
+          const info = await ctx.llm.resolveModelInfo(attempt.provider, attempt.model, combined)
+          effortsAdvertised = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts.map(effort => effort.id) : []
+        } catch {
+          effortsAdvertised = []
+        }
       }
       for (const effort of effortChain) {
         let buffer = ''
@@ -626,11 +633,11 @@ export function apply(ctx, config) {
                 ],
               },
             ],
-            // 160 tokens was not enough for a reasoning model: it spent the
-            // whole budget on `reasoning_content` and every answer came back
-            // empty. With reasoning off the budget only holds the code, and 900
-            // tokens cover the five lines this feature is allowed to insert.
-            maxTokens: 900,
+            // The answer is at most `answerLines` lines of code, so the budget is
+            // sized to that instead of a flat 900: a shorter budget comes back
+            // sooner, and a thinking model still cannot spend it all on reasoning
+            // when the level is `off`.
+            maxTokens: Math.min(900, Math.max(80, preferences.answerLines * 40 + 40)),
             temperature: 0.1,
             signal: combined,
             sessionId: document.sessionId,

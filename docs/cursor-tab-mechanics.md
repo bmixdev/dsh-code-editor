@@ -167,8 +167,9 @@ DUPLICATING_LINE_AFTER_SUGGESTION, 3 DUPLICATING_MULTIPLE_LINES_AFTER_SUGGESTION
   стабильность даёт проверка версии модели и текста диапазона;
 - нет `diff_history`, `filesync_updates`, `lsp_*`, `parameter_hints` — плагин
   видит один буфер и не имеет LSP;
-- нет `nextEdit`/`fusedCursorPrediction` — после приёма просто запрашивается
-  продолжение (`refetchAfterAccept`);
+- нет `nextEdit`/`fusedCursorPrediction` — после приёма подсказка по умолчанию не
+  запрашивается: одна подсказка, дальше решение пользователя (`refetchAfterAccept`
+  выключен; включение возвращает запрос сразу после Tab);
 - нет зелёных подсветок изменённых слов: удаляемый хвост красится одной
   декорацией (`showRemovedDecorations`), вставка — ghost-текстом;
 - нет `CppAppend`, статистики принятия и телеметрии.

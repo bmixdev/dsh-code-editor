@@ -2017,7 +2017,7 @@ const TAB_PREFERENCES = [
   },
   { key: 'deadlineMs', kind: 'number', value: 6000, min: 1000, max: 60000, title: 'Подсказки: предел ожидания', hint: 'Сколько миллисекунд ждать ответ, прежде чем сдаться (1000–60000).' },
   { key: 'flushAfterMs', kind: 'number', value: 250, min: 0, max: 5000, title: 'Подсказки: показывать начало ответа', hint: 'Сколько миллисекунд собирать текст после первого символа, прежде чем показать его.' },
-  { key: 'debounceMs', kind: 'number', value: 320, min: 50, max: 3000, title: 'Подсказки: задержка', hint: 'Пауза после последней правки перед запросом, мс (50–3000).' },
+  { key: 'debounceMs', kind: 'number', value: 500, min: 50, max: 3000, title: 'Подсказки: задержка', hint: 'Пауза после последней правки перед запросом, мс (50–3000).' },
   { key: 'aboveLines', kind: 'number', value: 60, min: 0, max: 400, title: 'Подсказки: строк до курсора', hint: 'Сколько строк перед курсором видит модель (0–400).' },
   { key: 'belowLines', kind: 'number', value: 20, min: 0, max: 200, title: 'Подсказки: строк после курсора', hint: 'Сколько строк после курсора видит модель (0–200).' },
   { key: 'answerLines', kind: 'number', value: 5, min: 1, max: 20, title: 'Подсказки: длина ответа', hint: 'Просить продолжение не длиннее N строк (1–20).' },
@@ -2029,7 +2029,7 @@ const TAB_PREFERENCES = [
   { key: 'snoozeAfterRejectMs', kind: 'number', value: 800, min: 0, max: 5000, title: 'Подсказки: пауза после Escape', hint: 'Не спрашивать модель сразу после отклонения, мс.' },
   { key: 'rangeReplace', kind: 'boolean', value: true, title: 'Подсказки: заменять хвост строки', hint: 'Разрешать замену текста после курсора, а не только вставку.' },
   { key: 'partialAccept', kind: 'boolean', value: true, title: 'Подсказки: приём по слову', hint: 'Ctrl+→ принимает следующее слово подсказки.' },
-  { key: 'refetchAfterAccept', kind: 'boolean', value: true, title: 'Подсказки: запрос после приёма', hint: 'Сразу спрашивать продолжение после Tab.' },
+  { key: 'refetchAfterAccept', kind: 'boolean', value: false, title: 'Подсказки: запрос после приёма', hint: 'Сразу спрашивать продолжение после Tab.' },
   { key: 'triggerInComments', kind: 'boolean', value: true, title: 'Подсказки: в комментариях', hint: 'Подсказывать код сразу после комментария-просьбы.' },
   { key: 'showWhitespaceOnlyChanges', kind: 'boolean', value: false, title: 'Проверка: пробельные правки', hint: 'Показывать подсказки, меняющие только пробелы.' },
   { key: 'showRemovedDecorations', kind: 'boolean', value: true, title: 'Подсказки: подсветка замены', hint: 'Красить текст, который перепишет подсказка.' },
@@ -2532,10 +2532,20 @@ function IdeBody(props) {
       }
 
       const clearGhost = React.useCallback(() => {
-        runtime.current.ghost = ''
-        runtime.current.ghostPosition = undefined
-        runtime.current.tab.plan = undefined
-        runtime.current.tab.accepted = 0
+        const state = runtime.current
+        const decorations = state.tab.removedDecorations
+        // The content listener calls this on every keystroke. When nothing is
+        // drawn there is nothing to undo, and a widget relayout per character is
+        // exactly what makes typing feel like it waits for the model.
+        const visible =
+          state.ghost !== '' ||
+          state.tab.plan !== undefined ||
+          (Array.isArray(decorations) && decorations.length > 0)
+        state.ghost = ''
+        state.ghostPosition = undefined
+        state.tab.plan = undefined
+        state.tab.accepted = 0
+        if (!visible) return
         const node = runtime.current.ghostNode
         if (node !== undefined) node.style.display = 'none'
         const editor = runtime.current.editor
@@ -2626,9 +2636,9 @@ function IdeBody(props) {
           removedChars: plan.kind === 'replace' ? plan.removedText.length : 0,
           suppressed: '',
         })
-        // Cursor asks again right after an acceptance: the next suggestion is
-        // predicted from the text the user just took.
-        if (tabPref('refetchAfterAccept', true) === true) {
+        // Off by default: one suggestion, then the user decides. The setting is
+        // kept for anyone who wants the next hint predicted immediately.
+        if (tabPref('refetchAfterAccept', false) === true) {
           window.clearTimeout(runtime.current.ghostTimer)
           runtime.current.ghostTimer = window.setTimeout(() => {
             void requestGhost('refetch')
@@ -2744,6 +2754,7 @@ function IdeBody(props) {
         const position = editor.getPosition()
         if (model === null || position === null) return
         if (kind !== 'explicit' && kind !== 'refetch' && Date.now() < runtime.current.tab.snoozeUntil) return
+        if (kind === 'auto' && runtime.current.tab.plan !== undefined) return
         const result = await complete(model, position, { triggerKind: kind === 'explicit' ? 1 : 0, kind }, undefined)
         if (result === undefined || result.plan === undefined) {
           clearGhost()
@@ -2775,11 +2786,26 @@ function IdeBody(props) {
 
       const scheduleGhost = (kind = 'auto') => {
         window.clearTimeout(runtime.current.ghostTimer)
+        // A pending answer is for text that no longer exists. Cancelling it here
+        // is what keeps typing responsive: otherwise every keystroke leaves a
+        // request running and its late answer has to be thrown away on arrival.
+        const pending = runtime.current.tab.controller
+        if (pending !== undefined) {
+          pending.abort()
+          runtime.current.tab.controller = undefined
+        }
+        // One suggestion at a time: while one is on screen the user either
+        // accepts it or cancels it, so nothing asks the model again.
+        if (runtime.current.tab.plan !== undefined) return
         if (runtime.current.autoSuggest !== true) return
-        const delay = Number(tabPref('debounceMs', 320))
+        const editor = runtime.current.editor
+        if (editor === undefined || !editor.hasTextFocus()) return
+        const selection = editor.getSelection()
+        if (selection !== null && !selection.isEmpty()) return
+        const delay = Number(tabPref('debounceMs', 500))
         runtime.current.ghostTimer = window.setTimeout(() => {
           void requestGhost(kind)
-        }, Number.isFinite(delay) ? Math.max(0, delay) : 320)
+        }, Number.isFinite(delay) ? Math.max(0, delay) : 500)
       }
 
       const enableSuggestions = async () => {
@@ -2888,11 +2914,20 @@ function IdeBody(props) {
           scheduleGhost('auto')
         })
         const blur = editor.onDidBlurEditorWidget(() => clearGhost())
+        let cursorTimer = 0
         const cursorChange = editor.onDidChangeCursorPosition((event) => {
-          setCursor({ line: event.position.lineNumber, column: event.position.column })
           if (runtime.current.tab.internalEdit === true) return
           const shown = runtime.current.ghostPosition
           if (shown !== undefined && (shown.lineNumber !== event.position.lineNumber || shown.column !== event.position.column)) clearGhost()
+          // The status bar needs the final position, not every intermediate one.
+          // A React update per mouse move re-renders the whole pane, which is
+          // what made placing the cursor feel heavy.
+          if (cursorTimer !== 0) return
+          cursorTimer = window.setTimeout(() => {
+            cursorTimer = 0
+            const position = editor.getPosition()
+            if (position !== null) setCursor({ line: position.lineNumber, column: position.column })
+          }, 120)
         })
 
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
@@ -2921,6 +2956,7 @@ function IdeBody(props) {
 
         return () => {
           window.clearTimeout(runtime.current.ghostTimer)
+          window.clearTimeout(cursorTimer)
           if (runtime.current.tab.controller !== undefined) runtime.current.tab.controller.abort()
           blur.dispose()
           change.dispose()
