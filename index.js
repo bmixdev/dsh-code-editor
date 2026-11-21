@@ -22,6 +22,7 @@
  * layer serves only to the owner principal (this machine's GUI page).
  */
 import { appendFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -35,6 +36,7 @@ import {
 } from './catalog.js'
 import { buildContext, postprocessCompletion } from './completion.js'
 import { optedInRoots, readPreferences, writePreferences } from './prefs.js'
+import { boundLines, evaluateSuggestion, planEdit, reasonLabel } from './tab.js'
 import { listFiles, listTree } from './tree.js'
 import { readSessionState, writeSessionState } from './state.js'
 
@@ -417,6 +419,7 @@ export function apply(ctx, config) {
     if (body.sessionId !== document.sessionId) return fail('wrong-session', 'Документ принадлежит другой сессии.')
     if (body.token !== document.token) return fail('stale-client', 'Редактор потерял актуальную версию файла.')
     const preferences = await readPreferences()
+    const kind = body.kind === 'explicit' ? 'explicit' : body.kind === 'refetch' ? 'refetch' : body.explicit === true ? 'explicit' : 'auto'
     if (
       !optedIn.has(document.workspaceRoot) &&
       !optedInRoots(preferences).includes(document.workspaceRoot)
@@ -434,6 +437,26 @@ export function apply(ctx, config) {
     if (rawText.length > MAX_CONTEXT_TEXT_CHARS) {
       return fail('context-too-large', 'Файл слишком велик для подсказок в редакторе.')
     }
+    if (rawText.length > preferences.maxFileChars) {
+      logCompletion({
+        file: document.displayPath,
+        language: document.language,
+        kind,
+        suppressed: 'file-too-large',
+        fileChars: rawText.length,
+        limit: preferences.maxFileChars,
+      })
+      return {
+        text: '',
+        requestId: randomUUID(),
+        provider: '',
+        model: '',
+        durationMs: 0,
+        reason: reasonLabel('file-too-large'),
+        suppressed: { reason: 'file-too-large' },
+        trajectory: { kind, suppressed: 'file-too-large', fileChars: rawText.length, explicit: kind === 'explicit' },
+      }
+    }
     const left = boundedWindow(body.contextLeft, preferences.contextLeft)
     const right = boundedWindow(body.contextRight, preferences.contextRight)
     const context = buildContext({
@@ -447,6 +470,24 @@ export function apply(ctx, config) {
     // to the same budget it was granted rather than the configured default.
     const prefix = context.prefix === '' ? clip(String(body.prefix ?? ''), left, 'end') : context.prefix
     const suffix = context.suffix === '' ? clip(String(body.suffix ?? ''), right, 'start') : context.suffix
+    if (preferences.triggerInComments !== true && looksLikeCommentLine(prefix)) {
+      logCompletion({ file: document.displayPath, language: document.language, kind, suppressed: 'comment-line' })
+      return {
+        text: '',
+        requestId: randomUUID(),
+        provider: '',
+        model: '',
+        durationMs: 0,
+        reason: reasonLabel('comment-line'),
+        suppressed: { reason: 'comment-line' },
+        trajectory: { kind, suppressed: 'comment-line', explicit: kind === 'explicit' },
+      }
+    }
+    // `aboveLines`/`belowLines` bound the prompt by lines; the character window
+    // above only keeps the request itself bounded. Both are settings the user
+    // can change in the IDE drawer.
+    const windowPrefix = boundLines(prefix, preferences.aboveLines, 'end')
+    const windowSuffix = boundLines(suffix, preferences.belowLines, 'start')
     const selection = ctx.agentDefaultModel.currentSelection()
     if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
       return fail('no-model', 'Модель не выбрана — подсказки недоступны, редактор работает.')
@@ -495,7 +536,7 @@ export function apply(ctx, config) {
     const systemPrompt =
       'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
       'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
-      'уже написанного кода. Продолжение должно быть коротким (1–5 строк) и синтаксически уместным. ' +
+      `уже написанного кода. Продолжение должно быть коротким (1–${preferences.answerLines} строк) и синтаксически уместным. ` +
       'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
       'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
       'Если уместного продолжения нет, ответь пустой строкой.'
@@ -505,8 +546,8 @@ export function apply(ctx, config) {
     const requestText =
       `Файл: ${document.displayPath}\n` +
       `Язык: ${document.language}\n\n` +
-      `--- текст до курсора ---\n${prefix}\n--- курсор ---\n` +
-      `--- текст после курсора ---\n${suffix}`
+      `--- текст до курсора ---\n${windowPrefix}\n--- курсор ---\n` +
+      `--- текст после курсора ---\n${windowSuffix}`
 
     const deadline = AbortSignal.timeout(COMPLETION_DEADLINE_MS)
     const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
@@ -608,6 +649,39 @@ export function apply(ctx, config) {
     })
 
     const result = sanitizeCompletion(answer)
+
+    // Where the answer lands and whether it is worth showing. Both decisions
+    // used to live in Cursor's server response (`range_to_replace` plus the
+    // bad-case heuristics); here the Host owns them because it already has the
+    // whole buffer, and every knob below is a saved preference.
+    const requestId = randomUUID()
+    const modelVersion = Number.isFinite(Number(body.modelVersion)) ? Number(body.modelVersion) : undefined
+    const planOptions = {
+      rangeReplace: preferences.rangeReplace,
+      rangeReplaceLines: preferences.rangeReplaceLines,
+      showWhitespaceOnlyChanges: preferences.showWhitespaceOnlyChanges,
+      heuristicDuplicateLine: preferences.heuristicDuplicateLine,
+      heuristicExtendsRange: preferences.heuristicExtendsRange,
+      maxAddedLines: preferences.maxAddedLines,
+      recentRejectThreshold: preferences.recentRejectThreshold,
+      recentRejectWindowMs: preferences.recentRejectWindowMs,
+      heuristicRevertingChange: preferences.heuristicRevertingChange,
+    }
+    const plan = planEdit({
+      text: rawText,
+      offset: Number(body.offset ?? 0),
+      suggestion: result,
+      options: planOptions,
+    })
+    const verdict = evaluateSuggestion({
+      text: rawText,
+      plan,
+      options: planOptions,
+      rejections: readRecords(body.rejections),
+      revertions: readRecords(body.revertions),
+    })
+    const accepted = verdict.accepted && plan.insertText !== ''
+
     // The GUI shows nothing when the answer is empty, so every attempt records
     // what it was and what came back; without this line "smart Tab does not
     // work" is impossible to tell apart from "the model answered nothing".
@@ -624,9 +698,16 @@ export function apply(ctx, config) {
       finishReason,
       error: streamError,
       firstChunk,
+      kind,
+      planKind: plan.kind,
+      planChars: plan.insertText.length,
+      planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
+      removedChars: plan.removedText.length,
+      suppressed: accepted ? '' : verdict.reason,
     })
     // An empty answer is a normal outcome the user has to be able to read, so
-    // it comes back with the same diagnostics block as a real completion.
+    // it comes back with the same diagnostics block as a real completion. A
+    // suppressed answer names the check that dropped it.
     const reason =
       streamError !== ''
         ? `Модель не ответила: ${streamError}`
@@ -634,13 +715,25 @@ export function apply(ctx, config) {
           ? 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
           : text.trim() === ''
             ? 'Модель не вернула продолжение.'
-            : ''
+            : accepted
+              ? ''
+              : reasonLabel(verdict.reason)
     return {
-      text: result,
+      // `text` stays the final insert text: the client only has to apply it.
+      // A suppressed answer returns an empty string and a reason, never the
+      // rejected code.
+      text: accepted ? plan.insertText : '',
+      requestId,
+      kind,
+      planKind: plan.kind,
+      range: { start: plan.startOffset, end: plan.endOffset },
+      removedText: plan.removedText,
+      modelVersion,
       provider: used.provider,
       model: used.model,
       durationMs: Date.now() - startedAt,
       reason,
+      suppressed: accepted ? undefined : { reason: verdict.reason },
       // The IDE renders these in its output panel: the trajectory explains what
       // was attempted and what came back, the conversation shows the exact text.
       trajectory: {
@@ -650,9 +743,15 @@ export function apply(ctx, config) {
         chunkTypes: [...chunkTypes],
         rawChars: text.length,
         answerChars: result.length,
-        before: prefix.length,
-        after: suffix.length,
-        explicit: body.explicit === true,
+        before: windowPrefix.length,
+        after: windowSuffix.length,
+        explicit: kind === 'explicit',
+        kind,
+        planKind: plan.kind,
+        planChars: plan.insertText.length,
+        planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
+        removedChars: plan.removedText.length,
+        suppressed: accepted ? '' : verdict.reason,
       },
       conversation: { system: systemPrompt, message: requestText, answer: text },
     }
@@ -945,6 +1044,38 @@ function relativeOf(cwd, displayPath) {
 function clip(text, limit, side) {
   if (text.length <= limit) return text
   return side === 'end' ? text.slice(text.length - limit) : text.slice(0, limit)
+}
+
+/**
+ * Whether the line under the cursor is a comment.
+ *
+ * The editor knows the grammar of every language Monaco shipped; the Host only
+ * needs the cheap answer, because the setting exists to stop suggestions inside
+ * comments, not to parse them.
+ */
+const COMMENT_LINE = /^\s*(?:\/\/|#|--|\/\*|\*|<!--|;;|%|"""|''')/
+function looksLikeCommentLine(text) {
+  const lines = String(text ?? '').split('\n')
+  return COMMENT_LINE.test(lines[lines.length - 1] ?? '')
+}
+
+/**
+ * Client-reported rejection history, bounded on the way in.
+ *
+ * The IDE keeps the list per tab; a request may carry at most twenty entries of
+ * two thousand characters each, so an old entry can never grow a request.
+ */
+function readRecords(value) {
+  if (!Array.isArray(value)) return []
+  const records = []
+  for (const entry of value.slice(0, 20)) {
+    if (entry === null || typeof entry !== 'object') continue
+    const text = typeof entry.text === 'string' ? entry.text.slice(0, 2000) : ''
+    if (text === '') continue
+    const at = Number(entry.at)
+    records.push({ text, at: Number.isFinite(at) ? at : Date.now() })
+  }
+  return records
 }
 
 /**

@@ -31,12 +31,83 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   apiKeyRef: '',
   /** Workspace roots whose owner allowed sending buffer context to the model. */
   completionOptIn: [],
+
+  // Tab mechanics. Every value below is a knob of the suggestion engine ported
+  // from the observed behaviour of Cursor's Tab (see tab.js and
+  // docs/cursor-tab-mechanics.md); the IDE settings drawer exposes all of them.
+  /** Quiet time after the last keystroke before an automatic request. */
+  debounceMs: 320,
+  /** Lines of the buffer before the cursor kept in the prompt. */
+  aboveLines: 60,
+  /** Lines of the buffer after the cursor kept in the prompt. */
+  belowLines: 20,
+  /** Longest answer asked for, in lines. */
+  answerLines: 5,
+  /** Let an answer rewrite the rest of the cursor line instead of only inserting. */
+  rangeReplace: true,
+  /** How many lines from the cursor a rewrite may cover. 0 disables rewrites. */
+  rangeReplaceLines: 2,
+  /** Ctrl+Right inserts the next word of a pending suggestion. */
+  partialAccept: true,
+  /** Ask again immediately after accepting, like "next suggestion". */
+  refetchAfterAccept: true,
+  /** Ask for suggestions while the cursor is on a comment line. */
+  triggerInComments: true,
+  /** How long Esc suppresses automatic requests. */
+  snoozeAfterRejectMs: 800,
+  /** Show answers that only change whitespace. */
+  showWhitespaceOnlyChanges: false,
+  /** Mark the text a rewrite deletes. */
+  showRemovedDecorations: true,
+  /** Buffers above this many characters get no suggestions at all. */
+  maxFileChars: 1000000,
+  /** Say in the output panel why a suggestion was dropped. */
+  explainSuppressed: true,
+  /** Drop an answer that duplicates the line below the cursor. */
+  heuristicDuplicateLine: true,
+  /** Drop an answer that only retells the lines below the cursor. */
+  heuristicExtendsRange: true,
+  /** Drop an answer longer than the buffered request asked for. */
+  maxAddedLines: 20,
+  /** Rejections of the same answer before it is suppressed. 0 disables. */
+  recentRejectThreshold: 3,
+  /** How long a rejection is remembered. */
+  recentRejectWindowMs: 300000,
+  /** Drop an answer that restores text the user just deleted. */
+  heuristicRevertingChange: true,
 })
 
-const LIMITS = {
+/** Inclusive integer bounds, applied to both the file and the drawer. */
+export const PREFERENCE_LIMITS = Object.freeze({
   contextLeft: [200, 20000],
   contextRight: [0, 8000],
-}
+  debounceMs: [50, 3000],
+  aboveLines: [0, 400],
+  belowLines: [0, 200],
+  answerLines: [1, 20],
+  rangeReplaceLines: [0, 8],
+  snoozeAfterRejectMs: [0, 5000],
+  maxFileChars: [1000, 5000000],
+  maxAddedLines: [1, 200],
+  recentRejectThreshold: [0, 10],
+  recentRejectWindowMs: [0, 600000],
+})
+
+const BOOLEAN_KEYS = [
+  'fileTree',
+  'hiddenFiles',
+  'autoSuggest',
+  'rangeReplace',
+  'partialAccept',
+  'refetchAfterAccept',
+  'triggerInComments',
+  'showWhitespaceOnlyChanges',
+  'showRemovedDecorations',
+  'explainSuppressed',
+  'heuristicDuplicateLine',
+  'heuristicExtendsRange',
+  'heuristicRevertingChange',
+]
 
 /** How many workspaces may stay opted in at once. */
 const MAX_OPT_IN = 20
@@ -64,12 +135,12 @@ function sanitize(patch) {
     if (value.length > 200) throw Object.assign(new Error('Слишком длинное значение настройки.'), { code: 'bad-request' })
     result[key] = value
   }
-  for (const key of ['fileTree', 'hiddenFiles', 'autoSuggest']) {
+  for (const key of BOOLEAN_KEYS) {
     if (patch[key] !== undefined) result[key] = patch[key] === true
   }
-  for (const key of ['contextLeft', 'contextRight']) {
+  for (const key of Object.keys(PREFERENCE_LIMITS)) {
     if (patch[key] !== undefined) {
-      result[key] = clampInteger(patch[key], LIMITS[key], DEFAULT_PREFERENCES[key])
+      result[key] = clampInteger(patch[key], PREFERENCE_LIMITS[key], DEFAULT_PREFERENCES[key])
     }
   }
   if (patch.completionOptIn !== undefined) {

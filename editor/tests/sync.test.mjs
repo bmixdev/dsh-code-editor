@@ -5,6 +5,7 @@
  */
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
@@ -20,6 +21,7 @@ for (const name of ['catalog.js', 'completion.js', 'prefs.js', 'tree.js']) {
       original,
       `editor/${name} drifted from ${name}: copy the root file again to keep one source of truth`,
     )
-    assert.ok(fileURLToPath(moduleUrl(name)).endsWith(`editor/${name}`))
+    // Windows resolves the URL to backslashes, so compare native segments.
+    assert.ok(fileURLToPath(moduleUrl(name)).endsWith(path.join('editor', name)))
   })
 }
