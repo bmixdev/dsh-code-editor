@@ -4099,10 +4099,10 @@ function IdeBody(props) {
   background:var(--ide-panel, #1f2228); border:1px solid rgba(106, 190, 120, .5);
   border-left:3px solid rgba(106, 190, 120, .9); border-radius:4px;
   box-shadow:0 6px 18px rgba(0, 0, 0, .55); pointer-events:none; }
-.dsh-ide-edit-hint { color:rgba(150, 200, 160, .75); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif);
+.dsh-ide-edit-hint { color:rgba(150, 200, 160, .75); font:400 10.5px/1.4 var(--ide-font, system-ui, sans-serif);
   margin-bottom:2px; letter-spacing:.01em; }
 .dsh-ide-edit-code { color:rgba(160, 230, 175, .98); white-space:pre;
-  font:400 13px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+  font:400 13px/1.5 var(--ide-font-mono, ui-monospace, monospace); }
 .dsh-ide-icon-button { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:4px;
   padding:2px 5px; font:400 12px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-icon-button:hover { background:var(--ide-hover); }
