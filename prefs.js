@@ -97,8 +97,12 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   snoozeAfterRejectMs: 800,
   /** Show answers that only change whitespace. */
   showWhitespaceOnlyChanges: false,
-  /** Mark the text a rewrite deletes. */
-  showRemovedDecorations: true,
+  /**
+   * Mark the text a rewrite deletes. Off by default: the marker is a range
+   * decoration, and a range that ends up covering more text than the user
+   * expected reads as a selection they did not make.
+   */
+  showRemovedDecorations: false,
   /** Buffers above this many characters get no suggestions at all. */
   maxFileChars: 1000000,
   /** Say in the output panel why a suggestion was dropped. */

@@ -2047,7 +2047,13 @@ const TAB_PREFERENCES = [
   { key: 'refetchAfterAccept', kind: 'boolean', value: false, title: 'Подсказки: запрос после приёма', hint: 'Сразу спрашивать продолжение после Tab.' },
   { key: 'triggerInComments', kind: 'boolean', value: true, title: 'Подсказки: в комментариях', hint: 'Подсказывать код сразу после комментария-просьбы.' },
   { key: 'showWhitespaceOnlyChanges', kind: 'boolean', value: false, title: 'Проверка: пробельные правки', hint: 'Показывать подсказки, меняющие только пробелы.' },
-  { key: 'showRemovedDecorations', kind: 'boolean', value: true, title: 'Подсказки: подсветка замены', hint: 'Красить текст, который перепишет подсказка.' },
+  {
+    key: 'showRemovedDecorations',
+    kind: 'boolean',
+    value: false,
+    title: 'Подсказки: подсветка замены',
+    hint: 'Красить текст, который перепишет подсказка. По умолчанию выключено: подсветка легко выглядит как чужое выделение.',
+  },
   { key: 'explainSuppressed', kind: 'boolean', value: true, title: 'Подсказки: причины отказа', hint: 'Писать в «Траектории», почему подсказка скрыта.' },
   { key: 'heuristicDuplicateLine', kind: 'boolean', value: true, title: 'Проверка: дубль строки', hint: 'Отклонять повтор следующей строки.' },
   { key: 'heuristicExtendsRange', kind: 'boolean', value: true, title: 'Проверка: повтор диапазона', hint: 'Отклонять ответ, повторяющий исходные строки.' },
@@ -2419,6 +2425,10 @@ function IdeBody(props) {
         if (tabPref('showRemovedDecorations', true) !== true) return
         const start = model.getPositionAt(plan.range.start)
         const end = model.getPositionAt(plan.range.end)
+        // One line only: a multi-line marker is indistinguishable from a stray
+        // selection, and the edits that matter (a rewritten empty assignment,
+        // an echo of the rest of the line) never span more than one line.
+        if (start.lineNumber !== end.lineNumber) return
         runtime.current.tab.removedDecorations = editor.deltaDecorations(
           [],
           [
@@ -2605,6 +2615,10 @@ function IdeBody(props) {
               forceMoveMarkers: true,
             },
           ])
+          // `executeEdits` moves the caret but leaves any selection the editor
+          // had, so a hint applied while text was selected looked like the
+          // selection grew. Collapse it at the end of what we inserted.
+          editor.setPosition(model.getPositionAt(startOffset + text.length))
           editor.pushUndoStop()
         } finally {
           runtime.current.tab.internalEdit = false
@@ -2937,13 +2951,19 @@ function IdeBody(props) {
           if (shown !== undefined && (shown.lineNumber !== event.position.lineNumber || shown.column !== event.position.column)) clearGhost()
           // The status bar needs the final position, not every intermediate one.
           // A React update per mouse move re-renders the whole pane, which is
-          // what made placing the cursor feel heavy.
+          // what made placing the cursor feel heavy. Only a changed position is
+          // worth a render, and at most four times a second.
           if (cursorTimer !== 0) return
           cursorTimer = window.setTimeout(() => {
             cursorTimer = 0
             const position = editor.getPosition()
-            if (position !== null) setCursor({ line: position.lineNumber, column: position.column })
-          }, 120)
+            if (position === null) return
+            setCursor((current) =>
+              current.line === position.lineNumber && current.column === position.column
+                ? current
+                : { line: position.lineNumber, column: position.column },
+            )
+          }, 250)
         })
 
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
@@ -2983,11 +3003,16 @@ function IdeBody(props) {
       }, [monaco])
 
       // Keep the active tab bound to the editor, one model per tab.
+      //
+      // The dependency list is deliberately `[activeKey, monaco]`: marking a tab
+      // dirty rewrites `tabs` on every keystroke, and with `tabs` here this whole
+      // effect (clearGhost, updateOptions, focus) ran for every character typed,
+      // which is what made the editor feel like it was waiting for something.
       React.useEffect(() => {
         clearGhost()
         const editor = runtime.current.editor
         if (!editor || !monaco || activeKey === '') return
-        const entry = tabs.find((candidate) => candidate.key === activeKey)
+        const entry = stateRef.current.tabs.find((candidate) => candidate.key === activeKey)
         if (entry === undefined) return
         let model = runtime.current.models.get(activeKey)
         if (model === undefined) {
@@ -2999,14 +3024,29 @@ function IdeBody(props) {
           if (editor.getModel() !== null) runtime.current.views.set(runtime.current.activeKey, editor.saveViewState())
           editor.setModel(model)
           const view = runtime.current.views.get(activeKey)
-          if (view !== undefined && view !== null) editor.restoreViewState(view)
+          if (view !== undefined && view !== null) {
+            editor.restoreViewState(view)
+            // A saved view state carries the selection as well as the scroll
+            // offset. A selection the user made once used to come back with the
+            // tab and looked like it could not be dismissed, so only the caret
+            // position is restored here.
+            const restored = editor.getPosition()
+            if (restored !== null) editor.setPosition(restored)
+          } else {
+            // A fresh tab has no view state, and Monaco keeps the selection of the
+            // model it replaced. Opening a second file after selecting text in the
+            // first one therefore started with the old selection over the new
+            // buffer, which looked like everything being highlighted.
+            editor.setSelection(new monaco.Selection(1, 1, 1, 1))
+            editor.setScrollTop(0)
+          }
           runtime.current.activeKey = activeKey
           const position = editor.getPosition()
           if (position !== null) setCursor({ line: position.lineNumber, column: position.column })
+          editor.focus()
         }
         editor.updateOptions({ readOnly: entry.readOnly === true })
-        editor.focus()
-      }, [activeKey, tabs, monaco])
+      }, [activeKey, monaco])
 
       // The close guard reads this set synchronously; keep it in step with react.
       React.useEffect(() => {
