@@ -2522,15 +2522,32 @@ function IdeBody(props) {
           code.textContent = edit.newText
           node.appendChild(hint)
           node.appendChild(code)
+          node.title = edit.newText
+          // The card may be wider than the text column: scrolling it must not
+          // move the caret or steal focus from the editor.
+          node.addEventListener('mousedown', (event) => event.preventDefault())
           if (start.lineNumber - lastCardLine < 7) return
           lastCardLine = start.lineNumber
           const widget = {
             getId: () => `dsh-ide.edit.${plan.requestId}.${index}`,
             getDomNode: () => node,
-            getPosition: () => ({
-              position: model.getPositionAt(edit.start),
-              preference: [monacoInstance.editor.ContentWidgetPositionPreference.BELOW],
-            }),
+            getPosition: () => {
+              // The percentage cap is unreliable inside Monaco's widget layer, so
+              // the usable width comes from the editor layout itself. Without it
+              // the card runs past the right edge and its text is cut off.
+              const width = editor.getLayoutInfo().width
+              node.style.maxWidth = `${Math.max(220, Math.round(width) - 48)}px`
+              return {
+                // Anchored at the start of the line, not at the column of the
+                // edit: a card that begins mid-line runs off the right edge of a
+                // narrow editor.
+                position: { lineNumber: start.lineNumber, column: 1 },
+                preference: [
+                  monacoInstance.editor.ContentWidgetPositionPreference.BELOW,
+                  monacoInstance.editor.ContentWidgetPositionPreference.ABOVE,
+                ],
+              }
+            },
           }
           editor.addContentWidget(widget)
           widgets.push(widget)
@@ -4096,9 +4113,11 @@ function IdeBody(props) {
 .dsh-ide-ghost-removed { background:rgba(224, 108, 117, .18); border-bottom:1px solid rgba(224, 108, 117, .55); }
 .dsh-ide-edit-old { background:rgba(224, 108, 117, .18); border-bottom:1px solid rgba(224, 108, 117, .55); }
 .dsh-ide-edit-new { position:relative; z-index:30; margin:2px 0 0 10px; padding:4px 10px 5px;
-  background:var(--ide-panel, #1f2228); border:1px solid rgba(106, 190, 120, .5);
+  box-sizing:border-box; width:max-content; max-width:min(620px, calc(100% - 20px));
+  max-height:200px; overflow:auto; cursor:auto;
+  background:var(--ide-panel, #252526); border:1px solid rgba(106, 190, 120, .5);
   border-left:3px solid rgba(106, 190, 120, .9); border-radius:4px;
-  box-shadow:0 6px 18px rgba(0, 0, 0, .55); pointer-events:none; }
+  box-shadow:0 6px 18px rgba(0, 0, 0, .55); }
 .dsh-ide-edit-hint { color:rgba(150, 200, 160, .75); font:400 10.5px/1.4 var(--ide-font, system-ui, sans-serif);
   margin-bottom:2px; letter-spacing:.01em; }
 .dsh-ide-edit-code { color:rgba(160, 230, 175, .98); white-space:pre;
