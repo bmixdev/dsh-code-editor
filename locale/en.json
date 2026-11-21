@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Code editor",
-    "description": "Monaco code editor in the right sidebar: browse the workspace tree, edit the open file, accept an AI suggestion with Tab, tune the completion model and API key in the settings drawer."
+    "title": "IDE",
+    "description": "Main plugin of this repository: a VS Code style workspace in the right sidebar — explorer tree, file tabs, quick open (Ctrl+P), Monaco with AI inline suggestions and completion-model settings. Open it with the IDE button on the Start tab, in the composer row, or in the file tab actions."
   }
 }

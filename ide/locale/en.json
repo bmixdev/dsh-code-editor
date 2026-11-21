@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "IDE",
-    "description": "VS Code style workspace: explorer tree with lazy folders, file tabs, quick open (Ctrl+P), Monaco editing with AI inline suggestions and a settings drawer for the completion model and API key."
-  }
-}

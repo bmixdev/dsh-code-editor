@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Code editor",
+    "description": "Secondary Monaco editor in the right sidebar: workspace file tree, editing of the open file, Tab inline model suggestions, and completion-model and API-key settings. Open it with the Edit button in the document preview header."
+  }
+}

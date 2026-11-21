@@ -1,28 +1,25 @@
 /**
- * Host half of `@local/dsh-ide` — a tabbed, VS Code-shaped editor that brings
- * its own explorer and does not depend on the built-in file plugin.
+ * Host half of `@local/dsh-code-editor`.
  *
  * Responsibilities:
- *  - serve the vendored Monaco tree (`/ide/vs/…`) as static bytes;
+ *  - serve the vendored Monaco tree (`/code-editor/vs/…`) as static bytes;
  *  - open a text file from inside the calling session's workspace and hand the
- *    client its text plus an opaque revision token (one document per open tab);
- *  - save a document through that session's `ctx.fs` with a mandatory version
+ *    client its text plus an opaque revision token;
+ *  - save the file through that session's `ctx.fs` with a mandatory version
  *    check, under the session's sandbox policy (a read-only session stays
  *    read-only);
- *  - list workspace folders for the explorer and flatten the workspace for
- *    quick open;
- *  - remember which tabs a session had open (`~/.dsh/ide-state.json`);
  *  - answer cancellable inline-completion requests from the configured model;
+ *  - remember the per-workspace smart-Tab opt-in;
+ *  - list workspace folders for the editor's file tree;
  *  - report the live provider/model catalog and store the completion key
  *    through the credential store;
- *  - persist the completion preferences shared with the code-editor plugin
- *    (`~/.dsh/code-editor.json`).
+ *  - persist the editor's own preferences (`~/.dsh/code-editor.json`).
  *
  * Every operation is an exact Fetch route below `/api`, which the connection
  * layer serves only to the owner principal (this machine's GUI page).
  */
 import { appendFileSync } from 'node:fs'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -35,13 +32,12 @@ import {
 } from './catalog.js'
 import { buildContext, postprocessCompletion } from './completion.js'
 import { optedInRoots, readPreferences, writePreferences } from './prefs.js'
-import { listFiles, listTree } from './tree.js'
-import { readSessionState, writeSessionState } from './state.js'
+import { listTree } from './tree.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ASSET_ROOT = path.join(HERE, 'vendor', 'vs')
-const ASSET_PREFIX = '/ide/vs'
-const API_PREFIX = '/api/ide/'
+const ASSET_PREFIX = '/code-editor/vs'
+const API_PREFIX = '/api/code-editor/'
 
 /** Files above this size stay in the preview: the editor refuses them. */
 const MAX_EDIT_BYTES = 1024 * 1024
@@ -183,7 +179,7 @@ export function apply(ctx, config) {
         path: ASSET_PREFIX,
         resource: serveAsset,
       }),
-    'dsh-ide: Monaco assets',
+    'dsh-code-editor: Monaco assets',
   )
 
   const handlers = {
@@ -193,12 +189,6 @@ export function apply(ctx, config) {
     complete: (body, signal) => complete(body, signal),
     resolve: (body) => resolveSession(body),
     tree: (body, signal) => treeRoute(body, signal),
-    files: (body, signal) => filesRoute(body, signal),
-    create: (body, signal) => createRoute(body, signal),
-    mkdir: (body, signal) => mkdirRoute(body, signal),
-    rename: (body, signal) => renameRoute(body, signal),
-    remove: (body, signal) => removeRoute(body, signal),
-    state: (body) => stateRoute(body),
     catalog: () => buildCatalog(ctx),
     credentials: (body) => credentialsRoute(body),
     prefs: (body) => prefsRoute(body),
@@ -225,7 +215,7 @@ export function apply(ctx, config) {
             }
           },
         }),
-      `dsh-ide: route ${name}`,
+      `dsh-code-editor: route ${name}`,
     )
   }
 
@@ -492,38 +482,9 @@ export function apply(ctx, config) {
       attempts.push({ provider: selection.provider, model: selection.model })
     }
 
-    const systemPrompt =
-      'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
-      'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
-      'уже написанного кода. Продолжение должно быть коротким (1–5 строк) и синтаксически уместным. ' +
-      'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
-      'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
-      'Если уместного продолжения нет, ответь пустой строкой.'
-    // The suffix must follow its own header: an inverted layout tells the model to
-    // continue past the text that comes after the cursor, which produced empty
-    // answers for every request of the first benchmark.
-    const requestText =
-      `Файл: ${document.displayPath}\n` +
-      `Язык: ${document.language}\n\n` +
-      `--- текст до курсора ---\n${prefix}\n--- курсор ---\n` +
-      `--- текст после курсора ---\n${suffix}`
-
     const deadline = AbortSignal.timeout(COMPLETION_DEADLINE_MS)
     const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
     const startedAt = Date.now()
-
-    // A thinking model spends the output budget on hidden reasoning and then
-    // returns nothing, which reads in the GUI as "completions stopped working".
-    // Pinning the least advertised effort leaves the budget to the code.
-    const leastEffort = async (provider, model) => {
-      try {
-        const info = await ctx.llm.resolveModelInfo(provider, model, combined)
-        const effort = info?.reasoning?.efforts?.[0]
-        return typeof effort?.id === 'string' && effort.id !== '' ? effort.id : undefined
-      } catch {
-        return undefined
-      }
-    }
 
     let text = ''
     let used = attempts[0]
@@ -536,8 +497,7 @@ export function apply(ctx, config) {
     let finishReason = ''
     let firstChunk = ''
     for (const attempt of attempts) {
-      const effort = await leastEffort(attempt.provider, attempt.model)
-      used = effort === undefined ? attempt : { ...attempt, effort }
+      used = attempt
       let buffer = ''
       streamError = ''
       finishReason = ''
@@ -545,8 +505,16 @@ export function apply(ctx, config) {
       for await (const chunk of ctx.llm.stream({
         provider: attempt.provider,
         model: attempt.model,
-        ...(used.effort === undefined ? {} : { reasoningEffort: used.effort }),
-      system: systemPrompt,
+      system:
+        'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
+        'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
+        'уже написанного кода. Продолжение должно быть коротким (1–5 строк) и синтаксически уместным. ' +
+        // A comment that asks for code is the most common way a programmer
+        // starts a block, so the answer has to begin with a line break and
+        // contain the code itself rather than a repeat of the comment.
+        'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
+        'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
+        'Если уместного продолжения нет, ответь пустой строкой.',
       // Message content is a list of typed blocks, not a bare string: every
       // other host-side caller in this installation passes
       // `[{ type: 'text', text }]`, and a string content made the adapter end
@@ -557,16 +525,23 @@ export function apply(ctx, config) {
           content: [
             {
               type: 'text',
-              text: requestText,
+              text:
+                `Файл: ${document.displayPath}\n` +
+                `Язык: ${document.language}\n\n` +
+                // The suffix must follow its own header: an inverted layout tells the
+                // model to continue past the text that comes after the cursor, which
+                // produced empty answers for every request of the first benchmark.
+                `--- текст до курсора ---\n${prefix}\n--- курсор ---\n` +
+                `--- текст после курсора ---\n${suffix}`,
             },
           ],
         },
       ],
       // 160 tokens was not enough for a reasoning model: it spent the whole
       // budget on `reasoning_content` and every answer came back empty with
-      // `finish_reason: length`. The effort is pinned to the least advertised
-      // value above and 900 tokens leave room for the five lines of code.
-      maxTokens: 900,
+      // `finish_reason: length`. 400 leaves room for the thinking that
+      // deepseek-v4.1-flash still does before the five lines of code.
+      maxTokens: 400,
       temperature: 0.1,
       signal: combined,
       sessionId: document.sessionId,
@@ -625,36 +600,20 @@ export function apply(ctx, config) {
       error: streamError,
       firstChunk,
     })
-    // An empty answer is a normal outcome the user has to be able to read, so
-    // it comes back with the same diagnostics block as a real completion.
-    const reason =
-      streamError !== ''
-        ? `Модель не ответила: ${streamError}`
-        : finishReason === 'length'
-          ? 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
-          : text.trim() === ''
-            ? 'Модель не вернула продолжение.'
-            : ''
+    if (text.trim() === '' && streamError !== '') {
+      return fail('upstream', `Модель не ответила: ${streamError}`)
+    }
+    if (text.trim() === '' && finishReason === 'length') {
+      return fail(
+        'upstream',
+        'Модель израсходовала лимит на рассуждения: выберите нерассуждающую модель в настройках редактора (шестерёнка).',
+      )
+    }
     return {
       text: result,
       provider: used.provider,
       model: used.model,
       durationMs: Date.now() - startedAt,
-      reason,
-      // The IDE renders these in its output panel: the trajectory explains what
-      // was attempted and what came back, the conversation shows the exact text.
-      trajectory: {
-        attempts: attempts.map(attempt => `${attempt.provider} / ${attempt.model}`),
-        finishReason,
-        streamError,
-        chunkTypes: [...chunkTypes],
-        rawChars: text.length,
-        answerChars: result.length,
-        before: prefix.length,
-        after: suffix.length,
-        explicit: body.explicit === true,
-      },
-      conversation: { system: systemPrompt, message: requestText, answer: text },
     }
   }
 
@@ -701,125 +660,6 @@ export function apply(ctx, config) {
   }
 
   // ---------------------------------------------------------- editor state
-
-  async function filesRoute(body, signal) {
-    const scope = sessionOf(body)
-    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
-    const preferences = await readPreferences()
-    return listFiles(ctx, {
-      cwd: scope.cwd,
-      hidden: body.hidden === undefined ? preferences.hiddenFiles === true : body.hidden === true,
-      limit: typeof body.limit === 'number' ? body.limit : undefined,
-      signal,
-    })
-  }
-
-  // ----------------------------------------------------------------- create
-
-  async function createRoute(body, signal) {
-    const scope = sessionOf(body)
-    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
-    const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
-    if (mode === 'read-only') return fail('read-only', 'Рабочая папка открыта только для чтения.')
-    const relative = typeof body.path === 'string' ? body.path.trim() : ''
-    const segments = relative.split(/[\\/]+/)
-    if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
-      return fail('bad-request', 'Укажите путь к новому файлу внутри рабочей папки.')
-    }
-    const root = await ctx.fs.resolve(scope.cwd, { signal })
-    const target = await ctx.fs.resolve(path.resolve(scope.cwd, relative), { signal })
-    if (!ctx.fs.contains(root, target)) return fail('outside-workspace', 'Файл должен находиться внутри рабочей папки.')
-    const nativePath = ctx.fs.processPath(target)
-    await mkdir(path.dirname(nativePath), { recursive: true })
-    try {
-      await writeFile(nativePath, '', { flag: 'wx' })
-    } catch (error) {
-      if (error !== null && typeof error === 'object' && error.code === 'EEXIST') {
-        return fail('exists', 'Файл с таким путём уже существует — откройте его через Ctrl+P.')
-      }
-      throw error
-    }
-    return { path: relative, created: true }
-  }
-
-  async function mkdirRoute(body, signal) {
-    const scope = sessionOf(body)
-    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
-    const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
-    if (mode === 'read-only') return fail('read-only', 'Рабочая папка открыта только для чтения.')
-    const relative = typeof body.path === 'string' ? body.path.trim() : ''
-    const segments = relative.split(/[\\/]+/)
-    if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
-      return fail('bad-request', 'Укажите путь к новой папке внутри рабочей папки.')
-    }
-    const root = await ctx.fs.resolve(scope.cwd, { signal })
-    const target = await ctx.fs.resolve(path.resolve(scope.cwd, relative), { signal })
-    if (!ctx.fs.contains(root, target)) return fail('outside-workspace', 'Папка должна находиться внутри рабочей папки.')
-    const nativePath = ctx.fs.processPath(target)
-    const existing = await stat(nativePath).catch(() => undefined)
-    if (existing !== undefined) return fail('exists', 'Папка с таким путём уже существует.')
-    await mkdir(nativePath, { recursive: true })
-    return { path: relative, created: true }
-  }
-
-  async function renameRoute(body, signal) {
-    const scope = sessionOf(body)
-    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
-    const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
-    if (mode === 'read-only') return fail('read-only', 'Рабочая папка открыта только для чтения.')
-    const from = typeof body.path === 'string' ? body.path.trim() : ''
-    const to = typeof body.to === 'string' ? body.to.trim() : ''
-    for (const relative of [from, to]) {
-      const segments = relative.split(/[\\/]+/)
-      if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
-        return fail('bad-request', 'Укажите путь внутри рабочей папки.')
-      }
-    }
-    const root = await ctx.fs.resolve(scope.cwd, { signal })
-    const targetFrom = await ctx.fs.resolve(path.resolve(scope.cwd, from), { signal })
-    const targetTo = await ctx.fs.resolve(path.resolve(scope.cwd, to), { signal })
-    if (!ctx.fs.contains(root, targetFrom) || !ctx.fs.contains(root, targetTo)) {
-      return fail('outside-workspace', 'Переименование возможно только внутри рабочей папки.')
-    }
-    const nativeFrom = ctx.fs.processPath(targetFrom)
-    const nativeTo = ctx.fs.processPath(targetTo)
-    const existingFrom = await stat(nativeFrom).catch(() => undefined)
-    if (existingFrom === undefined) return fail('not-found', 'Такого файла или папки больше нет — обновите дерево.')
-    const existingTo = await stat(nativeTo).catch(() => undefined)
-    if (existingTo !== undefined) return fail('exists', 'По новому пути уже что-то есть — выберите другое имя.')
-    await mkdir(path.dirname(nativeTo), { recursive: true })
-    await rename(nativeFrom, nativeTo)
-    return { path: to, renamed: true }
-  }
-
-  async function removeRoute(body, signal) {
-    const scope = sessionOf(body)
-    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
-    const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
-    if (mode === 'read-only') return fail('read-only', 'Рабочая папка открыта только для чтения.')
-    const relative = typeof body.path === 'string' ? body.path.trim() : ''
-    const segments = relative.split(/[\\/]+/)
-    if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
-      return fail('bad-request', 'Нельзя удалить рабочую папку целиком — укажите файл или вложенную папку.')
-    }
-    const root = await ctx.fs.resolve(scope.cwd, { signal })
-    const target = await ctx.fs.resolve(path.resolve(scope.cwd, relative), { signal })
-    if (!ctx.fs.contains(root, target)) return fail('outside-workspace', 'Удаление возможно только внутри рабочей папки.')
-    const nativePath = ctx.fs.processPath(target)
-    const info = await stat(nativePath).catch(() => undefined)
-    if (info === undefined) return fail('not-found', 'Такого файла или папки больше нет — обновите дерево.')
-    await rm(nativePath, { recursive: true, force: false })
-    return { path: relative, removed: true }
-  }
-
-  async function stateRoute(body) {
-    const scope = sessionOf(body)
-    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
-    if (body.patch !== undefined && typeof body.patch === 'object' && body.patch !== null) {
-      return { state: await writeSessionState(scope.id, body.patch) }
-    }
-    return { state: await readSessionState(scope.id) }
-  }
 
   async function credentialsRoute(body) {
     const operation = typeof body.op === 'string' ? body.op : 'status'

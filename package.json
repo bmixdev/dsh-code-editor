@@ -1,9 +1,9 @@
 {
-  "name": "@local/dsh-code-editor",
+  "name": "@local/dsh-ide",
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Monaco code editor tab for DeepSeek Harness: workspace file tree, AI inline completions with a provider/model chooser, in-app settings, guarded save and quote-to-chat.",
+  "description": "Main plugin of the dsh-code-editor repository: a VS Code style IDE for DeepSeek Harness with an explorer tree, file tabs, quick open (Ctrl+P), a Monaco editor with AI inline suggestions and a settings drawer for the completion model and API key. It lives in the right sidebar and opens from the IDE button on the Start tab, in the composer row, or in the file/Files tab actions.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -12,6 +12,7 @@
   "keywords": [
     "deepseek-harness",
     "dsh-plugin",
+    "ide",
     "monaco",
     "code-editor",
     "inline-completion"
@@ -25,10 +26,11 @@
   "files": [
     "index.js",
     "client.js",
-    "completion.js",
-    "tree.js",
+    "state.js",
     "catalog.js",
+    "completion.js",
     "prefs.js",
+    "tree.js",
     "cordis.patch.yml",
     "README.md",
     "locale/*.json",
@@ -39,8 +41,9 @@
   ],
   "scripts": {
     "check": "node scripts/check-manifests.mjs",
-    "test": "node --test tests/completion.test.mjs tests/client-smoke.test.mjs tests/host-smoke.mjs tests/editor-state.test.mjs",
-    "test:ide": "node --test ide/tests/host.test.mjs ide/tests/client.test.mjs ide/tests/sync.test.mjs"
+    "test": "node --test tests/host.test.mjs tests/client.test.mjs",
+    "test:editor": "node --test editor/tests/completion.test.mjs editor/tests/client-smoke.test.mjs editor/tests/host-smoke.mjs editor/tests/editor-state.test.mjs editor/tests/sync.test.mjs",
+    "test:all": "npm test && npm run test:editor"
   },
   "engines": {
     "node": ">=22"
