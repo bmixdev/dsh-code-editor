@@ -11,7 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 
-import { apply, rankModels } from '../index.js'
+import { apply, rankModels, resetModelCatalog } from '../index.js'
 
 const SESSION_ID = 'session-1'
 const ROUTES = [
@@ -46,7 +46,10 @@ async function makeWorkspace() {
   return root
 }
 
-function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1' }) {
+function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1', models = [{ id: 'fixture-model', name: 'Fixture model' }] }) {
+  // The catalog is cached per provider for five minutes, so one test's catalog
+  // would leak into the next one and hide a model it added.
+  resetModelCatalog()
   const routes = new Map()
   const streamCalls = []
   const session = { id: SESSION_ID }
@@ -71,7 +74,7 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
     llm: {
       listProviders: () => [{ id: 'fixture', name: 'Fixture' }],
       async listModels() {
-        return [{ id: 'fixture-model', name: 'Fixture model' }]
+        return models
       },
       listConfigurableProviders: () => [],
       // A thinking model advertises opaque effort ids; the completion pins the
@@ -626,8 +629,47 @@ test('a typing pause asks for edits only when the setting turns them on', async 
   }
 })
 
-test('an unconfigured hint prefers a fast model over the session one', () => {
-  // The real catalog of the gateway this machine uses. The session runs on
+test('a hint can stay on the session model and asks for code without commentary', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({
+        root,
+        models: [
+          { id: 'fixture-model', name: 'Fixture model' },
+          { id: 'fixture-flash', name: 'Fixture flash' },
+        ],
+      })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      const ask = () =>
+        app.call('complete', {
+          id: opened.body.id,
+          sessionId: SESSION_ID,
+          token: opened.body.token,
+          text: 'export const answer = 42\n',
+          offset: 'export const answer = 42\n'.length,
+        })
+
+      // By default a fast sibling is borrowed from the catalog.
+      const auto = await ask()
+      assert.equal(app.streamCalls[0].model, 'fixture-flash')
+      assert.equal(auto.body.trajectory.modelSource, 'auto')
+
+      // Turning that off keeps the user's own model, as asked in the settings.
+      await app.call('prefs', { patch: { autoModel: false } })
+      const own = await ask()
+      assert.equal(app.streamCalls[1].model, 'fixture-model')
+      assert.equal(own.body.trajectory.modelSource, 'session')
+      // Chat models narrate unless told not to, so the instruction says it.
+      assert.match(app.streamCalls[1].system, /Не рассуждай вслух/)
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an unconfigured hint prefers a fast model over the session one', () => {  // The real catalog of the gateway this machine uses. The session runs on
   // deepseek-v4.1-flash, a thinking model that needs 3.2 s to its first text and
   // often runs into the deadline; glm-5.3-flash answered the same prompt in 0.7 s.
   const catalog = [

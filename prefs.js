@@ -137,6 +137,18 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   maxEdits: 3,
   /** Send the whole file instead of the windows around the cursor. */
   wholeFileContext: true,
+  /**
+   * When no hint model is chosen, borrow a fast one from the provider's own
+   * catalog instead of the session model. Off means "use the session model", so
+   * a user who wants their chat model for hints keeps it.
+   */
+  autoModel: true,
+  /**
+   * Add «отвечай сразу кодом, без рассуждений» to the instruction. A reasoning
+   * model may still think before it writes, but the sentence keeps a chatty
+   * model from narrating the answer.
+   */
+  noReasoningHint: true,
 })
 
 /** Inclusive integer bounds, applied to both the file and the drawer. */
@@ -176,6 +188,8 @@ const BOOLEAN_KEYS = [
   'multiEdit',
   'multiEditAuto',
   'wholeFileContext',
+  'autoModel',
+  'noReasoningHint',
 ]
 
 /** How many workspaces may stay opted in at once. */

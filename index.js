@@ -87,8 +87,12 @@ export function rankModels(ids, avoidFamily = '') {
   return ids.slice().sort((left, right) => score(right) - score(left))
 }
 
-/** Ranks a provider's catalog and returns its fastest-looking model id. */
-async function pickFastModel(ctx, provider, avoidFamily = '') {
+/** Forgets the catalog cache; tests need it, and so does a provider switch. */
+export function resetModelCatalog() {
+  catalogCache = { provider: '', models: [], at: 0 }
+}
+
+/** Ranks a provider's catalog and returns its fastest-looking model id. */async function pickFastModel(ctx, provider, avoidFamily = '') {
   const now = Date.now()
   if (catalogCache.provider !== provider || now - catalogCache.at > CATALOG_TTL_MS) {
     let models = []
@@ -599,7 +603,7 @@ export function apply(ctx, config) {
     // the settings name no model, a fast model of the same provider is chosen
     // instead and the trajectory says so; the setting always overrides it.
     let effectiveModel = requestedModel
-    if (modelSource === 'session') {
+    if (modelSource === 'session' && preferences.autoModel !== false) {
       const family = String(selection.model).toLowerCase().split('-')[0]
       const fast = await pickFastModel(ctx, requestedProvider, family)
       if (fast !== '' && fast !== selection.model) {
@@ -637,7 +641,16 @@ export function apply(ctx, config) {
       language: document.language,
       file: document.displayPath,
     })
-    const systemPrompt = multiEdit ? `${basePrompt}\n\n${editInstructions({ maxEdits: preferences.maxEdits })}` : basePrompt
+    // A chat model narrates before it writes. The line below asks for code
+    // first; it cannot switch off hidden reasoning (that is the route's own
+    // setting), but it keeps the visible answer free of commentary.
+    const concisePrompt =
+      preferences.noReasoningHint === false
+        ? basePrompt
+        : `${basePrompt}\n\nНе рассуждай вслух: сразу пиши код без пояснений.`
+    const systemPrompt = multiEdit
+      ? `${concisePrompt}\n\n${editInstructions({ maxEdits: preferences.maxEdits })}`
+      : concisePrompt
     // The suffix must follow its own header: an inverted layout tells the model to
     // continue past the text that comes after the cursor, which produced empty
     // answers for every request of the first benchmark.
