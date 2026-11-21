@@ -205,11 +205,11 @@ function renderText(element) {
 test('a replacement is offered as pink removal plus green phantom text', async () => {
   const source = await readFile(CLIENT_SOURCE, 'utf8')
 
-  // The removed fragment keeps a pink background, and the replacement follows it
-  // on the same line as green phantom text. Both live in one decoration, so a
-  // single-line edit never needs an overlay.
-  assert.ok(source.includes("inlineClassName: 'dsh-ide-edit-old'"), 'the removed range is highlighted')
-  assert.ok(source.includes("after: { content: edit.newText, inlineClassName: 'dsh-ide-edit-inline' }"), 'the replacement is inline phantom text')
+  // Every replacement is staged as real lines: the old text stays visible in
+  // pink and the new text takes its own lines in green, so nothing is printed
+  // over existing code and nothing flows past the end of a line.
+  assert.ok(source.includes('const diffLinesLocal = (before, after) => {'), 'the change is staged from a line diff')
+  assert.ok(!source.includes('after: { content: edit.newText'), 'no replacement is drawn inline')
   // A block answer takes real lines instead of printing over the code below it,
   // and only the lines that differ are inserted: the unchanged ones stay put.
   assert.ok(source.includes('const diffLinesLocal = (before, after) => {'), 'the block is staged from a line diff')

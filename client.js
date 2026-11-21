@@ -2564,7 +2564,10 @@ function IdeBody(props) {
             column += 1
             continue
           }
-          if (table[row + 1][column] >= table[row][column + 1]) {
+          // Adds come first when the two choices are equally good, so the new
+          // lines are inserted above the ones they replace: a block answer reads
+          // top-down instead of the new imports landing under the old `def`.
+          if (table[row + 1][column] > table[row][column + 1]) {
             ops.push({ type: 'del', text: left[row] })
             row += 1
           } else {
@@ -2615,26 +2618,10 @@ function IdeBody(props) {
         const decorations = []
         const blocks = []
         for (const edit of edits) {
-          const start = model.getPositionAt(edit.start)
-          const end = model.getPositionAt(edit.end)
-          // The hover carries the whole proposal, so a line whose card was
-          // skipped as too close to the previous one is still readable.
+          // The hover carries the whole proposal, so the hint is readable even
+          // where the staged lines are not.
           const hover =
             (edit.why === '' ? 'Правка подсказки' : edit.why) + '\n\n```\n' + edit.newText + '\n```'
-          if (!edit.newText.includes('\n')) {
-            // A one-line replacement is phantom text on the same line: what goes
-            // away stays pink, what arrives follows it in green. Monaco flows the
-            // "after" content inline, so nothing is printed over anything else.
-            decorations.push({
-              range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
-              options: {
-                inlineClassName: 'dsh-ide-edit-old',
-                hoverMessage: { value: hover },
-                after: { content: edit.newText, inlineClassName: 'dsh-ide-edit-inline' },
-              },
-            })
-            continue
-          }
           blocks.push({ edit, hover })
         }
         runtime.current.tab.editDecorations = editor.deltaDecorations([], decorations)
