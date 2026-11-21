@@ -58,6 +58,54 @@ const CONTEXT_RIGHT = 1000
 const MAX_CONTEXT_TEXT_CHARS = 4 * 1024 * 1024
 const COMPLETION_DEADLINE_MS = 20000
 const COMPLETION_MAX_CHARS = 400
+/**
+ * Hints must appear while the user is still looking at the line, so an
+ * unconfigured route prefers a small model. The hints below are name-based on
+ * purpose: a catalog entry carries no latency, and the small variants of this
+ * gateway are the ones that answer under a second.
+ */
+const FAST_MODEL_HINTS = ['flash', 'mini', 'haiku', 'lite', 'small', 'fast', 'instant', 'cheap']
+const SLOW_MODEL_HINTS = ['reason', 'think', 'thinking', 'pro', 'max', 'opus', 'sonnet', 'o1', 'o3', 'r1']
+const CATALOG_TTL_MS = 5 * 60 * 1000
+let catalogCache = { provider: '', models: [], at: 0 }
+
+/**
+ * Ranks model ids for a hint request: small variants first, thinking-heavy
+ * families last, and the chat model's own family demoted so the hint does not
+ * land on the same slow model the session uses.
+ */
+export function rankModels(ids, avoidFamily = '') {
+  const score = id => {
+    const lower = id.toLowerCase()
+    let value = 0
+    if (FAST_MODEL_HINTS.some(hint => lower.includes(hint))) value += 2
+    if (SLOW_MODEL_HINTS.some(hint => lower.includes(hint))) value -= 2
+    if (lower.includes('code')) value += 1
+    if (avoidFamily !== '' && lower.split('-')[0] === avoidFamily) value -= 1
+    return value
+  }
+  return ids.slice().sort((left, right) => score(right) - score(left))
+}
+
+/** Ranks a provider's catalog and returns its fastest-looking model id. */
+async function pickFastModel(ctx, provider, avoidFamily = '') {
+  const now = Date.now()
+  if (catalogCache.provider !== provider || now - catalogCache.at > CATALOG_TTL_MS) {
+    let models = []
+    try {
+      const listed = await ctx.llm.listModels(provider)
+      models = Array.isArray(listed) ? listed : []
+    } catch {
+      // An unlistable provider simply has no better suggestion to offer.
+    }
+    catalogCache = { provider, models, at: now }
+  }
+  const ids = catalogCache.models
+    .map(entry => (typeof entry === 'string' ? entry : entry?.id))
+    .filter(id => typeof id === 'string' && id !== '')
+  if (ids.length === 0) return ''
+  return rankModels(ids, avoidFamily)[0] ?? ''
+}
 
 const CONTENT_TYPES = new Map([
   ['.js', 'text/javascript; charset=utf-8'],
@@ -532,7 +580,7 @@ export function apply(ctx, config) {
     // Where the model came from, so the trajectory can say why the session's own
     // model appears in a row: an empty preference means "whatever the session
     // uses", not "a broken completion setting".
-    const modelSource =
+    let modelSource =
       (typeof body.model === 'string' && body.model.trim() !== '')
         ? 'request'
         : String(preferences.completionModel ?? '').trim() !== ''
@@ -545,8 +593,22 @@ export function apply(ctx, config) {
     const requestedProvider = String(
       (typeof body.provider === 'string' ? body.provider : '') || preferences.completionProvider || '',
     ).trim() || selection.provider
+    // Nothing is configured, and the session's own model is usually a thinking
+    // one: its hidden reasoning eats the whole six-second window and the row ends
+    // as «модель не вернула продолжение», which reads as a broken feature. When
+    // the settings name no model, a fast model of the same provider is chosen
+    // instead and the trajectory says so; the setting always overrides it.
+    let effectiveModel = requestedModel
+    if (modelSource === 'session') {
+      const family = String(selection.model).toLowerCase().split('-')[0]
+      const fast = await pickFastModel(ctx, requestedProvider, family)
+      if (fast !== '' && fast !== selection.model) {
+        effectiveModel = fast
+        modelSource = 'auto'
+      }
+    }
     const attempts = []
-    if (requestedModel !== '') attempts.push({ provider: requestedProvider, model: requestedModel })
+    if (effectiveModel !== '') attempts.push({ provider: requestedProvider, model: effectiveModel })
     if (requestedProvider !== selection.provider) {
       // A provider without a model cannot be called: ask its catalog for the
       // first advertised model so the choice still means something.

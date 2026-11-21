@@ -11,7 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 
-import { apply } from '../index.js'
+import { apply, rankModels } from '../index.js'
 
 const SESSION_ID = 'session-1'
 const ROUTES = [
@@ -624,4 +624,23 @@ test('a typing pause asks for edits only when the setting turns them on', async 
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('an unconfigured hint prefers a fast model over the session one', () => {
+  // The real catalog of the gateway this machine uses. The session runs on
+  // deepseek-v4.1-flash, a thinking model that needs 3.2 s to its first text and
+  // often runs into the deadline; glm-5.3-flash answered the same prompt in 0.7 s.
+  const catalog = [
+    'deepseek-v4.1-flash', 'deepseek-v4-pro', 'glm-5.3', 'glm-5.3-flash', 'grok-4.7',
+    'gpt-5.6-luna', 'gpt-6-luna', 'claude-haiku-5-5', 'hy3', 'hy4', 'hy4-preview',
+    'hy4-flash-free', 'kimi-k2.7-code', 'kimi-k3', 'kimi-k3.1-pro', 'mimo-v2.6-flash',
+    'mimo-v2.6-pro', 'minimax-m3', 'minimax-m3.1-flash', 'longcat-2.0', 'longcat-2.5-free',
+    'step-5-preview', 'beam-free', 'qwen3.8-max', 'qwen3.8-flash', 'qwen3.7-plus',
+    'qwen4-max', 'gemini-4-argon', 'muse-spark-1.2', 'muse-spark-1.3-contributor',
+    'iceman-contributor-free',
+  ]
+  assert.equal(rankModels(catalog, 'deepseek')[0], 'glm-5.3-flash')
+  // A catalog with nothing better than the session model keeps it, so a provider
+  // with a single model does not lose its only choice.
+  assert.equal(rankModels(['fixture-model'], 'fixture')[0], 'fixture-model')
 })

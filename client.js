@@ -1987,6 +1987,7 @@ function traceModelHint(row) {
   if (row === undefined || row === null) return ''
   const parts = []
   if (row.modelSource === 'session') parts.push('Своя модель подсказок не выбрана — взята модель сессии.')
+  if (row.modelSource === 'auto') parts.push('Модель подсказок не выбрана — взята быстрая модель провайдера.')
   if (row.modelSource === 'settings') parts.push('Модель выбрана в настройках подсказок.')
   if (row.modelSource === 'request') parts.push('Модель передана запросом.')
   if (row.fellBack === true) parts.push('Первая модель не ответила — сработала запасная.')
@@ -2131,7 +2132,7 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                       title: traceModelHint(row),
                     },
                     `${row.provider} / ${row.model}${
-                      row.fellBack === true ? ' · запасная' : row.modelSource === 'session' ? ' · из сессии' : ''
+                      row.fellBack === true ? ' · запасная' : row.modelSource === 'session' ? ' · из сессии' : row.modelSource === 'auto' ? ' · быстрая' : ''
                     }`,
                   ),
                   h('span', { className: 'dsh-ide-trace-mode' }, row.explicit ? 'Ctrl+Space' : 'авто'),
