@@ -462,7 +462,7 @@ test('a whole-file answer returns located edits beside the cursor continuation',
       assert.equal(answered.body.trajectory.edits, 1)
       // The structured reply gets the larger budget: the edit list does not fit
       // the line allowance, and a cut reply used to lose every edit in it.
-      assert.equal(app.streamCalls[0].maxTokens, 680)
+      assert.equal(app.streamCalls[0].maxTokens, 1200)
     })
   } finally {
     await rm(root, { recursive: true, force: true })

@@ -662,7 +662,7 @@ export function apply(ctx, config) {
             // allowance: the reply was cut mid-string and every edit was lost.
             // The extra headroom is what keeps a multi-edit reply whole.
             maxTokens: multiEdit
-              ? Math.min(1500, Math.max(600, preferences.answerLines * 40 + 480))
+              ? Math.min(3000, Math.max(1200, preferences.answerLines * 40 + 1000))
               : Math.min(900, Math.max(80, preferences.answerLines * 40 + 40)),
             temperature: 0.1,
             signal: combined,

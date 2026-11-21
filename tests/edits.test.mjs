@@ -50,6 +50,20 @@ test('a truncated list keeps the complete leading edits', () => {
   assert.equal(parsed.edits[0].replace, 'def main(path):')
 })
 
+test('an edit cut inside why is still recovered', () => {
+  // The second live failure: the cut fell inside the optional `why` string, so
+  // the object never closed and the one useful edit was lost.
+  const parsed = parseEditResponse(
+    'INSERT:\nEDITS:\n' +
+      '[{"find":"def main():","replace":"def main(path):","why":"нужны импорты json и Path',
+  )
+  assert.equal(parsed.edits.length, 1)
+  assert.deepEqual(
+    { find: parsed.edits[0].find, replace: parsed.edits[0].replace, why: parsed.edits[0].why },
+    { find: 'def main():', replace: 'def main(path):', why: '' },
+  )
+})
+
 test('entries without a find or a replace are dropped', () => {
   const parsed = parseEditResponse(
     'a\nEDITS:\n[{"find":"","replace":"x"},{"find":"y","replace":""},{"find":"z","replace":"z"},{"find":"q","replace":"w"}]',

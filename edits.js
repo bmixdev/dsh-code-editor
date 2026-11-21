@@ -53,7 +53,7 @@ export function editInstructions({ maxEdits = DEFAULT_MAX_EDITS } = {}) {
     `${EDIT_SECTION}\n` +
     '[{"find":"<дословный фрагмент файла>","replace":"<новый текст>","why":"<короткая причина>"}]\n' +
     'Правила: `find` — точный фрагмент из файла, который встречается ровно один раз и занимает 1–5 строк; ' +
-    '`replace` — чем его заменить; правок не больше ' +
+    '`replace` — чем его заменить; `why` — не длиннее 60 символов; правок не больше ' +
     `${limit}; ` +
     `если правок не нужно, ответь \`${EDIT_SECTION} []\`. Не повторяй в правках то, что уже вставлено у курсора.`
   )
@@ -136,7 +136,40 @@ function readEditArray(tail) {
       if (entries.length > 0) depth = 0
     }
   }
+  if (entries.length === 0) return readEditPairs(tail)
+  const seen = new Set(
+    entries.map(entry => (entry !== null && typeof entry === 'object' && typeof entry.find === 'string' ? entry.find : '')),
+  )
+  for (const pair of readEditPairs(tail)) {
+    if (seen.has(pair.find)) continue
+    seen.add(pair.find)
+    entries.push(pair)
+  }
   return entries
+}
+
+/**
+ * Last-resort read of the edit list.
+ *
+ * A reply that runs out of tokens usually dies inside the last string — often
+ * inside `why`, which is optional. The object scanner above cannot close that
+ * object, so a complete `find` and `replace` would be dropped with it. This
+ * pass takes any pair whose two strings are fully quoted, wherever the cut fell.
+ */
+function readEditPairs(tail) {
+  const pattern = /"find"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"replace"\s*:\s*"((?:[^"\\]|\\.)*)"/g
+  const pairs = []
+  for (const match of tail.matchAll(pattern)) {
+    try {
+      pairs.push({
+        find: JSON.parse(`"${match[1]}"`),
+        replace: JSON.parse(`"${match[2]}"`),
+      })
+    } catch {
+      // An escaped sequence that does not decode is not a usable snippet.
+    }
+  }
+  return pairs
 }
 
 /** Normalize one entry; returns null when it is not a usable edit. */
