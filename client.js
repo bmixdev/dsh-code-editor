@@ -3144,9 +3144,21 @@ function IdeBody(props) {
         }
         runtime.current.tab.plan = plan
         runtime.current.tab.accepted = 0
-        if (plan.insertText !== '') showGhost(model.getPositionAt(plan.range.start), plan.insertText)
         decorateRemoved(plan, model)
+        // The staging runs first: a block proposal inserts real lines, and the
+        // ghost then has to be positioned in the buffer those lines produced.
         decorateEdits(plan, model)
+        if (plan.insertText !== '') {
+          const phantom = runtime.current.tab.phantom
+          const shift =
+            phantom === undefined
+              ? 0
+              : phantom.inserted.reduce(
+                  (sum, entry) => (entry.block.edit.start < plan.range.start ? sum + entry.text.length : sum),
+                  0,
+                )
+          showGhost(model.getPositionAt(plan.range.start + shift), plan.insertText)
+        }
       }
 
       const scheduleGhost = (kind = 'auto') => {
