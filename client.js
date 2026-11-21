@@ -2537,11 +2537,15 @@ function IdeBody(props) {
               // the card runs past the right edge and its text is cut off.
               const width = editor.getLayoutInfo().width
               node.style.maxWidth = `${Math.max(220, Math.round(width) - 48)}px`
+              // Anchored at the start of the line, not at the column of the edit:
+              // a card that begins mid-line runs off the right edge of a narrow
+              // editor. A multi-line edit anchors after its last line, so the
+              // proposal reads like a diff and does not hide the code it replaces.
+              const anchorLine = start.lineNumber === model.getPositionAt(edit.end).lineNumber
+                ? start.lineNumber
+                : model.getPositionAt(edit.end).lineNumber
               return {
-                // Anchored at the start of the line, not at the column of the
-                // edit: a card that begins mid-line runs off the right edge of a
-                // narrow editor.
-                position: { lineNumber: start.lineNumber, column: 1 },
+                position: { lineNumber: anchorLine, column: 1 },
                 preference: [
                   monacoInstance.editor.ContentWidgetPositionPreference.BELOW,
                   monacoInstance.editor.ContentWidgetPositionPreference.ABOVE,
