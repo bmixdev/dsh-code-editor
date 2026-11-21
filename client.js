@@ -2508,6 +2508,9 @@ function IdeBody(props) {
         })
         runtime.current.tab.editWidgets = widgets
         runtime.current.tab.edits = edits
+        // An answer that is only edits has no ghost text at the caret, but Tab
+        // must still accept it: the command is guarded by this context key.
+        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(true)
       }
 
       const complete = async (model, position, context, cancelToken) => {
