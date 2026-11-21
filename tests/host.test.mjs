@@ -408,19 +408,19 @@ test('the completion sends the provider default effort and reports its trajector
       // No level is pinned by default: every extra level would cost a rejected
       // request first, and a provider rejects an unknown level before the network.
       assert.equal(app.streamCalls[0].reasoningEffort, undefined)
-      // The budget follows `answerLines` (5 by default) plus the headroom for a
-      // structured reply: a list of edits with imports does not fit the line
-      // allowance, and the reply was cut mid-string when it did not.
-      assert.equal(app.streamCalls[0].maxTokens, 520)
+      // A typing pause asks for a continuation only, so the budget follows
+      // `answerLines` (5 by default). The edit list gets its own headroom on an
+      // explicit request, where the reply is structured.
+      assert.equal(app.streamCalls[0].maxTokens, 240)
       assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
       assert.equal(answered.body.trajectory.effort, '')
       assert.equal(answered.body.modelSource, 'session')
       assert.equal(answered.body.trajectory.before, 'export const answer = 42\n'.length)
       assert.equal(answered.body.trajectory.finishReason, 'stop')
       assert.equal(answered.body.conversation.answer, 'return 1')
-      // Whole-file edits are on by default, so the request carries the buffer
-      // with the cursor marked instead of the two windows around it.
-      assert.ok(answered.body.conversation.message.includes('--- файл целиком; курсор отмечен ⟦КУРСОР⟧ ---'))
+      // A typing pause sends the windows around the cursor, not the whole file;
+      // the structured request for edits is checked on the explicit path below.
+      assert.ok(answered.body.conversation.message.includes('--- текст до курсора ---'))
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -446,8 +446,11 @@ test('a whole-file answer returns located edits beside the cursor continuation',
         token: opened.body.token,
         text,
         offset: 0,
+        kind: 'explicit',
       })
       assert.equal(answered.status, 200)
+      // Only the explicit request carries the whole buffer with the cursor mark.
+      assert.ok(answered.body.conversation.message.includes('--- файл целиком; курсор отмечен ⟦КУРСОР⟧ ---'))
       // The continuation is the part before EDITS:, without the label and with
       // its indentation intact.
       assert.equal(answered.body.text, 'return answer')
@@ -457,6 +460,9 @@ test('a whole-file answer returns located edits beside the cursor continuation',
       assert.equal(edit.newText, 'answer = 43')
       assert.equal(edit.why, 'rename')
       assert.equal(answered.body.trajectory.edits, 1)
+      // The structured reply gets the larger budget: the edit list does not fit
+      // the line allowance, and a cut reply used to lose every edit in it.
+      assert.equal(app.streamCalls[0].maxTokens, 680)
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -524,6 +530,7 @@ test('the system instruction is a setting and its placeholders are filled', asyn
         token: opened.body.token,
         text: 'export const answer = 42\n',
         offset: 'export const answer = 42\n'.length,
+        kind: 'explicit',
       })
       // The edit instructions are appended to whatever the user wrote, so the
       // saved text must still open the system message and be fully filled.
@@ -540,6 +547,79 @@ test('the system instruction is a setting and its placeholders are filled', asyn
         offset: 'export const answer = 42\n'.length,
       })
       assert.ok(app.streamCalls[2].system.startsWith('Ты — движок строчных подсказок'))
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an answer that only carries edits is shown, not reported as empty', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({
+        root,
+        answer: 'INSERT:\n\nEDITS:\n[{"find":"answer = 42","replace":"answer = 43","why":"rename"}]',
+      })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      const text = 'export const answer = 42\n'
+      const answered = await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text,
+        offset: text.length,
+        kind: 'explicit',
+      })
+      assert.equal(answered.status, 200)
+      // The continuation is empty on purpose: the whole answer is the edit.
+      assert.equal(answered.body.text, '')
+      assert.equal(answered.body.edits.length, 1, JSON.stringify(answered.body).slice(0, 400))
+      // "Nothing came back" would send the user looking for a model problem;
+      // the edit is there and Tab will apply it.
+      assert.equal(answered.body.reason, '')
+      assert.equal(answered.body.suppressed, undefined)
+      assert.equal(answered.body.trajectory.suppressed, 'edits-only')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a typing pause asks for edits only when the setting turns them on', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({
+        root,
+        answer:
+          'INSERT:\nreturn answer\nEDITS:\n' +
+          '[{"find":"answer = 42","replace":"answer = 43","why":"rename"}]',
+      })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      const text = 'export const answer = 42\n'
+      const ask = () =>
+        app.call('complete', {
+          id: opened.body.id,
+          sessionId: SESSION_ID,
+          token: opened.body.token,
+          text,
+          offset: text.length,
+          kind: 'auto',
+        })
+
+      // By default a pause buys a fast continuation: the structured reply costs
+      // the model a few extra seconds, so it is reserved for an explicit ask.
+      const plain = await ask()
+      assert.equal(plain.body.edits.length, 0)
+      assert.equal(app.streamCalls[0].system.includes('EDITS:'), false)
+
+      await app.call('prefs', { patch: { multiEditAuto: true } })
+      const structured = await ask()
+      assert.equal(structured.body.edits.length, 1)
+      assert.equal(app.streamCalls[1].system.includes('EDITS:'), true)
     })
   } finally {
     await rm(root, { recursive: true, force: true })

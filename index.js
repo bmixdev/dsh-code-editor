@@ -493,8 +493,11 @@ export function apply(ctx, config) {
     // With whole-file edits on, the model gets the buffer with a cursor marker
     // and may answer with changes anywhere in the file — that is the part that
     // turns `main(f)` typed under a bare `def main():` into a proposal to fix
-    // the signature, not just characters at the caret.
-    const multiEdit = preferences.multiEdit === true && preferences.maxEdits > 0
+    // the signature, not just characters at the caret. A structured reply costs
+    // the model a few extra seconds, so while typing it is opt-in: the ordinary
+    // pause gets a fast continuation, and `Ctrl+Space` always asks for edits.
+    const wantsEdits = preferences.multiEdit === true && preferences.maxEdits > 0
+    const multiEdit = wantsEdits && (kind !== 'auto' || preferences.multiEditAuto === true)
     const selection = ctx.agentDefaultModel.currentSelection()
     if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
       return fail('no-model', 'Модель не выбрана — подсказки недоступны, редактор работает.')
@@ -659,7 +662,7 @@ export function apply(ctx, config) {
             // allowance: the reply was cut mid-string and every edit was lost.
             // The extra headroom is what keeps a multi-edit reply whole.
             maxTokens: multiEdit
-              ? Math.min(1500, Math.max(400, preferences.answerLines * 40 + 320))
+              ? Math.min(1500, Math.max(600, preferences.answerLines * 40 + 480))
               : Math.min(900, Math.max(80, preferences.answerLines * 40 + 40)),
             temperature: 0.1,
             signal: combined,
@@ -781,6 +784,12 @@ export function apply(ctx, config) {
           cursor: cursorOffset,
         })
       : []
+    // An answer may carry edits only: "move the call site, insert nothing here".
+    // The plan is then an empty insertion at the cursor, which the continuation
+    // heuristics rightly call empty — but the edits are the whole answer, so the
+    // reply counts as usable and must not be reported as "nothing came back".
+    const hasEdits = edits.length > 0
+    const showable = accepted || hasEdits
 
     // The GUI shows nothing when the answer is empty, so every attempt records
     // what it was and what came back; without this line "smart Tab does not
@@ -808,13 +817,14 @@ export function apply(ctx, config) {
       planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
       removedChars: plan.removedText.length,
       editCount: edits.length,
-      suppressed: accepted ? '' : verdict.reason,
+      suppressed: showable ? (accepted ? '' : 'edits-only') : verdict.reason,
     })
     // An empty answer is a normal outcome the user has to be able to read, so
     // it comes back with the same diagnostics block as a real completion. A
-    // suppressed answer names the check that dropped it.
-    const reason =
-      streamError !== ''
+    // suppressed answer names the check that dropped it. An answer that only
+    // carries edits is not suppressed: the panel says so, and Tab applies them.
+    const reason = !showable
+      ? streamError !== ''
         ? `Модель не ответила: ${streamError}`
         : finishReason === 'length'
           ? multiEdit && edits.length === 0
@@ -822,9 +832,8 @@ export function apply(ctx, config) {
             : 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
           : text.trim() === ''
             ? 'Модель не вернула продолжение.'
-            : accepted
-              ? ''
-              : reasonLabel(verdict.reason)
+            : reasonLabel(verdict.reason)
+      : ''
     return {
       // `text` stays the final insert text: the client only has to apply it.
       // A suppressed answer returns an empty string and a reason, never the
@@ -849,7 +858,7 @@ export function apply(ctx, config) {
         (used.provider !== attemptsForKind[0].provider || used.model !== attemptsForKind[0].model),
       durationMs: Date.now() - startedAt,
       reason,
-      suppressed: accepted ? undefined : { reason: verdict.reason },
+      suppressed: showable ? undefined : { reason: verdict.reason },
       // The IDE renders these in its output panel: the trajectory explains what
       // was attempted and what came back, the conversation shows the exact text.
       trajectory: {
@@ -872,7 +881,7 @@ export function apply(ctx, config) {
         planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
         removedChars: plan.removedText.length,
         edits: edits.length,
-        suppressed: accepted ? '' : verdict.reason,
+        suppressed: showable ? (accepted ? '' : 'edits-only') : verdict.reason,
       },
       conversation: { system: systemPrompt, message: requestText, answer: text },
     }

@@ -125,6 +125,8 @@ export const DEFAULT_PREFERENCES = Object.freeze({
    * propose a matching signature instead of only adding characters at the caret.
    */
   multiEdit: true,
+  /** Ask for edits on an ordinary typing pause too, not only on `Ctrl+Space`. */
+  multiEditAuto: false,
   /** Most edits to accept from one answer. 0 turns the edit part off. */
   maxEdits: 3,
   /** Send the whole file instead of the windows around the cursor. */
@@ -165,6 +167,7 @@ const BOOLEAN_KEYS = [
   'heuristicExtendsRange',
   'heuristicRevertingChange',
   'multiEdit',
+  'multiEditAuto',
   'wholeFileContext',
 ]
 
