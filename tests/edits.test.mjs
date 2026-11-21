@@ -39,6 +39,17 @@ test('unparsable JSON yields no edits instead of throwing', () => {
   assert.deepEqual(parsed.edits, [])
 })
 
+test('a truncated list keeps the complete leading edits', () => {
+  // The live failure: the answer ran out of tokens inside the second edit and
+  // every edit before the cut was thrown away with the half-written one.
+  const parsed = parseEditResponse(
+    'INSERT:\nEDITS:\n[{"find":"def main():","replace":"def main(path):","why":"argument"},{"find":"    with open(\\"data.json\\", \\"r\\",',
+  )
+  assert.equal(parsed.edits.length, 1)
+  assert.equal(parsed.edits[0].find, 'def main():')
+  assert.equal(parsed.edits[0].replace, 'def main(path):')
+})
+
 test('entries without a find or a replace are dropped', () => {
   const parsed = parseEditResponse(
     'a\nEDITS:\n[{"find":"","replace":"x"},{"find":"y","replace":""},{"find":"z","replace":"z"},{"find":"q","replace":"w"}]',

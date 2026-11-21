@@ -408,9 +408,10 @@ test('the completion sends the provider default effort and reports its trajector
       // No level is pinned by default: every extra level would cost a rejected
       // request first, and a provider rejects an unknown level before the network.
       assert.equal(app.streamCalls[0].reasoningEffort, undefined)
-      // The budget follows `answerLines` (5 by default) plus the allowance for
-      // the edit list, instead of a flat 900.
-      assert.equal(app.streamCalls[0].maxTokens, 360)
+      // The budget follows `answerLines` (5 by default) plus the headroom for a
+      // structured reply: a list of edits with imports does not fit the line
+      // allowance, and the reply was cut mid-string when it did not.
+      assert.equal(app.streamCalls[0].maxTokens, 520)
       assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
       assert.equal(answered.body.trajectory.effort, '')
       assert.equal(answered.body.modelSource, 'session')

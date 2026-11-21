@@ -90,17 +90,53 @@ function cleanAnswer(part) {
 /** Read the edit array out of the tail of the answer, tolerating chatter around it. */
 function readEditArray(tail) {
   const from = tail.indexOf('[')
-  const to = tail.lastIndexOf(']')
-  if (from === -1 || to <= from) return []
-  let parsed
-  try {
-    parsed = JSON.parse(tail.slice(from, to + 1))
-  } catch {
-    return []
+  if (from === -1) return []
+  const source = tail.slice(from + 1)
+  // A truncated reply is a normal outcome: the model spends part of its token
+  // budget on the first edits and the stream stops mid-string. Parsing the
+  // whole array then fails and every complete edit before the cut is lost, so
+  // the list is read object by object and the half-written tail is dropped.
+  const entries = []
+  let depth = 0
+  let inString = false
+  let escaped = false
+  let start = -1
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (inString && char === '\\') {
+      escaped = true
+      continue
+    }
+    if (char === '"') {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+    if (char === '{') {
+      if (depth === 0) start = index
+      depth += 1
+      continue
+    }
+    if (char === '}') {
+      depth -= 1
+      if (depth !== 0) continue
+      if (start !== -1) {
+        const slice = source.slice(start, index + 1)
+        try {
+          entries.push(JSON.parse(slice))
+        } catch {
+          // A broken object is skipped; the well-formed ones around it still count.
+        }
+        start = -1
+      }
+      if (entries.length > 0) depth = 0
+    }
   }
-  if (Array.isArray(parsed)) return parsed
-  if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed.edits)) return parsed.edits
-  return []
+  return entries
 }
 
 /** Normalize one entry; returns null when it is not a usable edit. */

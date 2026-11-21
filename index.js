@@ -654,9 +654,13 @@ export function apply(ctx, config) {
             // The answer is at most `answerLines` lines of code, so the budget is
             // sized to that instead of a flat 900: a shorter budget comes back
             // sooner, and a thinking model still cannot spend it all on reasoning
-            // when the level is `off`. The edit list rides in the same reply, so
-            // it adds a fixed allowance of its own.
-            maxTokens: Math.min(900, Math.max(80, preferences.answerLines * 40 + (multiEdit ? 160 : 40))),
+            // when the level is `off`. A structured answer also carries the edit
+            // list, and a list of three edits with imports does not fit the line
+            // allowance: the reply was cut mid-string and every edit was lost.
+            // The extra headroom is what keeps a multi-edit reply whole.
+            maxTokens: multiEdit
+              ? Math.min(1500, Math.max(400, preferences.answerLines * 40 + 320))
+              : Math.min(900, Math.max(80, preferences.answerLines * 40 + 40)),
             temperature: 0.1,
             signal: combined,
             sessionId: document.sessionId,
@@ -788,12 +792,10 @@ export function apply(ctx, config) {
       model: used.model,
       modelSource,
       effort: effortUsed ?? '',
-      flushed,
       rawChars: text.length,
       answerChars: result.length,
       ms: Date.now() - startedAt,
       attempts: attempts.length,
-      effort: effortUsed ?? '',
       efforts: effortsAdvertised,
       flushed,
       chunkTypes: [...chunkTypes],
@@ -815,7 +817,9 @@ export function apply(ctx, config) {
       streamError !== ''
         ? `Модель не ответила: ${streamError}`
         : finishReason === 'length'
-          ? 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
+          ? multiEdit && edits.length === 0
+            ? 'Модель не уложилась в лимит ответа — увеличьте «строк в ответе» или уменьшите число правок.'
+            : 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
           : text.trim() === ''
             ? 'Модель не вернула продолжение.'
             : accepted
