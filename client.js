@@ -2698,7 +2698,18 @@ function IdeBody(props) {
         if (editor === undefined || monacoInstance === undefined) return false
         const model = editor.getModel()
         if (model === null || operations.length === 0) return false
-        const ranges = operations.map((operation) => {
+        // Monaco refuses overlapping edits in one call. The Host already drops
+        // an edit that covers the cursor, but a replacement range can still meet
+        // an edit on the same line; the first operation wins there.
+        const ordered = [...operations].sort((left, right) => left.start - right.start)
+        const accepted = []
+        for (const operation of ordered) {
+          const last = accepted[accepted.length - 1]
+          if (last !== undefined && operation.start < last.end) continue
+          accepted.push(operation)
+        }
+        if (accepted.length === 0) return false
+        const ranges = accepted.map((operation) => {
           const start = model.getPositionAt(operation.start)
           const end = model.getPositionAt(operation.end)
           return {
