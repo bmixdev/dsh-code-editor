@@ -23,6 +23,9 @@ window.__ModuleLoader__.load({
 
     const TAB_ID = '@local/dsh-ide'
     const TAB_KIND = 'dsh-ide'
+    // Bumped with every change that has to reach the browser: the number is
+    // shown in the settings drawer, so "did the tab reload?" stops being a guess.
+    const UI_BUILD = '2026-11-21.5'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -1633,6 +1636,12 @@ window.__ModuleLoader__.load({
       ]
 
       const contextRows = [
+        setting(
+          'build',
+          'Сборка интерфейса',
+          'Если номер не совпадает с последним изменением, вкладка IDE работает на старом коде: нажмите Ctrl+Shift+R.',
+          h('span', { className: 'dsh-ide-setting-value' }, UI_BUILD),
+        ),
         setting(
           'context-left',
           'Контекст: символов до курсора',
@@ -4443,6 +4452,7 @@ function IdeBody(props) {
 .dsh-ide-setting-check { display:inline-flex; align-items:center; gap:6px; color:var(--ide-text);
   font:400 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-settings-actions { display:flex; gap:6px; }
+.dsh-ide-setting-value { font:500 12px/1.4 var(--dsh-font-mono, ui-monospace, monospace); color:var(--ide-muted, #9aa4b2); }
 .dsh-ide-settings-foot { display:flex; align-items:center; gap:8px; padding:8px 14px;
   border-top:1px solid var(--ide-border); background:var(--ide-panel); }
 .dsh-ide-settings-foot-spacer { flex:1 1 auto; }
