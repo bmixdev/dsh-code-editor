@@ -2980,7 +2980,18 @@ function IdeBody(props) {
         })
         if (runtime.current.ghostKey !== undefined) {
           editor.addCommand(monaco.KeyCode.Tab, () => handlersRef.current.acceptGhost?.(), 'editorTextFocus && dshIdeGhostVisible')
-          editor.addCommand(monaco.KeyCode.Escape, () => handlersRef.current.rejectGhost?.(), 'editorTextFocus && dshIdeGhostVisible')
+          // Escape drops the hint, and when there is no hint it collapses a
+          // selection. A selection that would not go away had no obvious way out
+          // once the pane stopped reacting to clicks.
+          editor.addCommand(
+            monaco.KeyCode.Escape,
+            () => {
+              if (handlersRef.current.rejectGhost?.() === true) return
+              const selection = editor.getSelection()
+              if (selection !== null && !selection.isEmpty()) editor.setPosition(selection.getPosition())
+            },
+            'editorTextFocus',
+          )
           editor.addCommand(
             monaco.KeyMod.CtrlCmd | monaco.KeyCode.RightArrow,
             () => handlersRef.current.acceptWord?.(),
