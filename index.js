@@ -498,6 +498,15 @@ export function apply(ctx, config) {
     // pause gets a fast continuation, and `Ctrl+Space` always asks for edits.
     const wantsEdits = preferences.multiEdit === true && preferences.maxEdits > 0
     const multiEdit = wantsEdits && (kind !== 'auto' || preferences.multiEditAuto === true)
+    // 0 means "no ceiling": the request then carries no `maxTokens` at all and
+    // the model stops when it is done. It is the default because a cap below the
+    // model's own output limit silently truncates the answer, and a truncated
+    // structured reply is what lost every edit twice in a row.
+    const tokenBudget = Number.isFinite(Number(preferences.maxTokens)) ? Math.max(0, Math.round(Number(preferences.maxTokens))) : 0
+    // The character guard exists so a runaway stream cannot fill the buffer, not
+    // to shorten a good answer. A structured reply is several times longer than
+    // a one-line continuation, so it gets the larger ceiling.
+    const answerChars = multiEdit ? 8000 : COMPLETION_MAX_CHARS
     const selection = ctx.agentDefaultModel.currentSelection()
     if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
       return fail('no-model', 'Модель не выбрана — подсказки недоступны, редактор работает.')
@@ -654,16 +663,12 @@ export function apply(ctx, config) {
                 ],
               },
             ],
-            // The answer is at most `answerLines` lines of code, so the budget is
-            // sized to that instead of a flat 900: a shorter budget comes back
-            // sooner, and a thinking model still cannot spend it all on reasoning
-            // when the level is `off`. A structured answer also carries the edit
-            // list, and a list of three edits with imports does not fit the line
-            // allowance: the reply was cut mid-string and every edit was lost.
-            // The extra headroom is what keeps a multi-edit reply whole.
-            maxTokens: multiEdit
-              ? Math.min(3000, Math.max(1200, preferences.answerLines * 40 + 1000))
-              : Math.min(900, Math.max(80, preferences.answerLines * 40 + 40)),
+            // No token ceiling by default: a thinking model spends part of the
+            // same budget on hidden reasoning, and every cap large enough to fit
+            // an edit list still cut the reply mid-string on a long one. The
+            // deadline and the stream reader bound the answer instead, and the
+            // setting can put a ceiling back when a route bills by tokens.
+            ...(tokenBudget > 0 ? { maxTokens: tokenBudget } : {}),
             temperature: 0.1,
             signal: combined,
             sessionId: document.sessionId,
@@ -715,7 +720,7 @@ export function apply(ctx, config) {
               flushed = true
               break
             }
-            if (buffer.length > COMPLETION_MAX_CHARS) break
+            if (buffer.length > answerChars) break
           }
         } catch (cause) {
           streamError = cause instanceof Error ? cause.message : String(cause)

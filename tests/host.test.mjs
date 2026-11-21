@@ -408,10 +408,10 @@ test('the completion sends the provider default effort and reports its trajector
       // No level is pinned by default: every extra level would cost a rejected
       // request first, and a provider rejects an unknown level before the network.
       assert.equal(app.streamCalls[0].reasoningEffort, undefined)
-      // A typing pause asks for a continuation only, so the budget follows
-      // `answerLines` (5 by default). The edit list gets its own headroom on an
-      // explicit request, where the reply is structured.
-      assert.equal(app.streamCalls[0].maxTokens, 240)
+      // No ceiling by default: the request carries no `maxTokens` at all, so the
+      // model stops when it is done. A cap below the model's own limit is what
+      // cut the reply in the middle of the edit list.
+      assert.equal(app.streamCalls[0].maxTokens, undefined)
       assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
       assert.equal(answered.body.trajectory.effort, '')
       assert.equal(answered.body.modelSource, 'session')
@@ -460,9 +460,9 @@ test('a whole-file answer returns located edits beside the cursor continuation',
       assert.equal(edit.newText, 'answer = 43')
       assert.equal(edit.why, 'rename')
       assert.equal(answered.body.trajectory.edits, 1)
-      // The structured reply gets the larger budget: the edit list does not fit
-      // the line allowance, and a cut reply used to lose every edit in it.
-      assert.equal(app.streamCalls[0].maxTokens, 1200)
+      // Structured or not, an unlimited default means no `maxTokens` field: the
+      // reply is bounded by the deadline, not by a number chosen in advance.
+      assert.equal(app.streamCalls[0].maxTokens, undefined)
     })
   } finally {
     await rm(root, { recursive: true, force: true })

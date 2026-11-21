@@ -125,6 +125,12 @@ export const DEFAULT_PREFERENCES = Object.freeze({
    * propose a matching signature instead of only adding characters at the caret.
    */
   multiEdit: true,
+  /**
+   * Token ceiling for one answer; 0 means no ceiling at all. The request then
+   * carries no `maxTokens`, so the model stops when it is done instead of in
+   * the middle of the edit list.
+   */
+  maxTokens: 0,
   /** Ask for edits on an ordinary typing pause too, not only on `Ctrl+Space`. */
   multiEditAuto: false,
   /** Most edits to accept from one answer. 0 turns the edit part off. */
@@ -150,6 +156,7 @@ export const PREFERENCE_LIMITS = Object.freeze({
   recentRejectThreshold: [0, 10],
   recentRejectWindowMs: [0, 600000],
   maxEdits: [0, 5],
+  maxTokens: [0, 8000],
 })
 
 const BOOLEAN_KEYS = [
