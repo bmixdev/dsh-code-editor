@@ -132,7 +132,7 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
     return { status: response.status, body: await response.json() }
   }
 
-  return { call, routes, streamCalls }
+  return { call, routes, streamCalls, llm: ctx.llm }
 }
 
 async function withFile(variable, name, run) {
@@ -420,10 +420,10 @@ test('the completion sends the provider default effort and reports its trajector
       assert.equal(answered.body.modelSource, 'session')
       assert.equal(answered.body.trajectory.before, 'export const answer = 42\n'.length)
       assert.equal(answered.body.trajectory.finishReason, 'stop')
-      assert.equal(answered.body.conversation.answer, 'return 1')
+      assert.equal(Object.hasOwn(answered.body, 'conversation'), false)
       // A typing pause sends the windows around the cursor, not the whole file;
       // the structured request for edits is checked on the explicit path below.
-      assert.ok(answered.body.conversation.message.includes('--- текст до курсора ---'))
+      assert.ok(app.streamCalls[0].messages[0].content[0].text.includes('--- текст до курсора ---'))
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -452,8 +452,14 @@ test('a whole-file answer returns located edits beside the cursor continuation',
         kind: 'explicit',
       })
       assert.equal(answered.status, 200)
-      // Only the explicit request carries the whole buffer with the cursor mark.
-      assert.ok(answered.body.conversation.message.includes('--- файл целиком; курсор отмечен ⟦КУРСОР⟧ ---'))
+      // Even a whole-file request does not echo the file back by default.
+      assert.equal(Object.hasOwn(answered.body, 'conversation'), false)
+      assert.ok(app.streamCalls[0].messages[0].content[0].text.includes('--- файл целиком; курсор отмечен ⟦КУРСОР⟧ ---'))
+      await app.call('prefs', { patch: { fullTrace: true } })
+      const detailed = await app.call('complete', { id: opened.body.id, sessionId: SESSION_ID, token: opened.body.token, text, offset: 0, kind: 'explicit' })
+      assert.equal(detailed.body.conversation.message, app.streamCalls.at(-1).messages[0].content[0].text)
+      assert.equal(detailed.body.conversation.system, app.streamCalls.at(-1).system)
+      assert.match(detailed.body.conversation.answer, /EDITS:/)
       // The continuation is the part before EDITS:, without the label and with
       // its indentation intact.
       assert.equal(answered.body.text, 'return answer')
@@ -590,6 +596,49 @@ test('an answer that only carries edits is shown, not reported as empty', async 
   }
 })
 
+test('auto flush returns buffered text even if the adapter stalls; structured edits wait for finish', { timeout: 5000 }, async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'prefs.json', async () => {
+      const app = setup({ root })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      await app.call('prefs', { patch: { flushAfterMs: 10, deadlineMs: 1000 } })
+      const text = 'const value = '
+      const ask = kind => app.call('complete', { id: opened.body.id, sessionId: SESSION_ID, token: opened.body.token, text, offset: text.length, kind })
+      let release, seenSignal
+      const stalled = new Promise(resolve => { release = resolve })
+      app.llm.stream = async function* ({ signal }) {
+        seenSignal = signal
+        yield { type: 'text-delta', text: '42' }
+        await stalled // Simulate a transport that ignores cancellation.
+        yield { type: 'text-delta', text: 'late' }
+      }
+      try {
+        const { body } = await ask('auto')
+        assert.equal(body.text, '42')
+        assert.equal(body.trajectory.flushed, true)
+        assert.equal(body.trajectory.streamError, '')
+        assert.equal(seenSignal.aborted, true)
+      } finally { release() }
+      app.llm.stream = async function* () {
+        yield { type: 'text-delta', text: 'INSERT:\n' }
+        await new Promise(resolve => setTimeout(resolve, 30))
+        yield { type: 'text-delta', text: '42\nEDITS:\n[]' }
+      }
+      const { body } = await ask('explicit')
+      assert.equal(body.text, '42')
+      assert.equal(body.trajectory.flushed, false)
+      resetModelCatalog()
+      app.llm.listModels = () => new Promise(() => {})
+      const keepAlive = setTimeout(() => {}, 3500)
+      try {
+        assert.equal((await ask('auto')).body.error.code, 'timeout')
+      } finally { clearTimeout(keepAlive) }
+    })
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('a typing pause asks for edits only when the setting turns them on', async () => {
   const root = await makeWorkspace()
   try {
@@ -603,14 +652,14 @@ test('a typing pause asks for edits only when the setting turns them on', async 
       const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
       await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
       const text = 'export const answer = 42\n'
-      const ask = () =>
+      const ask = (kind = 'auto') =>
         app.call('complete', {
           id: opened.body.id,
           sessionId: SESSION_ID,
           token: opened.body.token,
           text,
           offset: text.length,
-          kind: 'auto',
+          kind,
         })
 
       // By default a pause buys a fast continuation: the structured reply costs
@@ -619,10 +668,12 @@ test('a typing pause asks for edits only when the setting turns them on', async 
       assert.equal(plain.body.edits.length, 0)
       assert.equal(app.streamCalls[0].system.includes('EDITS:'), false)
 
+      await ask('refetch')
+      assert.equal(app.streamCalls.at(-1).system.includes('EDITS:'), false)
       await app.call('prefs', { patch: { multiEditAuto: true } })
       const structured = await ask()
       assert.equal(structured.body.edits.length, 1)
-      assert.equal(app.streamCalls[1].system.includes('EDITS:'), true)
+      assert.equal(app.streamCalls.at(-1).system.includes('EDITS:'), true)
     })
   } finally {
     await rm(root, { recursive: true, force: true })

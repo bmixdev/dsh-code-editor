@@ -92,7 +92,24 @@ export function resetModelCatalog() {
   catalogCache = { provider: '', models: [], at: 0 }
 }
 
-/** Ranks a provider's catalog and returns its fastest-looking model id. */async function pickFastModel(ctx, provider, avoidFamily = '') {
+// listModels has no signal, and a stream adapter can be slow to acknowledge
+// cancellation. Bound the caller's wait independently of provider cleanup.
+async function untilAbort(signal, work) {
+  signal.throwIfAborted()
+  let onAbort
+  const stopped = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([stopped, work()])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** Ranks a provider's catalog and returns its fastest-looking model id. */
+async function pickFastModel(ctx, provider, avoidFamily = '') {
   const now = Date.now()
   if (catalogCache.provider !== provider || now - catalogCache.at > CATALOG_TTL_MS) {
     let models = []
@@ -298,6 +315,7 @@ export function apply(ctx, config) {
     if (code === 'FS_SANDBOX_DENIED' || code === 'FS_READ_ONLY') {
       return { code: 'read-only', message: 'Сессия работает в режиме только для чтения — сохранение запрещено.' }
     }
+    if (error?.name === 'TimeoutError') return { code: 'timeout', message: 'Истекло время ожидания подсказки.' }
     if (code === 'ABORT_ERR' || code === 'ABORTED' || error?.name === 'AbortError') {
       return { code: 'cancelled', message: 'Запрос отменён.' }
     }
@@ -549,7 +567,7 @@ export function apply(ctx, config) {
     // the model a few extra seconds, so while typing it is opt-in: the ordinary
     // pause gets a fast continuation, and `Ctrl+Space` always asks for edits.
     const wantsEdits = preferences.multiEdit === true && preferences.maxEdits > 0
-    const multiEdit = wantsEdits && (kind !== 'auto' || preferences.multiEditAuto === true)
+    const multiEdit = wantsEdits && (kind === 'explicit' || preferences.multiEditAuto === true)
     // 0 means "no ceiling": the request then carries no `maxTokens` at all and
     // the model stops when it is done. It is the default because a cap below the
     // model's own output limit silently truncates the answer, and a truncated
@@ -559,6 +577,11 @@ export function apply(ctx, config) {
     // to shorten a good answer. A structured reply is several times longer than
     // a one-line continuation, so it gets the larger ceiling.
     const answerChars = multiEdit ? 8000 : COMPLETION_MAX_CHARS
+    const deadline = AbortSignal.timeout(boundedMs(preferences.deadlineMs, COMPLETION_DEADLINE_MS, 1000, 60000))
+    const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    const flushAfterMs = boundedMs(preferences.flushAfterMs, 250, 0, 5000)
+    const startedAt = Date.now()
+
     const selection = ctx.agentDefaultModel.currentSelection()
     if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
       return fail('no-model', 'Модель не выбрана — подсказки недоступны, редактор работает.')
@@ -605,7 +628,7 @@ export function apply(ctx, config) {
     let effectiveModel = requestedModel
     if (modelSource === 'session' && preferences.autoModel !== false) {
       const family = String(selection.model).toLowerCase().split('-')[0]
-      const fast = await pickFastModel(ctx, requestedProvider, family)
+      const fast = await untilAbort(combined, () => pickFastModel(ctx, requestedProvider, family))
       if (fast !== '' && fast !== selection.model) {
         effectiveModel = fast
         modelSource = 'auto'
@@ -613,16 +636,17 @@ export function apply(ctx, config) {
     }
     const attempts = []
     if (effectiveModel !== '') attempts.push({ provider: requestedProvider, model: effectiveModel })
-    if (requestedProvider !== selection.provider) {
+    if (requestedProvider !== selection.provider && (kind === 'explicit' || attempts.length === 0)) {
       // A provider without a model cannot be called: ask its catalog for the
       // first advertised model so the choice still means something.
       try {
-        const models = await ctx.llm.listModels(requestedProvider)
+        const models = await untilAbort(combined, () => ctx.llm.listModels(requestedProvider))
         const first = Array.isArray(models) ? models[0] : undefined
         if (first !== undefined && typeof first.id === 'string') {
           attempts.push({ provider: requestedProvider, model: first.id })
         }
       } catch {
+        combined.throwIfAborted()
         // The failure surfaces as "no model answered" below, with the provider
         // named in the log line.
       }
@@ -667,11 +691,6 @@ export function apply(ctx, config) {
           `--- текст до курсора ---\n${windowPrefix}\n--- курсор ---\n` +
           `--- текст после курсора ---\n${windowSuffix}`
 
-    const deadline = AbortSignal.timeout(boundedMs(preferences.deadlineMs, COMPLETION_DEADLINE_MS, 1000, 60000))
-    const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
-    const flushAfterMs = boundedMs(preferences.flushAfterMs, 250, 0, 5000)
-    const startedAt = Date.now()
-
     // A thinking model spends the output budget on hidden reasoning and then
     // returns nothing, and it is also what turned a hint into a 20 s wait.
     // DSH exposes an adapter-owned `off` level that sends `thinking: { type:
@@ -696,8 +715,8 @@ export function apply(ctx, config) {
     const chunkTypes = new Set()
     let streamError = ''
     let finishReason = ''
-    let firstChunk = ''
     for (const attempt of attemptsForKind) {
+      combined.throwIfAborted()
       // Asking the route for its reasoning catalogue is only needed when a level
       // has to be chosen. With the default (empty) preference there is nothing to
       // choose, and the extra round trip is pure latency on a keystroke.
@@ -705,20 +724,24 @@ export function apply(ctx, config) {
         effortsAdvertised = []
       } else {
         try {
-          const info = await ctx.llm.resolveModelInfo(attempt.provider, attempt.model, combined)
+          const info = await untilAbort(combined, () => ctx.llm.resolveModelInfo(attempt.provider, attempt.model, combined))
           effortsAdvertised = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts.map(effort => effort.id) : []
         } catch {
+          combined.throwIfAborted()
           effortsAdvertised = []
         }
       }
       for (const effort of effortChain) {
         let buffer = ''
-        let firstTextAt = 0
+        const stop = new AbortController()
+        const attemptSignal = AbortSignal.any([combined, stop.signal])
+        let timer
+        let iterator
         let unsupported = false
         streamError = ''
         finishReason = ''
         try {
-          for await (const chunk of ctx.llm.stream({
+          iterator = ctx.llm.stream({
             provider: attempt.provider,
             model: attempt.model,
             ...(effort === undefined ? {} : { reasoningEffort: effort }),
@@ -745,22 +768,21 @@ export function apply(ctx, config) {
             // setting can put a ceiling back when a route bills by tokens.
             ...(tokenBudget > 0 ? { maxTokens: tokenBudget } : {}),
             temperature: 0.1,
-            signal: combined,
+            signal: attemptSignal,
             sessionId: document.sessionId,
             purpose: 'code-editor-inline-completion',
-          })) {
+          })[Symbol.asyncIterator]()
+          while (true) {
+            const { done, value: chunk } = await untilAbort(attemptSignal, () => iterator.next())
+            if (done) { iterator = undefined; break }
             if (!chunk || typeof chunk !== 'object') continue
-            if (firstChunk === '') {
-              try {
-                firstChunk = JSON.stringify(chunk).slice(0, 400)
-              } catch {
-                firstChunk = '<unserializable chunk>'
-              }
-            }
             if (typeof chunk.type === 'string' && chunkTypes.size < 8) chunkTypes.add(chunk.type)
             if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-              if (firstTextAt === 0) firstTextAt = Date.now()
               buffer += chunk.text
+              if (!multiEdit && timer === undefined && chunk.text.length > 0) {
+                if (flushAfterMs === 0) { flushed = true; break }
+                timer = setTimeout(() => { flushed = true; stop.abort() }, flushAfterMs)
+              }
             }
             if (chunk.type === 'error') {
               const detail = chunk.message ?? chunk.error?.message ?? chunk.error
@@ -782,23 +804,20 @@ export function apply(ctx, config) {
               }
             }
             if (typeof chunk.finishReason === 'string' && chunk.finishReason !== '') finishReason = chunk.finishReason
-            // Cursor draws the beginning of an answer while the rest of the
-            // stream is still arriving. A whole answer is never worth 20 s of
-            // silence, so once text has started, a short grace period ends the
-            // stream and the hint appears with what is already there.
-            //
-            // With whole-file edits on the answer is a structured reply: cutting
-            // it after the `INSERT:` part leaves `EDITS:` with half a JSON array,
-            // which parses as "no edits at all". Those requests therefore wait
-            // for the stream to finish.
-            if (multiEdit !== true && firstTextAt !== 0 && Date.now() - firstTextAt >= flushAfterMs) {
-              flushed = true
-              break
-            }
             if (buffer.length > answerChars) break
           }
         } catch (cause) {
-          streamError = cause instanceof Error ? cause.message : String(cause)
+          // Preserve complete edits already received at the deadline, but never
+          // publish partial work when the caller cancelled the request.
+          if (signal?.aborted || buffer.trim() === '') combined.throwIfAborted()
+          if (!flushed) streamError = cause instanceof Error ? cause.message : String(cause)
+        } finally {
+          clearTimeout(timer)
+          if (iterator !== undefined) {
+            stop.abort()
+            // An adapter may still be unwinding next(); do not delay a ready hint.
+            void Promise.resolve().then(() => iterator.return?.()).catch(() => {})
+          }
         }
         unsupported = buffer.trim() === '' && isUnsupportedEffort(streamError)
         if (unsupported && effortChain.indexOf(effort) < effortChain.length - 1) continue
@@ -889,8 +908,7 @@ export function apply(ctx, config) {
       flushed,
       chunkTypes: [...chunkTypes],
       finishReason,
-      error: streamError,
-      firstChunk,
+      error: streamError !== '',
       kind,
       planKind: plan.kind,
       planChars: plan.insertText.length,
@@ -963,7 +981,7 @@ export function apply(ctx, config) {
         edits: edits.length,
         suppressed: showable ? (accepted ? '' : 'edits-only') : verdict.reason,
       },
-      conversation: { system: systemPrompt, message: requestText, answer: text },
+      ...(preferences.fullTrace === true ? { conversation: { system: systemPrompt, message: requestText, answer: text } } : {}),
     }
   }
 

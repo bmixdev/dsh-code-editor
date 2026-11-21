@@ -107,6 +107,8 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   maxFileChars: 1000000,
   /** Say in the output panel why a suggestion was dropped. */
   explainSuppressed: true,
+  /** Include source-bearing request and answer details in the local UI trace. */
+  fullTrace: false,
   /** Drop an answer that duplicates the line below the cursor. */
   heuristicDuplicateLine: true,
   /** Drop an answer that only retells the lines below the cursor. */
@@ -182,6 +184,7 @@ const BOOLEAN_KEYS = [
   'showWhitespaceOnlyChanges',
   'showRemovedDecorations',
   'explainSuppressed',
+  'fullTrace',
   'heuristicDuplicateLine',
   'heuristicExtendsRange',
   'heuristicRevertingChange',

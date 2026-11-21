@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-21.6'
+    const UI_BUILD = '2026-11-22.1'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -1748,6 +1748,7 @@ window.__ModuleLoader__.load({
         'triggerInComments',
         'showRemovedDecorations',
         'explainSuppressed',
+        'fullTrace',
       ]
       const CHECK_KEYS = [
         'showWhitespaceOnlyChanges',
@@ -2078,6 +2079,7 @@ const TAB_PREFERENCES = [
     title: 'Подсказки: подсветка замены',
     hint: 'Красить текст, который перепишет подсказка. По умолчанию выключено: подсветка легко выглядит как чужое выделение.',
   },
+  { key: 'fullTrace', kind: 'boolean', value: false, title: 'Полная диагностика подсказок', hint: 'Хранить в панели запрос, исходный код и ответ модели. Выключение очищает эти тексты в текущей панели.' },
   { key: 'explainSuppressed', kind: 'boolean', value: true, title: 'Подсказки: причины отказа', hint: 'Писать в «Траектории», почему подсказка скрыта.' },
   { key: 'heuristicDuplicateLine', kind: 'boolean', value: true, title: 'Проверка: дубль строки', hint: 'Отклонять повтор следующей строки.' },
   { key: 'heuristicExtendsRange', kind: 'boolean', value: true, title: 'Проверка: повтор диапазона', hint: 'Отклонять ответ, повторяющий исходные строки.' },
@@ -2150,7 +2152,7 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                   ),
                   h('span', { className: 'dsh-ide-trace-mode' }, row.explicit ? 'Ctrl+Space' : 'авто'),
                   h('span', { className: 'dsh-ide-trace-meta' }, `${row.before}/${row.after} символов`),
-                  h('span', { className: 'dsh-ide-trace-meta' }, `${row.durationMs} мс`),
+                  h('span', { className: 'dsh-ide-trace-meta' }, row.displayMs === undefined ? `${row.durationMs} мс` : `до показа: ${row.displayMs} мс · Host: ${row.durationMs} мс`),
                   row.ok
                     ? h('span', { className: 'dsh-ide-trace-ok' }, `+${row.chars} символов`)
                     : h('span', { className: 'dsh-ide-trace-error' }, row.reason || 'пустой ответ'),
@@ -2162,6 +2164,7 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
           { className: 'dsh-ide-panel-body dsh-ide-chat' },
           entry === undefined
             ? h('div', { className: 'dsh-ide-panel-empty' }, 'Запросов пока не было.')
+            : !conversation ? h('div', { className: 'dsh-ide-panel-empty' }, 'Для этой записи текст не сохранён. Для новых запросов включите «Полная диагностика подсказок» в настройках.')
             : h(
                 'div',
                 null,
@@ -2196,10 +2199,9 @@ function IdeBody(props) {
         activeKey: '',
         autoSuggest: true,
         lastCompletion: '',
-        ghost: '',
         ghostPosition: undefined,
-        ghostNode: undefined,
-        ghostWidget: undefined,
+        ghostDecorations: [],
+        ghostZone: undefined,
         ghostTimer: 0,
         ghostKey: undefined,
         // Controller state for the ported Tab mechanics: the plan the Host
@@ -2216,7 +2218,6 @@ function IdeBody(props) {
           editDecorations: [],
           rejections: new Map(),
           revertions: new Map(),
-          values: new Map(),
           internalEdit: false,
         },
       })
@@ -2740,16 +2741,18 @@ function IdeBody(props) {
         if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(true)
       }
 
-      const complete = async (model, position, context, cancelToken) => {
+      const cancelGhostRequest = () => {
+        window.clearTimeout(runtime.current.ghostTimer)
+        const controller = runtime.current.tab.controller
+        if (!controller) return
+        runtime.current.tab.controller = undefined
+        controller.abort()
+        runtime.current.setHintBusy?.(false)
+      }
+
+      const complete = async (model, position, kind, signal, isCurrent) => {
         const key = runtime.current.modelTabs.get(model.uri.toString())
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === key)
-        const requested = context === undefined || context === null ? {} : context
-        const kind =
-          requested.kind === 'explicit' || requested.kind === 'refetch'
-            ? requested.kind
-            : requested.triggerKind === 1
-              ? 'explicit'
-              : 'auto'
         const explicit = kind === 'explicit'
         if (entry === undefined || entry.readOnly) return { items: [] }
         if (kind === 'auto' && runtime.current.autoSuggest !== true) return { items: [] }
@@ -2762,11 +2765,6 @@ function IdeBody(props) {
         // only automatic suggestions are de-duplicated.
         if (kind === 'auto' && runtime.current.lastCompletion === stamp) return { items: [] }
         runtime.current.lastCompletion = stamp
-        const controller = new AbortController()
-        runtime.current.tab.controller = controller
-        if (cancelToken && typeof cancelToken.onCancellationRequested === 'function') {
-          cancelToken.onCancellationRequested(() => controller.abort())
-        }
         const rejections = (runtime.current.tab.rejections.get(key) || []).slice(-20)
         const revertions = (runtime.current.tab.revertions.get(key) || []).slice(-20)
         try {
@@ -2784,13 +2782,14 @@ function IdeBody(props) {
               rejections,
               revertions,
             },
-            controller.signal,
+            signal,
           )
+          if (!isCurrent()) return
           if (payload === undefined || typeof payload.text !== 'string') return { items: [] }
           const trajectory = payload.trajectory === undefined || payload.trajectory === null ? {} : payload.trajectory
           const planKind = typeof payload.planKind === 'string' ? payload.planKind : 'insert'
           const suppressed = typeof payload.suppressed === 'string' ? payload.suppressed : ''
-          pushTrace({
+          const trace = {
             at: new Date().toLocaleTimeString('ru-RU'),
             path: entry.path,
             provider: payload.provider,
@@ -2805,12 +2804,12 @@ function IdeBody(props) {
             chars: payload.text.length,
             ok: payload.text !== '',
             reason: typeof payload.reason === 'string' ? payload.reason : '',
-            conversation: payload.conversation,
+            conversation: tabPref('fullTrace', false) ? payload.conversation : undefined,
             kind,
             planKind,
             removedChars: asNumber(trajectory.removedChars),
             suppressed,
-          })
+          }
           const edits = []
           if (Array.isArray(payload.edits)) {
             for (const candidate of payload.edits.slice(0, 5)) {
@@ -2834,6 +2833,7 @@ function IdeBody(props) {
             if (explicit && typeof payload.reason === 'string' && payload.reason !== '') {
               setStatus({ kind: 'error', message: payload.reason })
             }
+            pushTrace(trace)
             return { items: [] }
           }
           const range = payload.range === undefined || payload.range === null ? {} : payload.range
@@ -2846,8 +2846,9 @@ function IdeBody(props) {
             modelVersion: version,
             requestId: typeof payload.requestId === 'string' ? payload.requestId : '',
           }
-          return { items: payload.text === '' ? [] : [{ insertText: payload.text }], text: payload.text, plan }
+          return { plan, trace }
         } catch (cause) {
+          if (!isCurrent()) return
           if (cause instanceof Error && (cause.name === 'AbortError' || cause.code === 'cancelled')) return { items: [] }
           if (cause instanceof Error && cause.code === 'not-opted-in') {
             // The host only sends buffer context after the workspace opted in. The
@@ -2875,48 +2876,83 @@ function IdeBody(props) {
         }
       }
 
+      const clearGhostPreview = () => {
+        const state = runtime.current
+        if (state.ghostZone !== undefined) {
+          state.editor?.changeViewZones((zones) => zones.removeZone(state.ghostZone))
+          state.ghostZone = undefined
+        }
+        if (state.ghostDecorations.length > 0) {
+          state.editor?.deltaDecorations(state.ghostDecorations, [])
+          state.ghostDecorations = []
+        }
+        state.ghostPosition = undefined
+      }
+
       const clearGhost = React.useCallback(() => {
         const state = runtime.current
-        const decorations = state.tab.removedDecorations
-        // The content listener calls this on every keystroke. When nothing is
-        // drawn there is nothing to undo, and a widget relayout per character is
-        // exactly what makes typing feel like it waits for the model.
+        // Avoid any editor work on ordinary keystrokes when no hint is drawn.
         const visible =
-          state.ghost !== '' ||
+          state.ghostPosition !== undefined ||
           state.tab.plan !== undefined ||
           state.tab.phantom !== undefined ||
-          (Array.isArray(decorations) && decorations.length > 0) ||
-          (Array.isArray(state.tab.editWidgets) && state.tab.editWidgets.length > 0)
-        state.ghost = ''
-        state.ghostPosition = undefined
+          state.tab.removedDecorations.length > 0 ||
+          state.tab.editWidgets.length > 0
         state.tab.plan = undefined
         state.tab.accepted = 0
         if (!visible) return
-        const node = runtime.current.ghostNode
-        if (node !== undefined) node.style.display = 'none'
-        const editor = runtime.current.editor
-        const widget = runtime.current.ghostWidget
-        if (editor !== undefined && widget !== undefined) editor.layoutContentWidget(widget)
-        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(false)
-        // The staged block took real lines; dropping the hint has to give them
-        // back, or Esc would leave the proposal in the buffer.
+        clearGhostPreview()
+        state.ghostKey?.set(false)
         clearPhantom()
         clearRemovedDecoration()
         clearEdits()
       }, [])
 
-      const showGhost = React.useCallback((position, ghostText) => {
-        const node = runtime.current.ghostNode
-        const editor = runtime.current.editor
-        const widget = runtime.current.ghostWidget
-        if (node === undefined || editor === undefined || widget === undefined || ghostText === '') return
-        runtime.current.ghost = ghostText
-        runtime.current.ghostPosition = position
-        node.textContent = ghostText
-        node.style.display = 'block'
-        editor.layoutContentWidget(widget)
-        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(true)
-      }, [])
+      const showGhost = (position, ghostText, end = position) => {
+        const state = runtime.current
+        const { editor, monaco } = state
+        const model = editor?.getModel()
+        if (!model || ghostText === '') return
+        clearGhostPreview()
+        const { lineNumber, column } = position
+        const lines = ghostText.split(/\r\n|\r|\n/)
+        const suffix = model.getLineContent(end.lineNumber).slice(end.column - 1)
+        const replacing = end.lineNumber !== lineNumber || end.column !== column
+        // Keep the original line readable when the proposal rewrites it or
+        // would move its suffix to a new line.
+        if (replacing || (lines.length > 1 && suffix !== '')) {
+          lines[0] = model.getLineContent(lineNumber).slice(0, column - 1) + lines[0]
+          lines[lines.length - 1] += suffix
+        } else {
+          const first = lines.shift()
+          if (first !== '') {
+            state.ghostDecorations = editor.deltaDecorations([], [{
+              range: new monaco.Range(lineNumber, column, lineNumber, column),
+              options: {
+                showIfCollapsed: true,
+                before: { content: first, inlineClassName: 'dsh-ide-ghost' },
+              },
+            }])
+          }
+        }
+        if (lines.length > 0) {
+          const node = document.createElement('div')
+          node.className = 'dsh-ide-ghost dsh-ide-ghost-lines'
+          node.textContent = lines.join('\n')
+          node.style.tabSize = String(model.getOptions().tabSize)
+          editor.applyFontInfo(node)
+          editor.changeViewZones((zones) => {
+            state.ghostZone = zones.addZone({
+              afterLineNumber: end.lineNumber,
+              heightInLines: lines.length,
+              domNode: node,
+              suppressMouseDown: true,
+            })
+          })
+        }
+        state.ghostPosition = position
+        state.ghostKey?.set(true)
+      }
 
       // Every ghost edit goes through one place: it brackets the Monaco edit with
       // undo stops and marks it as ours, so the content listener does not treat
@@ -3161,34 +3197,64 @@ function IdeBody(props) {
         return true
       }
 
-      // The buffer value before each change tells us what the user deleted. A
-      // suggestion that recreates that text is "reverting a change" and is
-      // dropped by the Host.
-      const trackRemovedText = (model, record) => {
-        const uri = model.uri.toString()
-        const previous = runtime.current.tab.values.get(uri)
-        const next = model.getValue()
-        runtime.current.tab.values.set(uri, next)
-        if (record !== true || typeof previous !== 'string' || previous === next) return
-        const prefix = commonPrefixLengthLocal(previous, next)
-        const limit = Math.min(previous.length - prefix, next.length - prefix)
-        let suffix = 0
-        while (suffix < limit && previous[previous.length - 1 - suffix] === next[next.length - 1 - suffix]) suffix += 1
-        remember(runtime.current.tab.revertions, runtime.current.modelTabs.get(uri), previous.slice(prefix, previous.length - suffix))
+      // Monaco reports replaced ranges in the old document, highest offset first.
+      // Keep the old lines of the active model; a normal keystroke updates one slot.
+      const trackRemovedText = (lines, model, event, key) => {
+        if (event.isFlush) return model.getLinesContent()
+        for (const { range, rangeLength, text } of event.changes) {
+          const first = range.startLineNumber - 1, last = range.endLineNumber - 1
+          const head = lines[first].slice(0, range.startColumn - 1)
+          const tail = lines[last].slice(range.endColumn - 1)
+          if (key && rangeLength > 0 && rangeLength <= 2000) {
+            const removed = first === last ? lines[first].slice(head.length, range.endColumn - 1) :
+              [lines[first].slice(head.length), ...lines.slice(first + 1, last), lines[last].slice(0, range.endColumn - 1)].join(event.eol)
+            const prefix = commonPrefixLengthLocal(removed, text)
+            let end = removed.length, other = text.length
+            while (end > prefix && other > prefix && removed[end - 1] === text[other - 1]) { end--; other-- }
+            remember(runtime.current.tab.revertions, key, removed.slice(prefix, end))
+          }
+          const added = text.split(/\r\n|[\r\n]/)
+          added[0] = head + added[0]
+          added[added.length - 1] += tail
+          if (first === last && added.length === 1) lines[first] = added[0]
+          else if (added.length < 8192) lines.splice(first, last - first + 1, ...added)
+          else lines = lines.slice(0, first).concat(added, lines.slice(last + 1))
+        }
+        return lines
       }
 
-      const requestGhost = async (kind) => {
+      const requestGhost = async (kind, triggerAt = performance.now()) => {
         const editor = runtime.current.editor
         if (editor === undefined) return
-        const model = editor.getModel()
-        const position = editor.getPosition()
-        if (model === null || position === null) return
         if (kind !== 'explicit' && kind !== 'refetch' && Date.now() < runtime.current.tab.snoozeUntil) return
         if (kind === 'auto' && runtime.current.tab.plan !== undefined) return
         // A staged block lives in the buffer; the request must describe the file
         // the user actually has, not the proposal it is still deciding about.
         if (runtime.current.tab.phantom !== undefined) clearGhost()
-        const result = await complete(model, position, { triggerKind: kind === 'explicit' ? 1 : 0, kind }, undefined)
+        cancelGhostRequest()
+        const model = editor.getModel()
+        const position = editor.getPosition()
+        if (model === null || position === null) return
+        const controller = new AbortController()
+        runtime.current.tab.controller = controller
+        const version = model.getVersionId()
+        const isCurrent = () => {
+          if (controller.signal.aborted || editor.getModel() !== model || model.getVersionId() !== version) return false
+          const caret = editor.getPosition()
+          return caret?.lineNumber === position.lineNumber && caret.column === position.column
+        }
+        runtime.current.setHintBusy?.(true)
+        let result
+        try {
+          result = await complete(model, position, kind, controller.signal, isCurrent)
+        } finally {
+          // A superseded response must not turn off the newer request's spinner.
+          if (runtime.current.tab.controller === controller) {
+            runtime.current.tab.controller = undefined
+            runtime.current.setHintBusy?.(false)
+          }
+        }
+        if (!isCurrent()) return
         if (result === undefined || result.plan === undefined) {
           clearGhost()
           return
@@ -3227,20 +3293,15 @@ function IdeBody(props) {
                     entry.edit.start < plan.range.start ? sum + entry.text.length - entry.original.length : sum,
                   0,
                 )
-          showGhost(model.getPositionAt(plan.range.start + shift), plan.insertText)
+          showGhost(model.getPositionAt(plan.range.start + shift), plan.insertText, model.getPositionAt(plan.range.end + shift))
+        } else {
+          clearGhostPreview()
         }
+        pushTrace({ ...result.trace, ok: true, displayMs: Math.round(performance.now() - triggerAt) })
       }
 
       const scheduleGhost = (kind = 'auto') => {
-        window.clearTimeout(runtime.current.ghostTimer)
-        // A pending answer is for text that no longer exists. Cancelling it here
-        // is what keeps typing responsive: otherwise every keystroke leaves a
-        // request running and its late answer has to be thrown away on arrival.
-        const pending = runtime.current.tab.controller
-        if (pending !== undefined) {
-          pending.abort()
-          runtime.current.tab.controller = undefined
-        }
+        cancelGhostRequest()
         // One suggestion at a time: while one is on screen the user either
         // accepts it or cancels it, so nothing asks the model again.
         if (runtime.current.tab.plan !== undefined) return
@@ -3249,9 +3310,10 @@ function IdeBody(props) {
         if (editor === undefined || !editor.hasTextFocus()) return
         const selection = editor.getSelection()
         if (selection !== null && !selection.isEmpty()) return
+        const triggerAt = performance.now()
         const delay = Number(tabPref('debounceMs', 500))
         runtime.current.ghostTimer = window.setTimeout(() => {
-          void requestGhost(kind)
+          void requestGhost(kind, triggerAt)
         }, Number.isFinite(delay) ? Math.max(0, delay) : 500)
       }
 
@@ -3323,48 +3385,101 @@ function IdeBody(props) {
           smoothScrolling: true,
           padding: { top: 8, bottom: 24 },
           inlineSuggest: { enabled: true },
+          glyphMargin: true,
         })
         runtime.current.editor = editor
         runtime.current.monaco = monaco
 
-        const ghostNode = document.createElement('span')
-        ghostNode.className = 'dsh-ide-ghost'
-        ghostNode.style.display = 'none'
-        const ghostWidget = {
-          getId: () => 'dsh-ide.ghost',
-          getDomNode: () => ghostNode,
-          getPosition: () =>
-            runtime.current.ghostPosition === undefined
-              ? null
-              : { position: runtime.current.ghostPosition, preference: [monaco.editor.ContentWidgetPositionPreference.EXACT] },
+        const hintButton = document.createElement('button')
+        hintButton.type = 'button'
+        hintButton.className = 'dsh-ide-hint-button'
+        const setHintBusy = (busy) => {
+          hintButton.textContent = busy ? '' : '💡'
+          hintButton.title = busy ? 'ИИ готовит подсказку. Нажмите, чтобы отменить (Esc)' : 'Запросить подсказку ИИ (Ctrl+Space)'
+          hintButton.setAttribute('aria-label', hintButton.title)
+          hintButton.setAttribute('data-busy', String(busy))
         }
-        editor.addContentWidget(ghostWidget)
-        runtime.current.ghostNode = ghostNode
-        runtime.current.ghostWidget = ghostWidget
+        setHintBusy(false)
+        runtime.current.setHintBusy = setHintBusy
+        // Keep the caret and editor focus: moving either invalidates a request.
+        hintButton.onmousedown = (event) => { event.preventDefault(); event.stopPropagation() }
+        hintButton.onclick = (event) => {
+          event.stopPropagation()
+          if (runtime.current.tab.controller) cancelGhostRequest()
+          else void requestGhost('explicit')
+          editor.focus()
+        }
+        let hintLine = 0
+        const hintWidget = {
+          getId: () => 'dsh-ide.ai-hint',
+          getDomNode: () => hintButton,
+          getPosition: () => ({ lane: monaco.editor.GlyphMarginLane.Right, range: new monaco.Range(hintLine, 1, hintLine, 1), zIndex: 1 }),
+        }
+        const syncHintLine = () => {
+          const model = editor.getModel()
+          const key = model && runtime.current.modelTabs.get(model.uri.toString())
+          const entry = key && stateRef.current.tabs.find(tab => tab.key === key)
+          const line = entry && !entry.readOnly ? editor.getPosition()?.lineNumber || 0 : 0
+          if (line === hintLine) return
+          const attached = hintLine !== 0
+          hintLine = line
+          if (!line) editor.removeGlyphMarginWidget(hintWidget)
+          else if (!attached) editor.addGlyphMarginWidget(hintWidget)
+          else editor.layoutGlyphMarginWidget(hintWidget)
+        }
+        syncHintLine()
+        let oldLines = editor.getModel()?.getLinesContent() || []
+        const modelChange = editor.onDidChangeModel(() => {
+          oldLines = editor.getModel()?.getLinesContent() || []
+          syncHintLine()
+        })
         runtime.current.ghostKey =
           typeof editor.createContextKey === 'function' ? editor.createContextKey('dshIdeGhostVisible', false) : undefined
 
-        const change = editor.onDidChangeModelContent(() => {
+        const change = editor.onDidChangeModelContent((event) => {
           const model = editor.getModel()
           if (model === null) return
           const internal = runtime.current.tab.internalEdit === true
           const staging = runtime.current.tab.staging === true
-          trackRemovedText(model, !internal && !staging)
           const key = runtime.current.modelTabs.get(model.uri.toString())
+          oldLines = trackRemovedText(oldLines, model, event, !internal && !staging ? key : undefined)
           if (key !== undefined && !staging) {
             setTabs((previous) =>
               previous.map((candidate) => (candidate.key === key && !candidate.dirty ? { ...candidate, dirty: true } : candidate)),
             )
           }
           // An edit we made ourselves (Tab, Ctrl+→) must not cancel or re-ask.
-          if (internal) return
+          if (internal || staging) return
+          const tab = runtime.current.tab, plan = tab.plan
+          const typed = event.changes.length === 1 ? event.changes[0] : undefined
+          if (plan?.kind === 'insert' && !tab.phantom && !plan.edits.length && plan.range.start === plan.range.end &&
+              !event.isFlush && !event.isUndoing && !event.isRedoing && !event.isEolChange &&
+              event.versionId === plan.modelVersion + 1 && typed?.rangeLength === 0 && typed.text.length > 0 &&
+              typed.rangeOffset === plan.range.start + tab.accepted && plan.insertText.startsWith(typed.text, tab.accepted) &&
+              editor.getSelections()?.length === 1) {
+            cancelGhostRequest()
+            const offset = typed.rangeOffset + typed.text.length
+            const rest = plan.insertText.slice(tab.accepted + typed.text.length)
+            if (!rest) clearGhost()
+            else {
+              tab.accepted = 0
+              tab.plan = { ...plan, range: { start: offset, end: offset }, insertText: rest, modelVersion: event.versionId }
+              showGhost(model.getPositionAt(offset), rest)
+            }
+            return
+          }
           clearGhost()
           scheduleGhost('auto')
         })
-        const blur = editor.onDidBlurEditorWidget(() => clearGhost())
+        const blur = editor.onDidBlurEditorWidget(() => {
+          cancelGhostRequest()
+          clearGhost()
+        })
         let cursorTimer = 0
         const cursorChange = editor.onDidChangeCursorPosition((event) => {
+          syncHintLine()
           if (runtime.current.tab.internalEdit === true) return
+          if (runtime.current.tab.controller) cancelGhostRequest()
           const shown = runtime.current.ghostPosition
           if (shown !== undefined && (shown.lineNumber !== event.position.lineNumber || shown.column !== event.position.column)) clearGhost()
           // The status bar needs the final position, not every intermediate one.
@@ -3404,6 +3519,7 @@ function IdeBody(props) {
           editor.addCommand(
             monaco.KeyCode.Escape,
             () => {
+              cancelGhostRequest()
               if (handlersRef.current.rejectGhost?.() === true) return
               const selection = editor.getSelection()
               if (selection !== null && !selection.isEmpty()) editor.setPosition(selection.getPosition())
@@ -3420,9 +3536,11 @@ function IdeBody(props) {
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
 
         return () => {
-          window.clearTimeout(runtime.current.ghostTimer)
+          cancelGhostRequest()
           window.clearTimeout(cursorTimer)
-          if (runtime.current.tab.controller !== undefined) runtime.current.tab.controller.abort()
+          modelChange.dispose()
+          if (hintLine) editor.removeGlyphMarginWidget(hintWidget)
+          runtime.current.setHintBusy = undefined
           blur.dispose()
           change.dispose()
           cursorChange.dispose()
@@ -3438,6 +3556,7 @@ function IdeBody(props) {
       // effect (clearGhost, updateOptions, focus) ran for every character typed,
       // which is what made the editor feel like it was waiting for something.
       React.useEffect(() => {
+        cancelGhostRequest()
         clearGhost()
         const editor = runtime.current.editor
         if (!editor || !monaco || activeKey === '') return
@@ -3585,6 +3704,11 @@ function IdeBody(props) {
         try {
           const payload = await call('prefs', { patch })
           const loaded = payload.preferences || {}
+          if (prefsRef.current?.fullTrace && loaded.fullTrace !== true) {
+            cancelGhostRequest()
+            setTrace(rows => rows.map(({ conversation, ...metadata }) => metadata))
+          }
+          prefsRef.current = loaded
           setPreferences(loaded)
           if (typeof payload.promptDefault === 'string') setPromptDefault(payload.promptDefault)
           runtime.current.autoSuggest = loaded.autoSuggest !== false
@@ -4357,8 +4481,13 @@ function IdeBody(props) {
   letter-spacing:-.02em; }
 .dsh-ide-tree-error { padding:3px 10px; color:var(--ide-error); font-size:11px; }
 .dsh-ide-tree-empty { padding:3px 10px; color:var(--ide-muted); font-size:11px; }
-.dsh-ide-ghost { display:none; pointer-events:none; white-space:pre; opacity:.5; color:var(--ide-fg);
-  font-family:var(--ide-font-mono, Consolas, 'Courier New', monospace); font-size:13px; line-height:20px; }
+.dsh-ide-hint-button { cursor:pointer; pointer-events:auto; border:0; border-radius:4px; padding:0; background:transparent; color:var(--ide-text); font:14px/1 system-ui; text-align:center; }
+.dsh-ide-hint-button:hover, .dsh-ide-hint-button:focus-visible { background:var(--ide-hover); outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-hint-button[data-busy="true"]::after { content:''; display:inline-block; vertical-align:middle; width:11px; height:11px; border-radius:50%; border:2px solid var(--ide-muted); border-top-color:transparent; animation:dsh-ide-hint-spin .8s linear infinite; }
+@keyframes dsh-ide-hint-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce) { .dsh-ide-hint-button[data-busy="true"]::after { animation:none; } }
+.dsh-ide-ghost { pointer-events:none; opacity:.5; color:var(--ide-text); }
+.dsh-ide-ghost-lines { white-space:pre; }
 .dsh-ide-ghost-removed { background:rgba(224, 108, 117, .18); border-bottom:1px solid rgba(224, 108, 117, .55); }
 .dsh-ide-edit-old { background:rgba(224, 108, 117, .22); border-bottom:1px solid rgba(224, 108, 117, .5); }
 .dsh-ide-edit-inline { color:rgba(150, 225, 165, .95); margin-left:6px; opacity:.95;
