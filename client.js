@@ -2320,6 +2320,11 @@ function IdeBody(props) {
           return false
         }
         setStatus({ kind: 'busy', message: 'Сохранение…' })
+        // A staged proposal lives in the buffer. Saving must write the file the
+        // user actually has, never the lines a hint is still offering.
+        if (runtime.current.tab.phantom !== undefined && runtime.current.editor !== undefined && runtime.current.editor.getModel() === model) {
+          clearGhost()
+        }
         try {
           const payload = await call('save', {
             id: target.hostId,
@@ -2511,12 +2516,17 @@ function IdeBody(props) {
           })
         }
         runtime.current.tab.internalEdit = true
+        // Staging is not a user edit: the buffer only holds the proposal, so
+        // the tab must not look modified and cancelling must not count as a
+        // reverted edit.
+        runtime.current.tab.staging = true
         try {
           editor.pushUndoStop()
           editor.executeEdits('dsh-ide', ranges)
           editor.pushUndoStop()
         } finally {
           runtime.current.tab.internalEdit = false
+          runtime.current.tab.staging = false
         }
         return true
       }
@@ -3256,9 +3266,10 @@ function IdeBody(props) {
           const model = editor.getModel()
           if (model === null) return
           const internal = runtime.current.tab.internalEdit === true
-          trackRemovedText(model, !internal)
+          const staging = runtime.current.tab.staging === true
+          trackRemovedText(model, !internal && !staging)
           const key = runtime.current.modelTabs.get(model.uri.toString())
-          if (key !== undefined) {
+          if (key !== undefined && !staging) {
             setTabs((previous) =>
               previous.map((candidate) => (candidate.key === key && !candidate.dirty ? { ...candidate, dirty: true } : candidate)),
             )
