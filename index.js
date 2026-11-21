@@ -36,6 +36,7 @@ import {
 } from './catalog.js'
 import { buildContext, postprocessCompletion } from './completion.js'
 import { DEFAULT_SYSTEM_PROMPT, fillPrompt, optedInRoots, readPreferences, writePreferences } from './prefs.js'
+import { buildFileContext, editInstructions, locateEdits, parseEditResponse } from './edits.js'
 import { boundLines, evaluateSuggestion, planEdit, reasonLabel } from './tab.js'
 import { listFiles, listTree } from './tree.js'
 import { readSessionState, writeSessionState } from './state.js'
@@ -488,6 +489,12 @@ export function apply(ctx, config) {
     // can change in the IDE drawer.
     const windowPrefix = boundLines(prefix, preferences.aboveLines, 'end')
     const windowSuffix = boundLines(suffix, preferences.belowLines, 'start')
+    const cursorOffset = Math.min(Math.max(0, Math.round(Number(body.offset ?? 0) || 0)), rawText.length)
+    // With whole-file edits on, the model gets the buffer with a cursor marker
+    // and may answer with changes anywhere in the file — that is the part that
+    // turns `main(f)` typed under a bare `def main():` into a proposal to fix
+    // the signature, not just characters at the caret.
+    const multiEdit = preferences.multiEdit === true && preferences.maxEdits > 0
     const selection = ctx.agentDefaultModel.currentSelection()
     if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
       return fail('no-model', 'Модель не выбрана — подсказки недоступны, редактор работает.')
@@ -551,19 +558,27 @@ export function apply(ctx, config) {
     // строк" working while changing the rest of the wording.
     const promptTemplate =
       String(preferences.systemPrompt ?? '').trim() === '' ? DEFAULT_SYSTEM_PROMPT : preferences.systemPrompt
-    const systemPrompt = fillPrompt(promptTemplate, {
+    const basePrompt = fillPrompt(promptTemplate, {
       answerLines: preferences.answerLines,
       language: document.language,
       file: document.displayPath,
     })
+    const systemPrompt = multiEdit ? `${basePrompt}\n\n${editInstructions({ maxEdits: preferences.maxEdits })}` : basePrompt
     // The suffix must follow its own header: an inverted layout tells the model to
     // continue past the text that comes after the cursor, which produced empty
     // answers for every request of the first benchmark.
     const requestText =
-      `Файл: ${document.displayPath}\n` +
-      `Язык: ${document.language}\n\n` +
-      `--- текст до курсора ---\n${windowPrefix}\n--- курсор ---\n` +
-      `--- текст после курсора ---\n${windowSuffix}`
+      multiEdit && preferences.wholeFileContext === true
+        ? buildFileContext({
+            path: document.displayPath,
+            language: document.language,
+            text: rawText,
+            offset: cursorOffset,
+          })
+        : `Файл: ${document.displayPath}\n` +
+          `Язык: ${document.language}\n\n` +
+          `--- текст до курсора ---\n${windowPrefix}\n--- курсор ---\n` +
+          `--- текст после курсора ---\n${windowSuffix}`
 
     const deadline = AbortSignal.timeout(boundedMs(preferences.deadlineMs, COMPLETION_DEADLINE_MS, 1000, 60000))
     const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
@@ -639,8 +654,9 @@ export function apply(ctx, config) {
             // The answer is at most `answerLines` lines of code, so the budget is
             // sized to that instead of a flat 900: a shorter budget comes back
             // sooner, and a thinking model still cannot spend it all on reasoning
-            // when the level is `off`.
-            maxTokens: Math.min(900, Math.max(80, preferences.answerLines * 40 + 40)),
+            // when the level is `off`. The edit list rides in the same reply, so
+            // it adds a fixed allowance of its own.
+            maxTokens: Math.min(900, Math.max(80, preferences.answerLines * 40 + (multiEdit ? 160 : 40))),
             temperature: 0.1,
             signal: combined,
             sessionId: document.sessionId,
@@ -683,7 +699,12 @@ export function apply(ctx, config) {
             // stream is still arriving. A whole answer is never worth 20 s of
             // silence, so once text has started, a short grace period ends the
             // stream and the hint appears with what is already there.
-            if (firstTextAt !== 0 && Date.now() - firstTextAt >= flushAfterMs) {
+            //
+            // With whole-file edits on the answer is a structured reply: cutting
+            // it after the `INSERT:` part leaves `EDITS:` with half a JSON array,
+            // which parses as "no edits at all". Those requests therefore wait
+            // for the stream to finish.
+            if (multiEdit !== true && firstTextAt !== 0 && Date.now() - firstTextAt >= flushAfterMs) {
               flushed = true
               break
             }
@@ -702,8 +723,12 @@ export function apply(ctx, config) {
       if (text.trim() !== '') break
     }
 
+    // A whole-file answer carries two parts: the continuation at the cursor and
+    // a list of edits elsewhere. A model that ignores the format simply wrote a
+    // continuation, so the parser falls back to "all of it is the answer".
+    const parsed = multiEdit ? parseEditResponse(text) : { answer: text, edits: [] }
     const answer = postprocessCompletion({
-      completion: text,
+      completion: parsed.answer,
       prefix,
       suffix,
       topLevelKeywords: topLevelKeywordsFor(document.language),
@@ -742,6 +767,16 @@ export function apply(ctx, config) {
       revertions: readRecords(body.revertions),
     })
     const accepted = verdict.accepted && plan.insertText !== ''
+    // Located against the buffer the user actually has, so a snippet the model
+    // remembered slightly wrong is dropped instead of applied in the wrong place.
+    const edits = multiEdit
+      ? locateEdits({
+          text: rawText,
+          edits: parsed.edits,
+          maxEdits: preferences.maxEdits,
+          cursor: cursorOffset,
+        })
+      : []
 
     // The GUI shows nothing when the answer is empty, so every attempt records
     // what it was and what came back; without this line "smart Tab does not
@@ -770,6 +805,7 @@ export function apply(ctx, config) {
       planChars: plan.insertText.length,
       planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
       removedChars: plan.removedText.length,
+      editCount: edits.length,
       suppressed: accepted ? '' : verdict.reason,
     })
     // An empty answer is a normal outcome the user has to be able to read, so
@@ -795,6 +831,10 @@ export function apply(ctx, config) {
       planKind: plan.kind,
       range: { start: plan.startOffset, end: plan.endOffset },
       removedText: plan.removedText,
+      // Edits elsewhere in the file, already resolved to offsets. The client
+      // draws them as ghost blocks and applies all of them with Tab in one undo
+      // step, so offsets are never recomputed after the insert.
+      edits,
       modelVersion,
       provider: used.provider,
       model: used.model,
@@ -827,6 +867,7 @@ export function apply(ctx, config) {
         planChars: plan.insertText.length,
         planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
         removedChars: plan.removedText.length,
+        edits: edits.length,
         suppressed: accepted ? '' : verdict.reason,
       },
       conversation: { system: systemPrompt, message: requestText, answer: text },

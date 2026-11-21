@@ -46,7 +46,7 @@ async function makeWorkspace() {
   return root
 }
 
-function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '' }) {
+function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1' }) {
   const routes = new Map()
   const streamCalls = []
   const session = { id: SESSION_ID }
@@ -86,7 +86,7 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
         if (rejectEffort !== '' && request.reasoningEffort === rejectEffort) {
           throw new Error('UNSUPPORTED_REASONING_EFFORT: this route has no such level')
         }
-        yield { type: 'text-delta', index: 0, text: 'return 1' }
+        yield { type: 'text-delta', index: 0, text: answer }
         yield { type: 'finish', reason: { kind: 'stop' } }
       },
     },
@@ -408,15 +408,54 @@ test('the completion sends the provider default effort and reports its trajector
       // No level is pinned by default: every extra level would cost a rejected
       // request first, and a provider rejects an unknown level before the network.
       assert.equal(app.streamCalls[0].reasoningEffort, undefined)
-      // The budget follows `answerLines` (5 by default) instead of a flat 900.
-      assert.equal(app.streamCalls[0].maxTokens, 240)
+      // The budget follows `answerLines` (5 by default) plus the allowance for
+      // the edit list, instead of a flat 900.
+      assert.equal(app.streamCalls[0].maxTokens, 360)
       assert.deepEqual(answered.body.trajectory.attempts, ['fixture / fixture-model'])
       assert.equal(answered.body.trajectory.effort, '')
       assert.equal(answered.body.modelSource, 'session')
       assert.equal(answered.body.trajectory.before, 'export const answer = 42\n'.length)
       assert.equal(answered.body.trajectory.finishReason, 'stop')
       assert.equal(answered.body.conversation.answer, 'return 1')
-      assert.ok(answered.body.conversation.message.includes('--- текст до курсора ---'))
+      // Whole-file edits are on by default, so the request carries the buffer
+      // with the cursor marked instead of the two windows around it.
+      assert.ok(answered.body.conversation.message.includes('--- файл целиком; курсор отмечен ⟦КУРСОР⟧ ---'))
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a whole-file answer returns located edits beside the cursor continuation', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({
+        root,
+        answer:
+          'INSERT:\nreturn answer\nEDITS:\n' +
+          '[{"find":"answer = 42","replace":"answer = 43","why":"rename"}]',
+      })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      const text = 'export const answer = 42\n'
+      const answered = await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text,
+        offset: 0,
+      })
+      assert.equal(answered.status, 200)
+      // The continuation is the part before EDITS:, without the label and with
+      // its indentation intact.
+      assert.equal(answered.body.text, 'return answer')
+      assert.equal(answered.body.edits.length, 1, JSON.stringify(answered.body).slice(0, 400))
+      const edit = answered.body.edits[0]
+      assert.equal(text.slice(edit.start, edit.end), 'answer = 42')
+      assert.equal(edit.newText, 'answer = 43')
+      assert.equal(edit.why, 'rename')
+      assert.equal(answered.body.trajectory.edits, 1)
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -485,7 +524,10 @@ test('the system instruction is a setting and its placeholders are filled', asyn
         text: 'export const answer = 42\n',
         offset: 'export const answer = 42\n'.length,
       })
-      assert.match(app.streamCalls[1].system, /^Дополни .*src[\\/]index\.js на javascript; не больше 5 строк\.$/)
+      // The edit instructions are appended to whatever the user wrote, so the
+      // saved text must still open the system message and be fully filled.
+      assert.match(app.streamCalls[1].system, /^Дополни .*src[\\/]index\.js на javascript; не больше 5 строк\./)
+      assert.ok(app.streamCalls[1].system.includes('EDITS:'))
 
       // Emptying the field restores the shipped instruction.
       await app.call('prefs', { patch: { systemPrompt: '' } })

@@ -1726,6 +1726,9 @@ window.__ModuleLoader__.load({
         'rangeReplaceLines',
         'maxFileChars',
         'snoozeAfterRejectMs',
+        'multiEdit',
+        'maxEdits',
+        'wholeFileContext',
         'rangeReplace',
         'partialAccept',
         'refetchAfterAccept',
@@ -2042,6 +2045,9 @@ const TAB_PREFERENCES = [
   { key: 'recentRejectThreshold', kind: 'number', value: 3, min: 0, max: 10, title: 'Проверка: порог повторов', hint: 'Не повторять отклонённое N раз; 0 — выключить проверку.' },
   { key: 'recentRejectWindowMs', kind: 'number', value: 300000, min: 0, max: 600000, title: 'Проверка: память отказов', hint: 'Сколько миллисекунд помнить отклонённое.' },
   { key: 'snoozeAfterRejectMs', kind: 'number', value: 800, min: 0, max: 5000, title: 'Подсказки: пауза после Escape', hint: 'Не спрашивать модель сразу после отклонения, мс.' },
+  { key: 'multiEdit', kind: 'boolean', value: true, title: 'Подсказки: правки по всему файлу', hint: 'В том же ответе просить правки в других местах файла (сигнатуры, ветки, импорты).' },
+  { key: 'maxEdits', kind: 'number', value: 3, min: 0, max: 5, title: 'Подсказки: сколько правок', hint: 'Больше этого числа правок из одного ответа не принимается; 0 — выключить.' },
+  { key: 'wholeFileContext', kind: 'boolean', value: true, title: 'Подсказки: весь файл в запросе', hint: 'Отправлять файл целиком с отметкой курсора, а не окна вокруг него.' },
   { key: 'rangeReplace', kind: 'boolean', value: true, title: 'Подсказки: заменять хвост строки', hint: 'Разрешать замену текста после курсора, а не только вставку.' },
   { key: 'partialAccept', kind: 'boolean', value: true, title: 'Подсказки: приём по слову', hint: 'Ctrl+→ принимает следующее слово подсказки.' },
   { key: 'refetchAfterAccept', kind: 'boolean', value: false, title: 'Подсказки: запрос после приёма', hint: 'Сразу спрашивать продолжение после Tab.' },
@@ -2187,6 +2193,9 @@ function IdeBody(props) {
           accepted: 0,
           snoozeUntil: 0,
           removedDecorations: [],
+          edits: [],
+          editWidgets: [],
+          editDecorations: [],
           rejections: new Map(),
           revertions: new Map(),
           values: new Map(),
@@ -2440,6 +2449,67 @@ function IdeBody(props) {
         )
       }
 
+      // ---------------------------------------------------------------------
+      // Phantom edits elsewhere in the file. The Host located every snippet in
+      // the buffer it sent, so both ends are exact offsets of the current text;
+      // the editor paints the old range and a ghost block with the replacement.
+      // ---------------------------------------------------------------------
+
+      const clearEdits = () => {
+        const state = runtime.current
+        const editor = state.editor
+        const decorations = state.tab.editDecorations
+        state.tab.editDecorations = []
+        if (editor !== undefined && Array.isArray(decorations) && decorations.length > 0) {
+          editor.deltaDecorations(decorations, [])
+        }
+        const widgets = state.tab.editWidgets
+        state.tab.editWidgets = []
+        if (editor !== undefined && Array.isArray(widgets)) {
+          for (const widget of widgets) editor.removeContentWidget(widget)
+        }
+        state.tab.edits = []
+      }
+
+      const decorateEdits = (plan, model) => {
+        clearEdits()
+        const editor = runtime.current.editor
+        const monacoInstance = runtime.current.monaco
+        const edits = Array.isArray(plan.edits) ? plan.edits : []
+        if (editor === undefined || monacoInstance === undefined || edits.length === 0) return
+        const decorations = []
+        for (const edit of edits) {
+          const start = model.getPositionAt(edit.start)
+          const end = model.getPositionAt(edit.end)
+          decorations.push({
+            range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+            options: {
+              inlineClassName: 'dsh-ide-edit-old',
+              hoverMessage: { value: edit.why === '' ? 'Правка подсказки' : edit.why },
+            },
+          })
+        }
+        runtime.current.tab.editDecorations = editor.deltaDecorations([], decorations)
+        const widgets = []
+        edits.forEach((edit, index) => {
+          const node = document.createElement('div')
+          node.className = 'dsh-ide-edit-new'
+          node.textContent = edit.newText
+          const widget = {
+            getId: () => `dsh-ide.edit.${plan.requestId}.${index}`,
+            getDomNode: () => node,
+            getPosition: () => ({
+              position: model.getPositionAt(edit.start),
+              preference: [monacoInstance.editor.ContentWidgetPositionPreference.BELOW],
+            }),
+          }
+          editor.addContentWidget(widget)
+          widgets.push(widget)
+        })
+        runtime.current.tab.editWidgets = widgets
+        runtime.current.tab.edits = edits
+      }
+
       const complete = async (model, position, context, cancelToken) => {
         const key = runtime.current.modelTabs.get(model.uri.toString())
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === key)
@@ -2511,7 +2581,24 @@ function IdeBody(props) {
             removedChars: asNumber(trajectory.removedChars),
             suppressed,
           })
-          if (payload.text === '') {
+          const edits = []
+          if (Array.isArray(payload.edits)) {
+            for (const candidate of payload.edits.slice(0, 5)) {
+              if (candidate === null || typeof candidate !== 'object') continue
+              const start = asNumber(candidate.start)
+              const end = asNumber(candidate.end)
+              const newText = typeof candidate.newText === 'string' ? candidate.newText : ''
+              if (newText === '' || end < start || end > text.length) continue
+              edits.push({
+                start,
+                end,
+                oldText: typeof candidate.oldText === 'string' ? candidate.oldText : '',
+                newText,
+                why: typeof candidate.why === 'string' ? candidate.why : '',
+              })
+            }
+          }
+          if (payload.text === '' && edits.length === 0) {
             // A silent empty answer is the worst failure mode: an explicit
             // request says why, an automatic one stays quiet like VS Code.
             if (explicit && typeof payload.reason === 'string' && payload.reason !== '') {
@@ -2525,10 +2612,11 @@ function IdeBody(props) {
             range: { start: asNumber(range.start), end: asNumber(range.end) },
             insertText: payload.text,
             removedText: typeof payload.removedText === 'string' ? payload.removedText : '',
+            edits,
             modelVersion: version,
             requestId: typeof payload.requestId === 'string' ? payload.requestId : '',
           }
-          return { items: [{ insertText: payload.text }], text: payload.text, plan }
+          return { items: payload.text === '' ? [] : [{ insertText: payload.text }], text: payload.text, plan }
         } catch (cause) {
           if (cause instanceof Error && (cause.name === 'AbortError' || cause.code === 'cancelled')) return { items: [] }
           if (cause instanceof Error && cause.code === 'not-opted-in') {
@@ -2566,7 +2654,8 @@ function IdeBody(props) {
         const visible =
           state.ghost !== '' ||
           state.tab.plan !== undefined ||
-          (Array.isArray(decorations) && decorations.length > 0)
+          (Array.isArray(decorations) && decorations.length > 0) ||
+          (Array.isArray(state.tab.editWidgets) && state.tab.editWidgets.length > 0)
         state.ghost = ''
         state.ghostPosition = undefined
         state.tab.plan = undefined
@@ -2579,6 +2668,7 @@ function IdeBody(props) {
         if (editor !== undefined && widget !== undefined) editor.layoutContentWidget(widget)
         if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(false)
         clearRemovedDecoration()
+        clearEdits()
       }, [])
 
       const showGhost = React.useCallback((position, ghostText) => {
@@ -2596,35 +2686,41 @@ function IdeBody(props) {
 
       // Every ghost edit goes through one place: it brackets the Monaco edit with
       // undo stops and marks it as ours, so the content listener does not treat
-      // it as typing and ask the model again.
-      const applyGhostEdit = (startOffset, endOffset, text) => {
+      // it as typing and ask the model again. The cursor continuation and the
+      // phantom edits are applied as one operation, which is why the edit
+      // offsets from the Host never have to be recomputed after the insert.
+      const applyGhostEdits = (operations, caretOffset) => {
         const editor = runtime.current.editor
         const monacoInstance = runtime.current.monaco
         if (editor === undefined || monacoInstance === undefined) return false
         const model = editor.getModel()
-        if (model === null) return false
-        const start = model.getPositionAt(startOffset)
-        const end = model.getPositionAt(endOffset)
+        if (model === null || operations.length === 0) return false
+        const ranges = operations.map((operation) => {
+          const start = model.getPositionAt(operation.start)
+          const end = model.getPositionAt(operation.end)
+          return {
+            range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+            text: operation.text,
+            forceMoveMarkers: true,
+          }
+        })
         runtime.current.tab.internalEdit = true
         try {
           editor.pushUndoStop()
-          editor.executeEdits('dsh-ide', [
-            {
-              range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
-              text,
-              forceMoveMarkers: true,
-            },
-          ])
+          editor.executeEdits('dsh-ide', ranges)
           // `executeEdits` moves the caret but leaves any selection the editor
           // had, so a hint applied while text was selected looked like the
           // selection grew. Collapse it at the end of what we inserted.
-          editor.setPosition(model.getPositionAt(startOffset + text.length))
+          editor.setPosition(model.getPositionAt(Math.max(0, caretOffset)))
           editor.pushUndoStop()
         } finally {
           runtime.current.tab.internalEdit = false
         }
         return true
       }
+
+      const applyGhostEdit = (startOffset, endOffset, text) =>
+        applyGhostEdits([{ start: startOffset, end: endOffset, text }], startOffset + text.length)
 
       const acceptGhost = () => {
         const plan = runtime.current.tab.plan
@@ -2638,13 +2734,20 @@ function IdeBody(props) {
         }
         const accepted = runtime.current.tab.accepted
         const text = plan.insertText.slice(accepted)
-        if (text === '') {
+        const edits = Array.isArray(plan.edits) ? plan.edits : []
+        if (text === '' && edits.length === 0) {
           clearGhost()
           return false
         }
         const tabKey = runtime.current.modelTabs.get(model.uri.toString())
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === tabKey)
-        const edited = applyGhostEdit(plan.range.start + accepted, plan.range.end, text)
+        // One transaction: the continuation at the caret plus every phantom edit
+        // the Host located. Tab is one undo step, and the offsets stay valid
+        // because Monaco applies the whole set together.
+        const operations = []
+        if (text !== '') operations.push({ start: plan.range.start + accepted, end: plan.range.end, text })
+        for (const edit of edits) operations.push({ start: edit.start, end: edit.end, text: edit.newText })
+        const edited = applyGhostEdits(operations, plan.range.start + plan.insertText.length)
         runtime.current.tab.plan = undefined
         runtime.current.tab.accepted = 0
         clearGhost()
@@ -2660,7 +2763,12 @@ function IdeBody(props) {
           durationMs: 0,
           chars: text.length,
           ok: true,
-          reason: plan.kind === 'replace' ? 'Принята замена (Tab)' : 'Принята подсказка (Tab)',
+          reason:
+            edits.length === 0
+              ? plan.kind === 'replace'
+                ? 'Принята замена (Tab)'
+                : 'Принята подсказка (Tab)'
+              : `Принято правок: ${edits.length} (Tab)`,
           kind: 'accepted',
           planKind: plan.kind,
           removedChars: plan.kind === 'replace' ? plan.removedText.length : 0,
@@ -2810,8 +2918,9 @@ function IdeBody(props) {
         }
         runtime.current.tab.plan = plan
         runtime.current.tab.accepted = 0
-        showGhost(model.getPositionAt(plan.range.start), plan.insertText)
+        if (plan.insertText !== '') showGhost(model.getPositionAt(plan.range.start), plan.insertText)
         decorateRemoved(plan, model)
+        decorateEdits(plan, model)
       }
 
       const scheduleGhost = (kind = 'auto') => {
@@ -3942,6 +4051,10 @@ function IdeBody(props) {
 .dsh-ide-ghost { display:none; pointer-events:none; white-space:pre; opacity:.5; color:var(--ide-fg);
   font-family:var(--ide-font-mono, Consolas, 'Courier New', monospace); font-size:13px; line-height:20px; }
 .dsh-ide-ghost-removed { background:rgba(224, 108, 117, .18); border-bottom:1px solid rgba(224, 108, 117, .55); }
+.dsh-ide-edit-old { background:rgba(224, 108, 117, .16); border-bottom:1px solid rgba(224, 108, 117, .5); }
+.dsh-ide-edit-new { margin:0 0 0 14px; padding:1px 0 1px 8px; border-left:2px solid rgba(106, 190, 120, .8);
+  color:rgba(140, 220, 155, .95); white-space:pre; font:400 13px/1.45 var(--dsh-font-mono, ui-monospace, monospace);
+  pointer-events:none; opacity:.9; }
 .dsh-ide-icon-button { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:4px;
   padding:2px 5px; font:400 12px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-icon-button:hover { background:var(--ide-hover); }

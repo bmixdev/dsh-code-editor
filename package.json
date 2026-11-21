@@ -30,6 +30,7 @@
     "catalog.js",
     "completion.js",
     "tab.js",
+    "edits.js",
     "prefs.js",
     "tree.js",
     "cordis.patch.yml",
@@ -42,7 +43,7 @@
   ],
   "scripts": {
     "check": "node scripts/check-manifests.mjs",
-    "test": "node --test tests/host.test.mjs tests/client.test.mjs tests/tab.test.mjs",
+    "test": "node --test tests/host.test.mjs tests/client.test.mjs tests/tab.test.mjs tests/edits.test.mjs",
     "test:editor": "node --test editor/tests/completion.test.mjs editor/tests/client-smoke.test.mjs editor/tests/host-smoke.mjs editor/tests/editor-state.test.mjs editor/tests/sync.test.mjs",
     "test:all": "npm test && npm run test:editor"
   },

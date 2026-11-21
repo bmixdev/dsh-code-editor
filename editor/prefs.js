@@ -119,6 +119,16 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   recentRejectWindowMs: 300000,
   /** Drop an answer that restores text the user just deleted. */
   heuristicRevertingChange: true,
+  /**
+   * Ask for edits elsewhere in the file in the same reply as the cursor
+   * continuation. This is what makes `main(f)` typed under a `def main():`
+   * propose a matching signature instead of only adding characters at the caret.
+   */
+  multiEdit: true,
+  /** Most edits to accept from one answer. 0 turns the edit part off. */
+  maxEdits: 3,
+  /** Send the whole file instead of the windows around the cursor. */
+  wholeFileContext: true,
 })
 
 /** Inclusive integer bounds, applied to both the file and the drawer. */
@@ -137,6 +147,7 @@ export const PREFERENCE_LIMITS = Object.freeze({
   maxAddedLines: [1, 200],
   recentRejectThreshold: [0, 10],
   recentRejectWindowMs: [0, 600000],
+  maxEdits: [0, 5],
 })
 
 const BOOLEAN_KEYS = [
@@ -153,6 +164,8 @@ const BOOLEAN_KEYS = [
   'heuristicDuplicateLine',
   'heuristicExtendsRange',
   'heuristicRevertingChange',
+  'multiEdit',
+  'wholeFileContext',
 ]
 
 /** How many workspaces may stay opted in at once. */
