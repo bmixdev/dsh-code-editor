@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-22.1'
+    const UI_BUILD = '2026-11-23.10'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -134,9 +134,10 @@ window.__ModuleLoader__.load({
     const openListeners = new Set()
     let openNonce = 0
 
-    function requestOpen(sessionId, filePath) {
+    function requestOpen(sessionId, filePath, lineRange) {
       const path = normalPath(filePath)
-      const request = { path, nonce: ++openNonce }
+      const bounds = chipBounds(lineRange)
+      const request = { path, nonce: ++openNonce, lineRange: bounds === undefined ? undefined : { start: bounds.from, end: bounds.to } }
       pendingOpens.set(sessionId, request)
       for (const listener of openListeners) {
         try {
@@ -168,6 +169,181 @@ window.__ModuleLoader__.load({
       const parts = String(filePath ?? '').split('/')
       parts.pop()
       return parts.join('/')
+    }
+
+    // DSH's own mention shape: a file is `@path`, a directory keeps its trailing
+    // slash (`@dir/`), and a path with spaces is quoted. The transcript parses
+    // exactly these forms back into reference chips, so this is the token both
+    // the drag source and the drop target hand to the composer.
+    // Shortcut for "add this file (and the lines selected in it) to the chat".
+    // It only fires while the IDE panel holds focus: the panel cannot claim a
+    // global chord, DSH's own keymap owns those.
+    const ADD_TO_CHAT_KEY = 'Ctrl+Alt+C'
+
+    const MENTION_UNSAFE = /[\u0000-\u001f\u007f-\u009f"]/u
+    function mentionText(filePath, directory) {
+      const path = normalPath(filePath)
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '')
+      if (path === '') return ''
+      const target = directory === true ? `${path}/` : path
+      if (MENTION_UNSAFE.test(target)) return ''
+      return /\s/u.test(target) ? `@"${target}"` : `@${target}`
+    }
+
+    function mentionLabel(token) {
+      const trimmed = String(token ?? '')
+        .replace(/^@+/, '')
+        .replace(/^"|"$/g, '')
+        .replace(/\/+$/, '')
+      return baseName(trimmed)
+    }
+
+    // A chip this plugin puts into the composer carries its line range inside
+    // itself: the draft shows `state.js:13-19`, and the message keeps
+    // `@state.js (строки 13-19)`. DSH's own `@` source serializes a reference to
+    // the bare path, so the lines would be lost on send; a second source of our
+    // own is the only hook the shell offers for a custom serialization. The
+    // fragment stays out of the visible token:
+    // `#L13-L19` rides after it and is stripped before the path is resolved.
+    const CHIP_SOURCE = 'dsh-ide-file'
+    const CHIP_RANGE = /#L(\d+)(?:-L?(\d+))?$/u
+
+    function chipBounds(lineRange) {
+      if (lineRange === undefined || lineRange === null) return undefined
+      if (typeof lineRange.start !== 'number' || typeof lineRange.end !== 'number') return undefined
+      const from = Math.max(1, Math.round(Math.min(lineRange.start, lineRange.end)))
+      const to = Math.max(1, Math.round(Math.max(lineRange.start, lineRange.end)))
+      return { from, to }
+    }
+
+    function chipRangeWord(range) {
+      return range.from === range.to ? `строка ${range.from}` : `строки ${range.from}-${range.to}`
+    }
+
+    function chipRef(token, lineRange) {
+      const mention = String(token ?? '')
+      if (mention === '') return ''
+      const range = chipBounds(lineRange)
+      if (range === undefined) return mention
+      return `${mention}#L${range.from}${range.from === range.to ? '' : `-L${range.to}`}`
+    }
+
+    function parseChipRef(ref) {
+      const text = String(ref ?? '').trim()
+      if (text === '') return undefined
+      const match = CHIP_RANGE.exec(text)
+      const mention = match === null ? text : text.slice(0, match.index)
+      const path = mention
+        .replace(/^@/u, '')
+        .replace(/^"(.*)"$/u, '$1')
+        .replace(/\/+$/u, '')
+      if (path === '') return undefined
+      const range =
+        match === null ? undefined : chipBounds({ start: Number(match[1]), end: Number(match[2] ?? match[1]) })
+      return { path, range }
+    }
+
+    // The text a chip turns into when the draft is serialized for sending. The
+    // transcript still draws one chip for `@state.js`; the lines follow as
+    // prose, which is the only shape the model can read (a path with a range
+    // suffix would not resolve as a reference).
+    function chipMessageText(ref) {
+      const text = String(ref ?? '').trim()
+      const parsed = parseChipRef(text)
+      if (parsed === undefined || parsed.range === undefined) return text
+      const mention = text.slice(0, text.search(CHIP_RANGE))
+      return `${mention} (${chipRangeWord(parsed.range)})`
+    }
+
+    let chatSourceReady = false
+
+    function chatSource() {
+      return {
+        trigger: '@',
+        name: CHIP_SOURCE,
+        // Chips are inserted, never typed: the `@` menu must not grow a second
+        // file group, so the source answers no candidates.
+        showGroupTitle: false,
+        candidates: () => Promise.resolve([]),
+        onPick: () => undefined,
+        openReference: (session, reference) => openChipReference(session, reference),
+        codec: {
+          // The text the chip shows (and copies) is the mention itself; the
+          // range fragment is ours alone and never leaves the ref.
+          clipboardText: (ref) => {
+            const text = String(ref ?? '')
+            const at = text.search(CHIP_RANGE)
+            return at < 0 ? text : text.slice(0, at)
+          },
+          serialize: (ref) => Promise.resolve(chipMessageText(ref)),
+        },
+      }
+    }
+
+    // Registered once, on the first chip: the `inputTriggers` service belongs
+    // to the shell and may not exist yet when this plugin applies.
+    function ensureChatSource() {
+      if (chatSourceReady) return true
+      const ctx = services.ctx
+      if (ctx === undefined || ctx === null || typeof ctx.get !== 'function') return false
+      let triggers
+      try {
+        triggers = ctx.get('inputTriggers')
+      } catch (cause) {
+        return false
+      }
+      if (triggers === undefined || triggers === null || typeof triggers.registerSource !== 'function') return false
+      let dispose
+      try {
+        dispose = triggers.registerSource(chatSource())
+      } catch (cause) {
+        return false
+      }
+      if (typeof dispose !== 'function') return false
+      chatSourceReady = true
+      try {
+        if (typeof ctx.effect === 'function') {
+          // The source dies with the plugin, and the flag that guards its
+          // registration dies with it: a reloaded plugin registers again.
+          ctx.effect(
+            () => () => {
+              chatSourceReady = false
+              try {
+                dispose()
+              } catch (cause) {
+                /* already gone */
+              }
+            },
+            'dsh-ide: @ reference source',
+          )
+        }
+      } catch (cause) {
+        /* the source stands for the life of the app either way */
+      }
+      return true
+    }
+
+    // A click on one of our chips reveals the file in the IDE pane and puts the
+    // selection on the lines the chip names.
+    function openChipReference(session, reference) {
+      const parsed = parseChipRef(reference === undefined || reference === null ? '' : reference.ref)
+      if (parsed === undefined) return false
+      const sessionId = session === undefined || session === null ? undefined : session.sessionId
+      if (typeof sessionId !== 'string' || sessionId === '') return false
+      const sidebar = services.sidebarRight
+      try {
+        if (sidebar && typeof sidebar.openResourceIn === 'function') {
+          sidebar.openResourceIn(sessionId, fileAddress(sessionId, parsed.path), { kind: TAB_KIND })
+        } else if (sidebar && typeof sidebar.openResource === 'function') {
+          sidebar.openResource(fileAddress(sessionId, parsed.path))
+        }
+      } catch (cause) {
+        /* an unwired sidebar must not swallow the click */
+      }
+      const range = parsed.range === undefined ? undefined : { start: parsed.range.from, end: parsed.range.to }
+      requestOpen(sessionId, parsed.path, range)
+      return true
     }
 
     function sessionIdFromElement(element) {
@@ -327,6 +503,144 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------- explorer
 
     /**
+     * Smallest single region two versions of a text differ in: the common
+     * prefix and suffix are the same in both, so one replacement describes the
+     * change. Used for the change history, where storing whole files per edit
+     * would be wasteful.
+     */
+    function changedRegion(before, after) {
+      if (before === after) return undefined
+      let start = 0
+      const limit = Math.min(before.length, after.length)
+      while (start < limit && before.charCodeAt(start) === after.charCodeAt(start)) start += 1
+      let tail = 0
+      while (
+        tail < limit - start &&
+        before.charCodeAt(before.length - 1 - tail) === after.charCodeAt(after.length - 1 - tail)
+      ) {
+        tail += 1
+      }
+      return {
+        start,
+        before: before.slice(start, before.length - tail),
+        after: after.slice(start, after.length - tail),
+      }
+    }
+
+    /**
+     * Review of one assistant turn: the side-by-side comparison plus the list of
+     * files that turn touched. Each file carries the same two decisions Cursor
+     * offers (keep / undo), and the header applies them to the whole turn.
+     *
+     * A component rather than inline JSX: the editor surface of `IdeBody` is
+     * already the largest expression in this file.
+     */
+    function DiffReview({ view, work, onAccept, onRevert, onAcceptAll, onRevertAll, onOpenFile, onClose, containerRef }) {
+      const files = Array.isArray(view.files) ? view.files : []
+      const stateOf = (file) => work[`${view.seq}:${file.index}`]
+      const decided = (file) => {
+        const current = stateOf(file)
+        return current !== undefined && (current.phase === 'accepted' || current.phase === 'reverted')
+      }
+      const busy = files.some((file) => stateOf(file)?.phase === 'saving')
+      const totalAdded = files.reduce((sum, file) => sum + (Number(file.added) || 0), 0)
+      const totalDeleted = files.reduce((sum, file) => sum + (Number(file.deleted) || 0), 0)
+      const phaseLabel = (phase) =>
+        phase === 'accepted' ? 'принято' : phase === 'reverted' ? 'отменено' : phase === 'saving' ? 'откатываю…' : 'не вышло'
+      return h(
+        'div',
+        { className: 'dsh-ide-diffview', 'data-phase': view.phase },
+        h(
+          'div',
+          { className: 'dsh-ide-diffview-head' },
+          h('span', { className: 'dsh-ide-diffview-title' }, view.display || view.path),
+          h(
+            'span',
+            { className: 'dsh-ide-diffview-sub' },
+            `${files.length === 1 ? '1 файл' : `файлов: ${files.length}`} · +${totalAdded} −${totalDeleted} · начало и конец хода`,
+          ),
+          h('span', { className: 'dsh-ide-diffview-spacer' }),
+          view.phase === 'pending' ? h('span', { className: 'dsh-ide-diffview-note' }, 'Читаю снимок…') : null,
+          view.phase === 'failed' ? h('span', { className: 'dsh-ide-diffview-error' }, view.error) : null,
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-diffview-action',
+              disabled: busy,
+              title: 'Оставить правки всех файлов хода',
+              onClick: () => onAcceptAll(),
+            },
+            'Принять все',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-diffview-action dsh-ide-diffview-danger',
+              disabled: busy,
+              title: 'Вернуть все файлы хода к его началу',
+              onClick: () => onRevertAll(),
+            },
+            'Отменить все',
+          ),
+          h('button', { type: 'button', className: 'dsh-ide-diffview-action', onClick: () => onClose() }, 'Закрыть'),
+        ),
+        h('div', { className: 'dsh-ide-diffview-body', ref: containerRef }),
+        files.length === 0
+          ? null
+          : h(
+              'div',
+              { className: 'dsh-ide-diffview-files' },
+              h('div', { className: 'dsh-ide-diffview-files-head' }, files.length === 1 ? '1 файл' : `Файлов: ${files.length}`),
+              files.map((file) => {
+                const display = String(file.display || file.path)
+                const state = stateOf(file)
+                return h(
+                  'div',
+                  { key: String(file.index), className: 'dsh-ide-diffview-file' },
+                  h('span', { className: 'dsh-ide-change-name' }, baseName(display)),
+                  dirName(display) === '' ? null : h('span', { className: 'dsh-ide-change-dir' }, dirName(display)),
+                  h('span', { className: 'dsh-ide-change-added' }, `+${file.added}`),
+                  h('span', { className: 'dsh-ide-change-removed' }, `−${file.deleted}`),
+                  state === undefined
+                    ? null
+                    : h('span', { className: `dsh-ide-assist-work dsh-ide-assist-work-${state.phase}` }, phaseLabel(state.phase)),
+                  h('span', { className: 'dsh-ide-diffview-spacer' }),
+                  h(
+                    'button',
+                    { type: 'button', className: 'dsh-ide-diffview-action', onClick: () => onOpenFile(file.path) },
+                    'Открыть',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-diffview-action',
+                      disabled: decided(file) || busy,
+                      title: 'Оставить правки этого файла как есть',
+                      onClick: () => onAccept(file),
+                    },
+                    'Принять',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-diffview-action dsh-ide-diffview-danger',
+                      disabled: decided(file) || busy,
+                      title: 'Вернуть этот файл к состоянию до хода',
+                      onClick: () => onRevert(file),
+                    },
+                    'Отменить',
+                  ),
+                )
+              }),
+            ),
+      )
+    }
+
+    /**
      * Workspace explorer. Folders load on first expand; the filter box switches
      * the view to a flat, fuzzy list served by the `files` route so a match in
      * a collapsed folder is still findable.
@@ -337,6 +651,18 @@ window.__ModuleLoader__.load({
       const activePath = typeof props.activePath === 'string' ? props.activePath : ''
       const onOpenFile = props.onOpenFile
       const onToggleHidden = props.onToggleHidden
+      const onInsertReference = props.onInsertReference
+      const searchOpen = props.searchOpen === true
+      const onCloseSearch = props.onCloseSearch
+      const changesOpen = props.changesOpen === true
+      const changes = Array.isArray(props.changes) ? props.changes : []
+      const onCloseChanges = props.onCloseChanges
+      const onOpenChange = props.onOpenChange
+      const onRevertChange = props.onRevertChange
+      // Host-side checkpoints: read-only view of what the assistant changed,
+      // fetched on demand because the diff needs a snapshot read per file.
+      const assistant = props.assistant === undefined ? { phase: 'idle', available: true, turns: [], error: '' } : props.assistant
+      const assistantTurns = Array.isArray(assistant.turns) ? assistant.turns : []
       // The menu bar asks for a refresh without owning the tree's internal state.
       const reloadSignal = props.reloadSignal === undefined ? 0 : props.reloadSignal
 
@@ -354,7 +680,19 @@ window.__ModuleLoader__.load({
       // the name is typed straight into the tree instead of a modal dialog.
       const [draft, setDraft] = React.useState(undefined)
       const [draftError, setDraftError] = React.useState('')
+      /** Per-file decision in the assistant list: `{phase, error}` keyed by `seq:index`.
+       * It lives in `IdeBody`, because the same decision has to be visible both
+       * in this list and in the toolbar of the side-by-side comparison. */
+      const assistantWork = props.assistantWork === undefined ? {} : props.assistantWork
+      const onOpenDiff = props.onOpenDiff
+      const onAcceptAssistant = props.onAcceptAssistant
+      const onRevertAssistant = props.onRevertAssistant
       const [rootOpen, setRootOpen] = React.useState(true)
+      // File content search: the panel owns its query and results, the explorer
+      // only decides whether to show it instead of the tree.
+      const [searchQuery, setSearchQuery] = React.useState('')
+      const [searchResult, setSearchResult] = React.useState({ phase: 'idle', matches: [], truncated: false, error: '' })
+      const searchInputRef = React.useRef(undefined)
       const expandedRef = React.useRef(new Set())
       const selected = props.selected
       const selectRow = (path, type) => {
@@ -363,6 +701,41 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         expandedRef.current = expanded
       }, [expanded])
+      // The scan happens on the Host and is local: it works without the Tab
+      // opt-in and never reaches a model. A new keystroke aborts the old walk so
+      // a slow folder cannot answer a query the user already replaced.
+      React.useEffect(() => {
+        if (!searchOpen) return undefined
+        const needle = searchQuery.trim()
+        if (needle === '' || typeof sessionId !== 'string' || sessionId === '') {
+          setSearchResult({ phase: 'idle', matches: [], truncated: false, error: '' })
+          return undefined
+        }
+        const controller = new AbortController()
+        const timer = window.setTimeout(() => {
+          setSearchResult((previous) => ({ ...previous, phase: 'pending', error: '' }))
+          void call('searchText', { sessionId, query: needle, limit: 50 }, controller.signal)
+            .then((payload) => {
+              if (controller.signal.aborted) return
+              const matches = payload !== null && Array.isArray(payload.matches) ? payload.matches : []
+              setSearchResult({ phase: 'ready', matches, truncated: payload?.truncated === true, error: '' })
+            })
+            .catch((cause) => {
+              if (controller.signal.aborted) return
+              if (cause !== null && typeof cause === 'object' && cause.code === 'cancelled') return
+              setSearchResult({ phase: 'failed', matches: [], truncated: false, error: describeError(cause) })
+            })
+        }, 250)
+        return () => {
+          window.clearTimeout(timer)
+          controller.abort()
+        }
+      }, [searchOpen, searchQuery, sessionId])
+      React.useEffect(() => {
+        if (!searchOpen) return undefined
+        const timer = window.setTimeout(() => searchInputRef.current?.focus(), 0)
+        return () => window.clearTimeout(timer)
+      }, [searchOpen])
       // New files and folders land in the selected folder, or next to the
       // selected file, exactly like the VS Code explorer.
       const targetDirectory = () => {
@@ -397,9 +770,18 @@ window.__ModuleLoader__.load({
           items.push({ id: 'toggle', label: expanded.has(target.path) ? 'Свернуть' : 'Развернуть', run: () => toggle(target.path, cache.has(target.path)) })
           items.push({ id: 'new-file', label: 'Новый файл…', run: () => props.onNewFile(target.path) })
           items.push({ id: 'new-folder', label: 'Новая папка…', run: () => props.onNewFolder(target.path) })
+          if (typeof props.onQuoteFile === 'function') {
+            items.push({ id: 'quote', label: 'Добавить в чат', key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, true) })
+          }
           items.push({ separator: true })
         } else {
           items.push({ id: 'open', label: 'Открыть', run: () => onOpenFile(target.path) })
+          if (typeof props.onQuoteFile === 'function') {
+            items.push({ id: 'quote', label: 'Добавить в чат', key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, false) })
+          }
+          if (typeof props.onQuoteLines === 'function') {
+            items.push({ id: 'quote-lines', label: 'Добавить строки в чат…', run: () => props.onQuoteLines(target.path) })
+          }
           items.push({ separator: true })
         }
         items.push({
@@ -597,6 +979,16 @@ window.__ModuleLoader__.load({
                     selectRow(file.path, file.type === 'directory' ? 'directory' : 'file')
                     onOpenFile(file.path)
                   },
+                  draggable: true,
+                  onDragStart: (event) => {
+                    const token = mentionText(file.path, file.type === 'directory')
+                    if (token === '') return
+                    // Both payloads carry the mention token, so a drop that lands
+                    // on the chat composer itself also becomes a reference.
+                    event.dataTransfer.setData('application/x-dsh-ide-file', token)
+                    event.dataTransfer.setData('text/plain', token)
+                    event.dataTransfer.effectAllowed = 'copy'
+                  },
                   onContextMenu: (event) => {
                     event.preventDefault()
                     selectRow(file.path, file.type === 'directory' ? 'directory' : 'file')
@@ -640,6 +1032,14 @@ window.__ModuleLoader__.load({
                     selectRow(path, isDirectory ? 'directory' : 'file')
                     if (isDirectory) toggle(path, cache.has(path))
                     else onOpenFile(path)
+                  },
+                  draggable: true,
+                  onDragStart: (event) => {
+                    const token = mentionText(path, isDirectory)
+                    if (token === '') return
+                    event.dataTransfer.setData('application/x-dsh-ide-file', token)
+                    event.dataTransfer.setData('text/plain', token)
+                    event.dataTransfer.effectAllowed = 'copy'
                   },
                   onContextMenu: (event) => {
                     event.preventDefault()
@@ -698,6 +1098,358 @@ window.__ModuleLoader__.load({
         if (rootOpen) walk('', 1)
         if (rootListing === undefined) rows.push(h('div', { key: 'loading', className: 'dsh-ide-tree-empty', style: { paddingLeft: '20px' } }, pending === '' ? 'Загрузка…' : 'Читаю папку…'))
         if (error !== '') rows.unshift(h('div', { key: 'tree-error', className: 'dsh-ide-tree-error' }, error))
+      }
+
+      if (changesOpen) {
+        // The comparison is read per file, on demand: the recorder keeps the
+        // snapshots, and pulling every file of every turn up front would be a
+        // lot of reads for a list the user may not open at all.
+        const assistantKey = (turn, file) => `${turn.seq}:${file.index}`
+        const assistantRows = []
+        if (assistant.phase === 'pending') {
+          assistantRows.push(h('div', { key: 'assistant-pending', className: 'dsh-ide-tree-empty' }, 'Читаю ходы…'))
+        } else if (assistant.phase === 'failed') {
+          assistantRows.push(h('div', { key: 'assistant-error', className: 'dsh-ide-tree-error' }, assistant.error))
+        } else if (assistant.available === false) {
+          assistantRows.push(h('div', { key: 'assistant-off', className: 'dsh-ide-tree-empty' }, 'Этот Host не ведёт контрольные точки ходов'))
+        } else if (assistantTurns.length === 0) {
+          assistantRows.push(h('div', { key: 'assistant-empty', className: 'dsh-ide-tree-empty' }, 'Ассистент ещё не менял файлы в этой сессии'))
+        } else {
+          for (const turn of assistantTurns) {
+            const files = Array.isArray(turn.files) ? turn.files : []
+            assistantRows.push(
+              h(
+                'div',
+                {
+                  key: `turn-${turn.seq}`,
+                  className: turn.stale === true ? 'dsh-ide-assist-turn dsh-ide-assist-turn-stale' : 'dsh-ide-assist-turn',
+                  role: 'listitem',
+                },
+                h(
+                  'div',
+                  { className: 'dsh-ide-assist-turn-head' },
+                  h('span', { className: 'dsh-ide-assist-turn-title' }, turn.turn === 0 ? 'Ход' : `Ход ${turn.turn}`),
+                  h(
+                    'span',
+                    { className: 'dsh-ide-assist-turn-count' },
+                    turn.stale === true ? 'снимок недоступен' : `+${turn.added} −${turn.deleted} · файлов: ${turn.total}`,
+                  ),
+                ),
+                // A stale turn kept its place in the list on purpose: dropping it
+                // would erase history the user already saw, so it is shown greyed
+                // out without actions instead of disappearing.
+                turn.stale === true
+                  ? h(
+                      'div',
+                      { className: 'dsh-ide-assist-note' },
+                      'Снимок хода больше недоступен — сравнение и откат открыть нельзя.',
+                    )
+                  : files.map((file) => {
+                  const key = assistantKey(turn, file)
+                  const display = String(file.display || file.path)
+                  const work = assistantWork[key]
+                  const decided = work !== undefined && (work.phase === 'accepted' || work.phase === 'reverted')
+                  return h(
+                    'div',
+                    { key, className: 'dsh-ide-assist-file' },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-ide-assist-file-head',
+                        title: `${display} — сравнение начала и конца хода`,
+                        onClick: () => {
+                          if (typeof onOpenDiff === 'function') onOpenDiff(turn, file)
+                        },
+                      },
+                      h('span', { className: 'dsh-ide-change-name' }, baseName(display)),
+                      dirName(display) === '' ? null : h('span', { className: 'dsh-ide-change-dir' }, dirName(display)),
+                      file.binary === true ? h('span', { className: 'dsh-ide-assist-flag' }, 'bin') : null,
+                      file.oversized === true ? h('span', { className: 'dsh-ide-assist-flag' }, 'большой') : null,
+                    ),
+                    h(
+                      'div',
+                      { className: 'dsh-ide-change-meta' },
+                      h('span', { className: 'dsh-ide-change-added' }, `+${file.added}`),
+                      h('span', { className: 'dsh-ide-change-removed' }, `−${file.deleted}`),
+                      typeof onOpenFile === 'function'
+                        ? h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-ide-change-revert',
+                              title: 'Открыть файл в редакторе',
+                              onClick: () => onOpenFile(file.path),
+                            },
+                            'Открыть',
+                          )
+                        : null,
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-assist-accept',
+                          disabled: decided || work?.phase === 'saving',
+                          title: 'Оставить правки ассистента как есть',
+                          onClick: () => {
+                            if (typeof onAcceptAssistant === 'function') onAcceptAssistant(turn, file)
+                          },
+                        },
+                        'Принять правки',
+                      ),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-assist-revert',
+                          disabled: decided || work?.phase === 'saving',
+                          title: 'Вернуть файл к состоянию до хода',
+                          onClick: () => {
+                            if (typeof onRevertAssistant === 'function') onRevertAssistant(turn, file)
+                          },
+                        },
+                        'Отменить правки',
+                      ),
+                      work === undefined
+                        ? null
+                        : h(
+                            'span',
+                            { className: `dsh-ide-assist-work dsh-ide-assist-work-${work.phase}` },
+                            work.phase === 'accepted'
+                              ? 'принято'
+                              : work.phase === 'reverted'
+                                ? 'отменено'
+                                : work.phase === 'saving'
+                                  ? 'откатываю…'
+                                  : 'не вышло',
+                          ),
+                    ),
+                    work !== undefined && work.phase === 'failed' && work.error !== ''
+                      ? h('div', { className: 'dsh-ide-assist-error' }, work.error)
+                      : null,
+                  )
+                }),
+              ),
+            )
+          }
+        }
+        const rows =
+          changes.length === 0
+            ? [h('div', { key: 'changes-empty', className: 'dsh-ide-tree-empty' }, 'Принятых правок в этой сессии пока нет')]
+            : changes.map((change) => {
+                const added = change.after === '' ? 0 : change.after.split('\n').length
+                const removed = change.before === '' ? 0 : change.before.split('\n').length
+                const status = change.reverted === true ? 'возвращено' : change.saved === true ? 'сохранено' : 'в буфере'
+                return h(
+                  'div',
+                  { key: String(change.id), className: 'dsh-ide-change-row', role: 'listitem' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-change-head',
+                      title: `${change.path} · ${status}`,
+                      onClick: () => {
+                        if (typeof onOpenChange === 'function') onOpenChange(change)
+                      },
+                    },
+                    h('span', { className: 'dsh-ide-change-name' }, baseName(change.path)),
+                    dirName(change.path) === '' ? null : h('span', { className: 'dsh-ide-change-dir' }, dirName(change.path)),
+                  ),
+                  h(
+                    'div',
+                    { className: 'dsh-ide-change-meta' },
+                    h('span', { className: 'dsh-ide-change-added' }, `+${added}`),
+                    h('span', { className: 'dsh-ide-change-removed' }, `−${removed}`),
+                    h('span', { className: `dsh-ide-change-status dsh-ide-change-${status === 'в буфере' ? 'buffer' : status === 'сохранено' ? 'saved' : 'reverted'}` }, status),
+                    change.error === undefined ? null : h('span', { className: 'dsh-ide-change-error' }, change.error),
+                    change.reverted === true
+                      ? null
+                      : h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-change-revert',
+                            title: 'Вернуть текст до правки',
+                            onClick: () => {
+                              if (typeof onRevertChange === 'function') onRevertChange(change)
+                            },
+                          },
+                          'Вернуть',
+                        ),
+                  ),
+                )
+              })
+        return h(
+          'div',
+          { className: 'dsh-ide-explorer' },
+          h(
+            'div',
+            { className: 'dsh-ide-explorer-head' },
+            h('span', { className: 'dsh-ide-explorer-title' }, 'ИЗМЕНЕНИЯ'),
+            h(
+              'span',
+              { className: 'dsh-ide-explorer-actions' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-icon-button',
+                  title: 'Закрыть список изменений',
+                  'aria-label': 'Закрыть список изменений',
+                  onClick: () => {
+                    if (typeof onCloseChanges === 'function') onCloseChanges()
+                  },
+                },
+                '✕',
+              ),
+            ),
+          ),
+          h('div', { className: 'dsh-ide-change-section' }, 'Правки ассистента'),
+          h('div', { className: 'dsh-ide-change-hint' }, 'Снимок начала и конца хода — не текущий диск'),
+          h('div', { className: 'dsh-ide-tree dsh-ide-assist-list', role: 'list' }, assistantRows),
+          h('div', { className: 'dsh-ide-change-section' }, 'Мои правки'),
+          h('div', { className: 'dsh-ide-change-hint' }, 'Правки этой сессии: принято в буфер, сохранено, возвращено'),
+          h('div', { className: 'dsh-ide-tree dsh-ide-change-list', role: 'list' }, rows),
+        )
+      }
+
+      if (searchOpen) {
+        const statusText =
+          searchResult.phase === 'failed'
+            ? searchResult.error
+            : searchResult.phase === 'pending' && searchResult.matches.length === 0
+              ? 'Ищу…'
+              : searchResult.phase === 'ready'
+                ? `${searchResult.matches.length}${searchResult.truncated ? '+' : ''} совпадений${
+                    searchResult.truncated ? ' · упёрлись в лимит, покажу не всё' : ''
+                  }`
+                : 'Введите текст — поиск идёт по рабочей папке'
+        // Group by file: a flat list of `path:line` rows reads as one grey wall,
+        // and there is no visible boundary between two files with the same name.
+        const groups = []
+        const groupOf = new Map()
+        for (const match of searchResult.matches) {
+          let group = groupOf.get(match.path)
+          if (group === undefined) {
+            group = { path: match.path, hits: [] }
+            groupOf.set(match.path, group)
+            groups.push(group)
+          }
+          group.hits.push(match)
+        }
+        const previewParts = (match) => {
+          const preview = String(match.preview ?? '')
+          const needle = typeof match.match === 'string' ? match.match : ''
+          if (needle === '') return [preview]
+          const at = preview.toLowerCase().indexOf(needle.toLowerCase())
+          if (at < 0) return [preview]
+          return [
+            preview.slice(0, at),
+            h('mark', { key: 'mark', className: 'dsh-ide-search-mark' }, preview.slice(at, at + needle.length)),
+            preview.slice(at + needle.length),
+          ]
+        }
+        const rows =
+          searchResult.phase === 'failed'
+            ? [h('div', { key: 'search-error', className: 'dsh-ide-tree-error' }, searchResult.error)]
+            : searchResult.phase === 'ready' && searchResult.matches.length === 0
+              ? [h('div', { key: 'search-empty', className: 'dsh-ide-tree-empty' }, 'Ничего не найдено')]
+              : groups.map((group) =>
+                  h(
+                    'div',
+                    { key: group.path, className: 'dsh-ide-search-file', role: 'group' },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-search-file-head', title: group.path },
+                      h('span', { className: 'dsh-ide-search-file-name' }, baseName(group.path)),
+                      dirName(group.path) === '' ? null : h('span', { className: 'dsh-ide-search-file-dir' }, dirName(group.path)),
+                      h('span', { className: 'dsh-ide-search-file-count' }, String(group.hits.length)),
+                    ),
+                    group.hits.map((match, index) =>
+                      h(
+                        'div',
+                        {
+                          key: `${match.line}:${match.column}:${index}`,
+                          className: 'dsh-ide-search-row',
+                          role: 'listitem',
+                        },
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-search-hit',
+                            title: `${match.path}:${match.line}:${match.column}`,
+                            onClick: () => {
+                              if (typeof onOpenFile === 'function') onOpenFile(match.path, match.line)
+                            },
+                          },
+                          h('span', { className: 'dsh-ide-search-line' }, String(match.line)),
+                          h('span', { className: 'dsh-ide-search-preview' }, previewParts(match)),
+                        ),
+                        typeof onInsertReference === 'function'
+                          ? h(
+                              'button',
+                              {
+                                type: 'button',
+                                className: 'dsh-ide-icon-button',
+                                title: 'Добавить ссылку в чат',
+                                'aria-label': 'Добавить ссылку в чат',
+                                onClick: () => onInsertReference(match.path, match.line),
+                              },
+                              '@',
+                            )
+                          : null,
+                      ),
+                    ),
+                  ),
+                )
+        return h(
+          'div',
+          { className: 'dsh-ide-explorer' },
+          h(
+            'div',
+            { className: 'dsh-ide-explorer-head' },
+            h('span', { className: 'dsh-ide-explorer-title' }, 'ПОИСК В ФАЙЛАХ'),
+            h(
+              'span',
+              { className: 'dsh-ide-explorer-actions' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-icon-button',
+                  title: 'Закрыть поиск',
+                  'aria-label': 'Закрыть поиск',
+                  onClick: () => {
+                    if (typeof onCloseSearch === 'function') onCloseSearch()
+                  },
+                },
+                '✕',
+              ),
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsh-ide-explorer-search' },
+            h('input', {
+              ref: searchInputRef,
+              className: 'dsh-ide-search-input',
+              type: 'search',
+              value: searchQuery,
+              placeholder: 'Текст для поиска',
+              'aria-label': 'Поиск по содержимому файлов',
+              onChange: (event) => setSearchQuery(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key !== 'Escape') return
+                if (searchQuery !== '') setSearchQuery('')
+                else if (typeof onCloseSearch === 'function') onCloseSearch()
+              },
+            }),
+          ),
+          h('div', { className: 'dsh-ide-search-status' }, statusText),
+          h('div', { className: 'dsh-ide-tree dsh-ide-search-results', role: 'list' }, rows),
+        )
       }
 
       return h(
@@ -1069,6 +1821,75 @@ window.__ModuleLoader__.load({
       return scored.slice(0, 60).map((entry) => entry.file)
     }
 
+    /**
+     * Command palette. It runs the very same closures the menu bar runs, so a
+     * command cannot exist in one place and be missing or different in the
+     * other; a disabled menu item stays disabled here for the same reason.
+     */
+    function CommandPalette({ commands, onPick, onClose }) {
+      const [query, setQuery] = React.useState('')
+      const needle = query.trim().toLowerCase()
+      const visible = commands.filter(
+        (entry) => needle === '' || `${entry.group} ${entry.label} ${entry.key === undefined ? '' : entry.key}`.toLowerCase().includes(needle),
+      )
+      const run = (entry) => {
+        if (entry.disabled === true) return
+        onPick(entry)
+      }
+      return h(
+        'div',
+        { className: 'dsh-ide-palette-layer', onClick: onClose },
+        h(
+          'div',
+          { className: 'dsh-ide-palette', onClick: (event) => event.stopPropagation() },
+          h('input', {
+            className: 'dsh-ide-palette-input',
+            type: 'text',
+            autoFocus: true,
+            placeholder: 'Команда…',
+            spellCheck: false,
+            value: query,
+            'aria-label': 'Палитра команд',
+            onChange: (event) => setQuery(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                onClose()
+                return
+              }
+              if (event.key !== 'Enter') return
+              event.preventDefault()
+              const first = visible.find((entry) => entry.disabled !== true)
+              if (first === undefined) onClose()
+              else run(first)
+            },
+          }),
+          h(
+            'div',
+            { className: 'dsh-ide-palette-list', role: 'list' },
+            visible.length === 0
+              ? h('div', { className: 'dsh-ide-palette-empty' }, 'Ничего не найдено')
+              : visible.map((entry) =>
+                  h(
+                    'button',
+                    {
+                      key: entry.id,
+                      type: 'button',
+                      className: `dsh-ide-palette-item${entry.disabled === true ? ' dsh-ide-palette-item-off' : ''}`,
+                      disabled: entry.disabled === true,
+                      title: entry.disabled === true ? 'Недоступно' : entry.label,
+                      onClick: () => run(entry),
+                    },
+                    h('span', { className: 'dsh-ide-palette-label' }, entry.label),
+                    h('span', { className: 'dsh-ide-palette-group' }, entry.group),
+                    entry.key === undefined ? null : h('span', { className: 'dsh-ide-palette-key' }, entry.key),
+                  ),
+                ),
+          ),
+        ),
+      )
+    }
+
     function QuickOpen({ files, loading, error, onPick, onClose }) {
       const [query, setQuery] = React.useState('')
       const [index, setIndex] = React.useState(0)
@@ -1356,6 +2177,17 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = React.useState('')
       const [query, setQuery] = React.useState('')
       const [section, setSection] = React.useState('completion')
+      // Chord drafts, one per IDE command. Empty means "the default chord"; the
+      // Host stores only the strings that parse and differ from the default.
+      const [keyDraft, setKeyDraft] = React.useState(() => {
+        const initial = {}
+        const stored = keybindingsOf(preferences)
+        for (const command of KEY_COMMANDS) {
+          const saved = stored === undefined || stored === null ? undefined : stored[command.id]
+          initial[command.id] = typeof saved === 'string' && saved !== '' ? saved : command.chord
+        }
+        return initial
+      })
       // Every Tab knob lives in one object: it starts from the stored
       // preferences and travels back to the Host as one patch.
       const [options, setOptions] = React.useState(() => {
@@ -1467,6 +2299,17 @@ window.__ModuleLoader__.load({
                 ? String(options[entry.key] ?? entry.value)
                 : toNumber(options[entry.key], entry.value)
         }
+        const issues = keyIssues()
+        if (issues.size > 0) {
+          setMessage(`Клавиши: ${issues.values().next().value}`)
+          return
+        }
+        const keybindings = {}
+        for (const command of KEY_COMMANDS) {
+          const text = String(keyDraft[command.id] ?? command.chord).trim()
+          if (text !== command.chord) keybindings[command.id] = text
+        }
+        patch.keybindings = keybindings
         onSave(patch)
       }
 
@@ -1781,10 +2624,98 @@ window.__ModuleLoader__.load({
       const hintsRows = [promptRow, ...rowsForKeyList(REQUEST_KEYS)]
       const hintFilterRows = rowsForKeyList(CHECK_KEYS)
 
+      // A chord the user typed may be unparsable or already taken; the section
+      // says which, and `submit` refuses to save while any row is unhappy.
+      const keyIssues = () => {
+        const issues = new Map()
+        const seen = new Map()
+        for (const command of KEY_COMMANDS) {
+          const text = String(keyDraft[command.id] ?? command.chord).trim()
+          if (text === '') {
+            issues.set(command.id, 'Пусто — останется клавиша по умолчанию.')
+            continue
+          }
+          const parsed = parseChord(text)
+          if (parsed === undefined) {
+            issues.set(command.id, 'Не понял клавишу')
+            continue
+          }
+          const signature = `${parsed.ctrl ? 1 : 0}${parsed.alt ? 1 : 0}${parsed.shift ? 1 : 0}${parsed.meta ? 1 : 0}:${parsed.key}`
+          const other = seen.get(signature)
+          if (other !== undefined) {
+            issues.set(command.id, `Занято: ${other.label}`)
+            continue
+          }
+          seen.set(signature, command)
+        }
+        return issues
+      }
+
+      const keyIssuesNow = keyIssues()
+      // The chord list is wide and shallow, so it is a table rather than one
+      // setting block per command: the name column stays readable and the
+      // default chord sits next to the field instead of under the title.
+      const keyCommandRows = (() => {
+        const visible = KEY_COMMANDS.filter((command) => matches(`${command.label} ${command.chord}`))
+        if (visible.length === 0) return []
+        return [
+          h(
+            'div',
+            { className: 'dsh-ide-keys', key: 'keys-table' },
+            h(
+              'div',
+              { className: 'dsh-ide-keys-row dsh-ide-keys-head' },
+              h('span', { className: 'dsh-ide-keys-name' }, 'Команда'),
+              h('span', { className: 'dsh-ide-keys-chord' }, 'Клавиша'),
+              h('span', { className: 'dsh-ide-keys-reset' }, ''),
+            ),
+            visible.map((command) => {
+              const issue = keyIssuesNow.get(command.id)
+              return h(
+                'div',
+                { className: 'dsh-ide-keys-row', key: command.id, 'data-invalid': issue !== undefined },
+                h(
+                  'span',
+                  { className: 'dsh-ide-keys-name' },
+                  command.label,
+                  keyDraft[command.id] === command.chord
+                    ? null
+                    : h('span', { className: 'dsh-ide-keys-default' }, `по умолчанию ${command.chord}`),
+                ),
+                h(
+                  'span',
+                  { className: 'dsh-ide-keys-chord' },
+                  h('input', {
+                    className: 'dsh-ide-input dsh-ide-key-input',
+                    value: keyDraft[command.id],
+                    spellCheck: false,
+                    'aria-label': command.label,
+                    'aria-invalid': issue !== undefined,
+                    onChange: (event) => setKeyDraft((current) => ({ ...current, [command.id]: event.target.value })),
+                  }),
+                  issue === undefined ? null : h('span', { className: 'dsh-ide-key-error' }, issue),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dsh-ide-icon-button dsh-ide-keys-reset',
+                    title: `Вернуть по умолчанию: ${command.chord}`,
+                    onClick: () => setKeyDraft((current) => ({ ...current, [command.id]: command.chord })),
+                  },
+                  '↺',
+                ),
+              )
+            }),
+          ),
+        ]
+      })()
+
       const sections = [
         { id: 'completion', label: 'Автодополнение', rows: completionRows },
         { id: 'hints', label: 'Подсказки ИИ', rows: hintsRows },
         { id: 'hints-filters', label: 'Проверки подсказок', rows: hintFilterRows },
+        { id: 'keys', label: 'Клавиши', rows: keyCommandRows },
         { id: 'key', label: 'API-ключ', rows: keyRows },
         { id: 'context', label: 'Контекст', rows: contextRows },
       ]
@@ -2086,6 +3017,170 @@ const TAB_PREFERENCES = [
   { key: 'heuristicRevertingChange', kind: 'boolean', value: true, title: 'Проверка: отмена правки', hint: 'Не предлагать текст, который пользователь только что удалил.' },
 ]
 
+// Chords the IDE owns. A user override lives in `preferences.keybindings` and is
+// applied at dispatch time instead of at registration: Monaco cannot change a
+// chord after `addCommand`, and a remapped chord must also stop working.
+const KEY_COMMANDS = [
+  { id: 'save', label: 'Сохранить файл', chord: 'Ctrl+S' },
+  { id: 'save-all', label: 'Сохранить всё', chord: 'Ctrl+Shift+S' },
+  { id: 'quick-open', label: 'Открыть файл по имени', chord: 'Ctrl+P' },
+  { id: 'close-tab', label: 'Закрыть вкладку', chord: 'Ctrl+W' },
+  { id: 'next-tab', label: 'Следующая вкладка', chord: 'Ctrl+Tab' },
+  { id: 'prev-tab', label: 'Предыдущая вкладка', chord: 'Ctrl+Shift+Tab' },
+  { id: 'search', label: 'Поиск в файлах', chord: 'Ctrl+Shift+F' },
+  { id: 'command-palette', label: 'Палитра команд', chord: 'Ctrl+Shift+P' },
+  { id: 'quote', label: 'Строки в чат', chord: 'Ctrl+L' },
+  { id: 'add-to-chat', label: 'Файл в чат', chord: 'Ctrl+Alt+C' },
+  { id: 'inline-edit', label: 'Изменить выделение', chord: 'Ctrl+Shift+K' },
+  { id: 'settings', label: 'Параметры', chord: 'Ctrl+,' },
+  { id: 'output', label: 'Журнал подсказок', chord: 'Ctrl+`' },
+]
+
+const COMMAND_HANDLERS = {
+  save: 'saveActive',
+  'save-all': 'saveAll',
+  'quick-open': 'openQuick',
+  'close-tab': 'closeActive',
+  'next-tab': 'nextTab',
+  'prev-tab': 'prevTab',
+  search: 'openSearch',
+  'command-palette': 'openPalette',
+  quote: 'quoteSelection',
+  'add-to-chat': 'addToChat',
+  'inline-edit': 'openInlineEdit',
+  settings: 'openSettings',
+  output: 'toggleOutput',
+}
+
+// Chord name -> Monaco KeyCode name. `+` itself is not bindable: it is the
+// separator.
+const CHORD_KEYS = (() => {
+  const keys = {
+    space: 'Space',
+    tab: 'Tab',
+    enter: 'Enter',
+    escape: 'Escape',
+    esc: 'Escape',
+    up: 'UpArrow',
+    down: 'DownArrow',
+    left: 'LeftArrow',
+    right: 'RightArrow',
+    home: 'Home',
+    end: 'End',
+    pageup: 'PageUp',
+    pagedown: 'PageDown',
+    insert: 'Insert',
+    delete: 'Delete',
+    del: 'Delete',
+    backspace: 'Backspace',
+    ',': 'Comma',
+    '.': 'Period',
+    '/': 'Slash',
+    '\\': 'Backslash',
+    ';': 'Semicolon',
+    "'": 'Quote',
+    '[': 'BracketLeft',
+    ']': 'BracketRight',
+    '-': 'Minus',
+    '=': 'Equal',
+    '`': 'Backquote',
+  }
+  for (let code = 65; code <= 90; code += 1) {
+    const letter = String.fromCharCode(code)
+    keys[letter.toLowerCase()] = `Key${letter}`
+  }
+  for (let digit = 0; digit <= 9; digit += 1) keys[String(digit)] = `Digit${digit}`
+  for (let n = 1; n <= 12; n += 1) keys[`f${n}`] = `F${n}`
+  return keys
+})()
+
+/**
+ * `Ctrl+Shift+K` -> `{ctrl:true, alt:false, shift:true, meta:false, key:'KeyK'}`.
+ * Returns undefined when the text is not a chord the IDE can compare.
+ */
+function parseChord(text) {
+  if (typeof text !== 'string') return undefined
+  const parts = text
+    .toLowerCase()
+    .split('+')
+    .map((part) => part.trim())
+    .filter((part) => part !== '')
+  if (parts.length === 0) return undefined
+  const chord = { ctrl: false, alt: false, shift: false, meta: false, key: '' }
+  for (const part of parts) {
+    if (part === 'ctrl' || part === 'control' || part === 'cmd' || part === 'command') chord.ctrl = true
+    else if (part === 'alt' || part === 'option') chord.alt = true
+    else if (part === 'shift') chord.shift = true
+    else if (part === 'win' || part === 'meta' || part === 'super') chord.meta = true
+    else {
+      const key = CHORD_KEYS[part]
+      if (key === undefined || chord.key !== '') return undefined
+      chord.key = key
+    }
+  }
+  if (chord.key === '') return undefined
+  return chord
+}
+
+/** A parsed chord back to text, for the help window. */
+function chordText(chord) {
+  const parts = []
+  if (chord.ctrl) parts.push('Ctrl')
+  if (chord.alt) parts.push('Alt')
+  if (chord.shift) parts.push('Shift')
+  if (chord.meta) parts.push('Win')
+  const key = chord.key
+  if (/^Key[A-Z]$/.test(key)) parts.push(key.slice(3))
+  else if (/^Digit[0-9]$/.test(key)) parts.push(key.slice(5))
+  else if (/^F[0-9]{1,2}$/.test(key)) parts.push(key)
+  else if (key === 'Escape') parts.push('Esc')
+  else if (key === 'UpArrow') parts.push('↑')
+  else if (key === 'DownArrow') parts.push('↓')
+  else if (key === 'LeftArrow') parts.push('←')
+  else if (key === 'RightArrow') parts.push('→')
+  else parts.push(key)
+  return parts.join('+')
+}
+
+/** Stored overrides, or undefined before the first `state` reply arrives. */
+function keybindingsOf(preferences) {
+  return preferences !== undefined && preferences !== null && typeof preferences === 'object' ? preferences.keybindings : undefined
+}
+
+/** The effective map: a stored override when it parses, the default otherwise. */
+function resolveKeymap(overrides) {
+  const configured = overrides !== undefined && overrides !== null && typeof overrides === 'object' ? overrides : {}
+  const map = new Map()
+  for (const command of KEY_COMMANDS) {
+    const custom = typeof configured[command.id] === 'string' ? parseChord(configured[command.id]) : undefined
+    map.set(command.id, custom !== undefined ? custom : parseChord(command.chord))
+  }
+  return map
+}
+
+// `event.code` is the physical key, so a chord keeps working on a non-Latin
+// layout. Monaco's own `IKeyboardEvent` carries the same DOM-style code.
+const DOM_CODE_ALIASES = {
+  ArrowUp: 'UpArrow',
+  ArrowDown: 'DownArrow',
+  ArrowLeft: 'LeftArrow',
+  ArrowRight: 'RightArrow',
+  NumpadEnter: 'Enter',
+}
+
+function matchChord(keymap, event) {
+  if (keymap === undefined || keymap === null) return undefined
+  const code = typeof event.code === 'string' ? DOM_CODE_ALIASES[event.code] ?? event.code : ''
+  if (code === '') return undefined
+  for (const [id, chord] of keymap) {
+    if (chord === undefined || chord.key !== code) continue
+    if (chord.ctrl !== (event.ctrlKey === true) || chord.alt !== (event.altKey === true)) continue
+    if (chord.shift !== (event.shiftKey === true) || chord.meta !== (event.metaKey === true)) continue
+    return id
+  }
+  return undefined
+}
+
 function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
   const entry = trace.length === 0 ? undefined : trace[Math.min(panel.index, trace.length - 1)]
   const conversation = entry === undefined ? undefined : entry.conversation
@@ -2204,6 +3299,19 @@ function IdeBody(props) {
         ghostZone: undefined,
         ghostTimer: 0,
         ghostKey: undefined,
+        // Inline Edit: one selection, one instruction, one reviewable
+        // replacement. The payload never contains Monaco objects.
+        inlineEdit: undefined,
+        inlineSeq: 0,
+        changeSeq: 0,
+        // Effective chord table (`Map` of command id -> parsed chord). Read by the
+        // editor's key dispatch, so a remap takes effect without re-registering.
+        keymap: undefined,
+        // Side-by-side comparison of an assistant turn: `{editor, original, modified}`.
+        diffEditor: undefined,
+        // One-shot caret target requested by a search hit, consumed once the tab
+        // owns the editor model.
+        pendingReveal: undefined,
         // Controller state for the ported Tab mechanics: the plan the Host
         // computed, how much of it was already accepted word by word, and the
         // per-tab histories that feed the bad-case checks.
@@ -2230,6 +3338,20 @@ function IdeBody(props) {
       const [status, setStatus] = React.useState({ kind: 'idle', message: '' })
       const [explorerWidth, setExplorerWidth] = React.useState(220)
       const [showTree, setShowTree] = React.useState(true)
+      const [searchOpen, setSearchOpen] = React.useState(false)
+      const [changes, setChanges] = React.useState([])
+      /** Host checkpoints of assistant turns: `{phase, available, turns, error}`. */
+      const [assistant, setAssistant] = React.useState({ phase: 'idle', available: true, turns: [], error: '' })
+      const [changesOpen, setChangesOpen] = React.useState(false)
+      /** Per-file decision on an assistant turn, keyed `seq:index`. */
+      const [assistantWork, setAssistantWork] = React.useState({})
+      /** Side-by-side comparison over the editor: `{phase, seq, index, path, display, before, after, language, error}`. */
+      const [diffView, setDiffView] = React.useState(undefined)
+      const diffContainerRef = React.useRef(undefined)
+      // Bumped after «Отменить правки» so the pane refetches the turn list
+      // instead of showing a snapshot the Host has already superseded.
+      const [changesReload, setChangesReload] = React.useState(0)
+      const [paletteOpen, setPaletteOpen] = React.useState(false)
       const [explorerSide, setExplorerSide] = React.useState('left')
       const [hidden, setHidden] = React.useState(false)
       const [preferences, setPreferences] = React.useState(undefined)
@@ -2255,6 +3377,10 @@ function IdeBody(props) {
       const [fontSize, setFontSize] = React.useState(13)
       const [wordWrap, setWordWrap] = React.useState(false)
       const [booted, setBooted] = React.useState(false)
+      const [dragOver, setDragOver] = React.useState('')
+      const [quotePrompt, setQuotePrompt] = React.useState(undefined)
+      const [inlineView, setInlineView] = React.useState(undefined)
+      const inlineInputRef = React.useRef(undefined)
       const [selected, setSelected] = React.useState(undefined)
       const selectedRef = React.useRef(undefined)
       selectedRef.current = selected
@@ -2275,6 +3401,14 @@ function IdeBody(props) {
       React.useEffect(() => {
         prefsRef.current = preferences
       }, [preferences])
+
+      // Same reason as `prefsRef`: the editor effect installs the key dispatch
+      // once, so the chord table has to be read through a ref.
+      const savedKeybindings = keybindingsOf(preferences)
+      const keymap = React.useMemo(() => resolveKeymap(savedKeybindings), [savedKeybindings])
+      React.useEffect(() => {
+        runtime.current.keymap = keymap
+      }, [keymap])
 
       const tabPref = (key, fallback) => {
         const saved = prefsRef.current
@@ -2321,6 +3455,419 @@ function IdeBody(props) {
         }
       }, [])
 
+      // ------------------------------------------------------------ "в чат"
+      //
+      // Inserts a quoted fragment into the current session's composer draft via
+      // the slot-provided `inputActions`. The full coordinates and the text both
+      // live in `text`; `summary` only controls how the draft displays it (see
+      // docs/dsh-code-editor.md, «Строки в чат»). Nothing is sent to the model:
+      // the user still has to press the ordinary send control.
+      const insertQuote = (text, summary) => {
+        const actions = props && props.inputActions
+        if (!actions || typeof actions.insertQuote !== 'function') {
+          setStatus({ kind: 'error', message: 'Чат недоступен в этой панели' })
+          return false
+        }
+        let accepted = false
+        try {
+          accepted = actions.insertQuote(text, summary) === true
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
+        setStatus(accepted ? { kind: 'ok', message: 'Добавлено в поле ввода' } : { kind: 'error', message: 'Поле ввода занято — очистите его и повторите' })
+        return accepted
+      }
+
+      // P6: «Объяснить» and «Подготовить план» only fill the chat composer with a
+      // ready request about the selection; the model call stays the user's own
+      // press of Enter in the standard composer. Sending from here would grant a
+      // new run nobody asked for.
+      const draftQuestion = (kind) => {
+        const editor = runtime.current.editor
+        const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (editor === undefined || active === undefined) {
+          setStatus({ kind: 'error', message: 'Откройте файл, о котором нужно спросить' })
+          return false
+        }
+        const model = editor.getModel()
+        if (model === null) return false
+        const selection = editor.getSelection()
+        const cursor = editor.getPosition()
+        const hasSelection = selection !== null && !selection.isEmpty()
+        const startLine = hasSelection ? selection.getStartPosition().lineNumber : cursor === null ? 0 : cursor.lineNumber
+        const endLine = hasSelection ? selection.getEndPosition().lineNumber : startLine
+        if (startLine === 0) {
+          setStatus({ kind: 'error', message: 'Курсор редактора недоступен' })
+          return false
+        }
+        const lineCount = model.getLineCount()
+        const from = Math.max(1, Math.min(startLine, endLine))
+        const to = Math.min(lineCount, Math.max(startLine, endLine))
+        let selected
+        if (hasSelection) {
+          selected = model.getValueInRange(selection)
+        } else {
+          const lines = []
+          for (let line = from; line <= to; line += 1) lines.push(model.getLineContent(line))
+          selected = lines.join('\n')
+        }
+        if (selected.trim() === '') {
+          setStatus({ kind: 'error', message: hasSelection ? 'Выделение пустое' : 'Строка пустая' })
+          return false
+        }
+        const actions = props && props.inputActions
+        if (!actions || typeof actions.insertText !== 'function') {
+          setStatus({ kind: 'error', message: 'Чат недоступен в этой панели' })
+          return false
+        }
+        const path = active.path
+        const question = kind === 'plan' ? 'Подготовь план изменения этого кода. Что нужно изменить: ' : 'Объясни этот код. Что именно непонятно: '
+        const language = typeof active.language === 'string' ? active.language : ''
+        const draft = `${question}\n\n${path}:${from}–${to}\n\`\`\`${language}\n${selected}\n\`\`\`\n`
+        const span = typeof actions.captureInsertion === 'function' ? actions.captureInsertion() : undefined
+        try {
+          actions.insertText(draft, span)
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
+        setStatus({ kind: 'ok', message: 'Черновик запроса в поле ввода — проверьте и отправьте сами.' })
+        return true
+      }
+
+      // Quote the current selection (or the current line when nothing is
+      // selected) from the live Monaco model, marking unsaved text as "из
+      // буфера". `lineRange` optionally overrides the selection with an explicit
+      // inclusive 1-based range { start, end }.
+      const quoteEditorFragment = (lineRange) => {
+        const editor = runtime.current.editor
+        const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (editor === undefined || active === undefined) return false
+        const model = editor.getModel()
+        if (model === null) return false
+        const selection = editor.getSelection()
+        const explicit = lineRange !== undefined && typeof lineRange.start === 'number' && typeof lineRange.end === 'number'
+        const cursor = editor.getPosition()
+        const hasSelection = !explicit && selection !== null && !selection.isEmpty()
+        const startLine = explicit ? lineRange.start : hasSelection ? selection.getStartPosition().lineNumber : cursor === null ? 0 : cursor.lineNumber
+        const endLine = explicit ? lineRange.end : hasSelection ? selection.getEndPosition().lineNumber : startLine
+        if (startLine === 0) {
+          setStatus({ kind: 'error', message: 'Курсор редактора недоступен' })
+          return false
+        }
+        const lineCount = model.getLineCount()
+        const from = Math.max(1, Math.min(startLine, endLine))
+        const to = Math.min(lineCount, Math.max(startLine, endLine))
+        let selected
+        if (explicit || !hasSelection) {
+          const lines = []
+          for (let line = from; line <= to; line += 1) lines.push(model.getLineContent(line))
+          selected = lines.join('\n')
+        } else {
+          selected = model.getValueInRange(selection)
+        }
+        if (selected.trim() === '') {
+          setStatus({ kind: 'error', message: hasSelection ? 'Выделение пустое' : 'Строка пустая' })
+          return false
+        }
+        const relativePath = active.path
+        const label = `${relativePath}:${from}–${to}${explicit || hasSelection ? '' : ' · из буфера'}`
+        const text = `${label}\n${selected}`
+        const summary = { label, title: 'Фрагмент из редактора', detail: relativePath, body: selected }
+        return insertQuote(text, summary)
+      }
+
+      // Quote a whole file (or an explicit line range of it) straight from the
+      // explorer without opening it as a tab. Reads the current on-disk bytes
+      // through the Host `open` route so the quote matches what is saved.
+      const quoteFile = async (filePath, lineRange) => {
+        const scope = stateRef.current.sessionId
+        if (typeof scope !== 'string' || scope === '') return false
+        const normalized = normalPath(filePath)
+        const explicit = lineRange !== undefined && typeof lineRange.start === 'number' && typeof lineRange.end === 'number'
+        let payload
+        try {
+          payload = await call('open', { sessionId: scope, path: normalized })
+        } catch (cause) {
+          setStatus({ kind: 'error', message: describeError(cause) })
+          return false
+        }
+        const text = payload === undefined ? '' : payload.text
+        if (typeof text !== 'string' || text.trim() === '') {
+          setStatus({ kind: 'error', message: 'Файл пустой' })
+          return false
+        }
+        const relativePath = payload && typeof payload.relativePath === 'string' && payload.relativePath !== '' ? payload.relativePath : normalized
+        const lines = text.split('\n')
+        let body
+        let from
+        let to
+        if (explicit) {
+          from = Math.max(1, Math.min(lineRange.start, lineRange.end))
+          to = Math.min(lines.length, Math.max(lineRange.start, lineRange.end))
+          body = lines.slice(from - 1, to).join('\n')
+        } else {
+          from = 1
+          to = lines.length
+          body = text
+        }
+        const label = `${relativePath}:${from}–${to}`
+        const summary = { label, title: 'Файл из проводника', detail: relativePath, body }
+        return insertQuote(`${label}\n${body}`, summary)
+      }
+
+      // --------------------------------------------------- ссылка в поле ввода
+      //
+      // The token itself is built by `mentionText`. The lines ride in the chip
+      // caption (`state.js:13-19`), never in the token: a reference resolves as
+      // a path, so `@file:12-40` would be read as a path with a colon in it and
+      // would not open anything.
+      const lineRangeBounds = (lineRange) => {
+        const valid = lineRange !== undefined && typeof lineRange.start === 'number' && typeof lineRange.end === 'number'
+        if (!valid) return undefined
+        return {
+          from: Math.max(1, Math.min(lineRange.start, lineRange.end)),
+          to: Math.max(1, Math.max(lineRange.start, lineRange.end)),
+        }
+      }
+
+      const lineRangeSuffix = (lineRange) => {
+        const bounds = lineRangeBounds(lineRange)
+        if (bounds === undefined) return ''
+        return bounds.from === bounds.to ? ` (строка ${bounds.from})` : ` (строки ${bounds.from}-${bounds.to})`
+      }
+
+      // The chip caption names the file and the lines it points at, the way the
+      // editor's own title does (`state.js:13-19`). It is display only: a
+      // reference is a path, so the lines travel in the label, never in the ref.
+      const chipCaption = (token, lineRange) => {
+        const name = mentionLabel(token)
+        const bounds = lineRangeBounds(lineRange)
+        if (bounds === undefined) return name
+        return bounds.from === bounds.to ? `${name}:${bounds.from}` : `${name}:${bounds.from}-${bounds.to}`
+      }
+
+      // A chip, not a decorated token. The `@` source only answers a click when
+      // the reference arrives with an appearance (`openReference` in the shell
+      // returns false for everything but `file`), and a typed `@path` carries
+      // no appearance at all: the composer still draws it as a reference, but
+      // the click is inert. A chip lives in the session input machine, so ask
+      // that machine for one through the very event the `@` menu uses. When the
+      // hook is out of reach, the plain token below remains the fallback — it
+      // renders the same way, it just is not clickable.
+      const INSERT_REFERENCE = 'slash/input-insert-reference'
+
+      const insertChatChip = (token, appearance, caption, lineRange) => {
+        const actions = props && props.inputActions
+        const context =
+          typeof services.sessionContext === 'function' ? services.sessionContext(sessionId) : undefined
+        if (context === undefined || context === null || typeof context.bail !== 'function') return false
+        if (!actions || typeof actions.captureInsertion !== 'function') return false
+        let span
+        try {
+          span = actions.captureInsertion()
+        } catch (cause) {
+          return false
+        }
+        if (span === null || typeof span !== 'object' || typeof span.start !== 'number') return false
+        const fallback = mentionLabel(token)
+        const label =
+          typeof caption === 'string' && caption !== ''
+            ? caption
+            : appearance === 'folder'
+              ? `${fallback}/`
+              : fallback
+        // Ours when the shell lends the trigger service, the built-in source
+        // otherwise: only ours can turn the lines into message text.
+        const own = ensureChatSource()
+        const reference = {
+          source: own ? CHIP_SOURCE : 'reference',
+          ref: own ? chipRef(token, lineRange) : token,
+          label,
+          appearance,
+          clipboardText: token,
+        }
+        const request = { reference, span }
+        const attempt = (run) => {
+          try {
+            return run() === true
+          } catch (cause) {
+            return false
+          }
+        }
+        // The shell reaches this helper as `actx.bail(actx, name, request)`;
+        // Cordis also exposes it bound to the context. Try the shipped shape
+        // first, then the bound one, and treat a miss as "no chip here".
+        return (
+          attempt(() => context.bail(context, INSERT_REFERENCE, request)) ||
+          attempt(() => context.bail(INSERT_REFERENCE, request))
+        )
+      }
+
+      // Insert plain text at the live caret. This is the same channel the
+      // composer uses for a paste: the draft keeps everything already typed,
+      // and the lexical text-ref decoration turns the token into a reference.
+      const insertChatText = (text) => {
+        const actions = props && props.inputActions
+        if (typeof text !== 'string' || text === '') return false
+        if (!actions || typeof actions.insertText !== 'function' || typeof actions.captureInsertion !== 'function') {
+          return false
+        }
+        try {
+          const span = actions.captureInsertion()
+          if (span === null || typeof span !== 'object' || typeof span.start !== 'number') return false
+          return actions.insertText(` ${text} `, span) === true
+        } catch (cause) {
+          return false
+        }
+      }
+
+      const insertChatToken = (text) => {
+        const actions = props && props.inputActions
+        if (typeof text !== 'string' || text === '') return false
+        if (!actions || typeof actions.insertText !== 'function' || typeof actions.captureInsertion !== 'function') {
+          setStatus({ kind: 'error', message: 'Поле ввода чата недоступно' })
+          return false
+        }
+        const accepted = insertChatText(text)
+        setStatus(
+          accepted
+            ? { kind: 'ok', message: `В поле ввода: ${text}` }
+            : { kind: 'error', message: 'Поле ввода занято — очистите его и повторите' },
+        )
+        return accepted
+      }
+
+      // Link a file (or a directory) into the draft as a clickable reference.
+      const insertChatReference = (filePath, options) => {
+        const settings = options === undefined ? {} : options
+        const directory = settings.directory === true
+        const token = mentionText(filePath, directory)
+        if (token === '') return false
+        const caption = chipCaption(token, settings.lineRange)
+        if (insertChatChip(token, directory ? 'folder' : 'file', caption, settings.lineRange)) {
+          setStatus({ kind: 'ok', message: `В поле ввода: ${caption}` })
+          return true
+        }
+        return insertChatToken(`${token}${lineRangeSuffix(settings.lineRange)}`)
+      }
+
+      // Ask for an optional line range before sending a file to the chat, so the
+      // user can point at a few lines. The prompt is a small modal; Enter (and
+      // the primary button) links the file with the parsed range, the secondary
+      // button quotes the lines' text instead, Escape aborts.
+      const requestQuoteLines = (filePath, directory) => {
+        setQuotePrompt({ path: filePath, directory: directory === true, value: '' })
+      }
+
+      const applyQuoteLines = (mode) => {
+        const request = quotePrompt
+        setQuotePrompt(undefined)
+        if (request === undefined || typeof request.path !== 'string' || request.path === '') return
+        const range = parseLineRange(request.value)
+        if (request.directory === true) {
+          insertChatReference(request.path, { directory: true })
+          return
+        }
+        if (mode === 'text') void quoteFile(request.path, range)
+        else insertChatReference(request.path, { lineRange: range })
+      }
+
+      // Parse "3", "3-7", "3–7" or "3,7" into an inclusive 1-based { start, end }.
+      const parseLineRange = (value) => {
+        if (typeof value !== 'string') return undefined
+        const trimmed = value.trim()
+        if (trimmed === '') return undefined
+        const match = /^\s*(\d+)\s*(?:[-–,]\s*(\d+))?\s*$/.exec(trimmed)
+        if (match === null) return undefined
+        const start = Number(match[1])
+        const end = match[2] === undefined ? start : Number(match[2])
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < 1) return undefined
+        return { start, end }
+      }
+
+      // The lines highlighted in the editor belong to the tab that is active, so
+      // a mention of any other file carries the path alone. An empty selection
+      // is the line the caret sits on, which is what "this line" means in the
+      // status bar too.
+      const selectionPatchFor = (filePath) => {
+        if (activeTab === undefined) return undefined
+        if (normalPath(activeTab.path) !== normalPath(filePath)) return undefined
+        const editor = runtime.current.editor
+        if (editor === undefined) return undefined
+        const model = typeof editor.getModel === 'function' ? editor.getModel() : undefined
+        const selection = typeof editor.getSelection === 'function' ? editor.getSelection() : undefined
+        if (model === undefined || model === null || selection === undefined || selection === null) return undefined
+        const start = Math.max(1, Math.min(selection.startLineNumber, selection.endLineNumber))
+        const end = Math.min(model.getLineCount(), Math.max(selection.startLineNumber, selection.endLineNumber))
+        return { start, end }
+      }
+
+      // One click in the explorer: link the file, and the highlighted lines when
+      // the file is the one open in the editor. Directories always link whole.
+      const addFileToChat = (filePath, directory) => {
+        if (directory === true) return insertChatReference(filePath, { directory: true })
+        return insertChatReference(filePath, { lineRange: selectionPatchFor(filePath) })
+      }
+
+      // Panel-level chord, so the shortcut also works while the explorer holds
+      // focus (Monaco owns it once the editor does).
+      const onRootKeyDown = (event) => {
+        if (event.defaultPrevented === true) return
+        // A chord may be a bare key; inside a text field that would eat typing.
+        const target = event.target
+        if (target !== null && target !== undefined) {
+          const tag = typeof target.tagName === 'string' ? target.tagName : ''
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable === true) return
+        }
+        const id = matchChord(runtime.current.keymap, event)
+        if (id === undefined) return
+        const run = handlersRef.current[COMMAND_HANDLERS[id]]
+        if (typeof run !== 'function') return
+        event.preventDefault()
+        run()
+      }
+
+
+      // Drop target for a row dragged out of the explorer. The transfer already
+      // carries the mention token (`@file`, `@dir/`), so the panel just hands it
+      // to the composer; a drop that lands on the composer itself is handled by
+      // the composer, which reads the same token out of `text/plain`.
+      const mentionFromDrag = (event) => {
+        const transfer = event.dataTransfer
+        if (transfer === undefined || transfer === null) return undefined
+        const direct = transfer.getData('application/x-dsh-ide-file')
+        if (typeof direct === 'string' && direct !== '') return direct
+        const plain = transfer.getData('text/plain')
+        if (typeof plain === 'string' && plain !== '') return plain
+        return undefined
+      }
+
+      const onEditorDragOver = (event) => {
+        const token = mentionFromDrag(event)
+        if (token === undefined) return
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'copy'
+        if (dragOver !== token) setDragOver(token)
+      }
+
+      const onEditorDragLeave = (event) => {
+        if (event.currentTarget !== null && event.currentTarget.contains(event.relatedTarget)) return
+        setDragOver('')
+      }
+
+      const onEditorDrop = (event) => {
+        const token = mentionFromDrag(event)
+        setDragOver('')
+        if (token === undefined) return
+        event.preventDefault()
+        // A plain path from another drop source is upgraded to a mention.
+        const mention = token.startsWith('@') ? token : `@${token}`
+        const appearance = mention.endsWith('/') ? 'folder' : 'file'
+        if (!insertChatChip(mention, appearance)) insertChatToken(mention)
+      }
+
       const saveKey = async (key) => {
         const target = stateRef.current.tabs.find((candidate) => candidate.key === key)
         const model = runtime.current.models.get(key)
@@ -2343,12 +3890,147 @@ function IdeBody(props) {
             text: model.getValue(),
           })
           setTabs((previous) => previous.map((candidate) => (candidate.key === key ? { ...candidate, token: payload.token, dirty: false } : candidate)))
+          setChanges((previous) => previous.map((change) => (change.path === target.path ? { ...change, saved: true } : change)))
           setStatus({ kind: 'ok', message: `Сохранено: ${target.name}` })
           return true
         } catch (cause) {
           setStatus({ kind: 'error', message: describeError(cause) })
           return false
         }
+      }
+
+      const pathOfTab = (key) => {
+        const entry = stateRef.current.tabs.find((candidate) => candidate.key === key)
+        return entry === undefined ? '' : entry.path
+      }
+
+      // Session memory of accepted edits. Only the changed region is kept, so a
+      // big file does not cost its whole text per edit; the history dies with
+      // the session and is never presented as a disk checkpoint.
+      const recordChange = (key, path, beforeText, afterText) => {
+        const region = changedRegion(beforeText, afterText)
+        if (region === undefined) return
+        const end = region.start + region.after.length
+        setChanges((previous) =>
+          [
+            {
+              id: (runtime.current.changeSeq += 1),
+              key,
+              path,
+              start: region.start,
+              before: region.before,
+              after: region.after,
+              ctxBefore: afterText.slice(Math.max(0, region.start - 24), region.start),
+              ctxAfter: afterText.slice(end, end + 24),
+              at: new Date().toLocaleTimeString('ru-RU'),
+              saved: false,
+              reverted: false,
+            },
+            ...previous,
+          ].slice(0, 40),
+        )
+      }
+
+      const openChange = (change) => {
+        const entry = stateRef.current.tabs.find((candidate) => normalPath(candidate.path) === normalPath(change.path))
+        const model = entry === undefined ? undefined : runtime.current.models.get(entry.key)
+        if (model !== undefined) {
+          const position = model.getPositionAt(Math.min(change.start, model.getValueLength()))
+          runtime.current.pendingReveal = { path: normalPath(change.path), line: position.lineNumber }
+        } else {
+          runtime.current.pendingReveal = { path: normalPath(change.path), offset: change.start }
+        }
+        void openFile(change.path, { activate: true })
+      }
+
+      // Reverting works by file path, not by the model that happens to be focused:
+      // a preview, a closed tab or a switched tab must not turn the button into a
+      // silent no-op. Every refusal says why.
+      const revertChange = (change) => {
+        const path = normalPath(change.path === undefined ? '' : change.path)
+        const entry = path === '' ? undefined : stateRef.current.tabs.find((candidate) => normalPath(candidate.path) === path)
+        if (entry === undefined) {
+          setStatus({ kind: 'error', message: 'Файл закрыт — откройте его и нажмите «Вернуть» ещё раз.' })
+          if (path !== '') openChange(change)
+          return
+        }
+        const model = runtime.current.models.get(entry.key)
+        if (model === undefined) {
+          setStatus({ kind: 'error', message: 'Файл закрыт — откройте его и нажмите «Вернуть» ещё раз.' })
+          openChange(change)
+          return
+        }
+        if (stateRef.current.activeKey !== entry.key) {
+          openChange(change)
+          setStatus({ kind: 'ok', message: `Открыл ${path} — нажмите «Вернуть» ещё раз.` })
+          return
+        }
+        // The recorded offset is only a hint. Accepting a hint can move the rest
+        // of the buffer (staged phantom lines are rewritten in the same undo
+        // step), so the edited region is located again by its own text and the
+        // 24-character context on both sides. Exactly one match is required: two
+        // identical candidates are not a guess the button is allowed to make.
+        const text = model.getValue()
+        const locate = () => {
+          const before = change.ctxBefore
+          const after = change.ctxAfter
+          if (change.after !== '') {
+            const hits = []
+            let at = text.indexOf(change.after)
+            while (at !== -1) {
+              if (
+                text.slice(Math.max(0, at - before.length), at) === before &&
+                text.slice(at + change.after.length, at + change.after.length + after.length) === after
+              ) {
+                hits.push(at)
+              }
+              at = text.indexOf(change.after, at + 1)
+            }
+            return hits.length === 1 ? hits[0] : undefined
+          }
+          const anchor = `${before}${after}`
+          if (anchor === '') return undefined
+          const hits = []
+          let at = text.indexOf(anchor)
+          while (at !== -1) {
+            hits.push(at + before.length)
+            at = text.indexOf(anchor, at + 1)
+          }
+          return hits.length === 1 ? hits[0] : undefined
+        }
+        const start = locate()
+        if (start === undefined) {
+          setStatus({ kind: 'error', message: 'Файл изменился — вернуть правку нельзя, откройте сравнение.' })
+          setChanges((previous) => previous.map((candidate) => (candidate.id === change.id ? { ...candidate, error: 'текст изменился' } : candidate)))
+          return
+        }
+        const end = start + change.after.length
+        const monaco = runtime.current.monaco
+        const editor = runtime.current.editor
+        if (monaco === undefined || editor === undefined) {
+          setStatus({ kind: 'error', message: 'Редактор ещё не готов — попробуйте ещё раз.' })
+          return
+        }
+        const startPosition = model.getPositionAt(start)
+        const endPosition = model.getPositionAt(end)
+        const range = new monaco.Range(startPosition.lineNumber, startPosition.column, endPosition.lineNumber, endPosition.column)
+        runtime.current.tab.internalEdit = true
+        try {
+          if (editor.getModel() !== model) editor.setModel(model)
+          editor.pushUndoStop()
+          editor.executeEdits('dsh-ide-revert', [{ range, text: change.before }])
+          editor.pushUndoStop()
+        } catch (cause) {
+          setStatus({ kind: 'error', message: `Не удалось вернуть правку: ${messageOf(cause)}` })
+          return
+        } finally {
+          runtime.current.tab.internalEdit = false
+        }
+        setChanges((previous) =>
+          previous.map((candidate) => (candidate.id === change.id ? { ...candidate, reverted: true, saved: false, error: undefined } : candidate)),
+        )
+        setTabs((previous) => previous.map((candidate) => (candidate.key === entry.key ? { ...candidate, dirty: true } : candidate)))
+        setStatus({ kind: 'ok', message: `Правка возвращена: ${path} (Ctrl+Z отменит сам возврат)` })
       }
 
       const saveAll = async () => {
@@ -3066,7 +4748,9 @@ function IdeBody(props) {
           }
         }
         const caret = plan.range.start + plan.insertText.length + shiftAt(plan.range.start)
+        const textBefore = model.getValue()
         const edited = applyGhostEdits(operations, caret)
+        const textAfter = model.getValue()
         runtime.current.tab.plan = undefined
         runtime.current.tab.accepted = 0
         // Tab keeps the staged lines: drop the record before clearGhost, which
@@ -3077,6 +4761,7 @@ function IdeBody(props) {
         }
         clearGhost()
         if (!edited) return false
+        recordChange(tabKey, pathOfTab(tabKey), textBefore, textAfter)
         pushTrace({
           at: new Date().toLocaleTimeString('ru-RU'),
           path: entry === undefined ? '' : entry.path,
@@ -3194,6 +4879,313 @@ function IdeBody(props) {
           suppressed: '',
         })
         clearGhost()
+        return true
+      }
+
+      // ------------------------------------------------------- inline edit
+      // Inline Edit reviews one model replacement for one selection. The source
+      // model stays untouched: the selection is painted as "old" and the
+      // replacement lives in a read-only view zone until «Принять» writes it as
+      // a single undoable edit. Nothing here touches the disk — saving is a
+      // separate, explicit action.
+
+      const inlineState = () => runtime.current.inlineEdit
+
+      const publishInline = () => {
+        const st = inlineState()
+        setInlineView(
+          st === undefined
+            ? undefined
+            : {
+                phase: st.phase,
+                key: st.key,
+                instruction: st.instruction,
+                error: st.error,
+                proposal: st.proposal,
+                addedLines: st.proposal === undefined ? 0 : st.proposal.addedLines,
+                removedLines: st.proposal === undefined ? 0 : st.proposal.removedLines,
+              },
+        )
+      }
+
+      const clearInlineDecorations = () => {
+        const st = inlineState()
+        const editor = runtime.current.editor
+        if (st === undefined || editor === undefined) return
+        if (st.decorations !== undefined) {
+          const decorations = st.decorations
+          st.decorations = undefined
+          try {
+            editor.deltaDecorations(decorations, [])
+          } catch {
+            /* the model may be disposed already; decorations die with it */
+          }
+        }
+        if (st.zone !== undefined) {
+          const zone = st.zone
+          st.zone = undefined
+          try {
+            editor.changeViewZones((accessor) => accessor.removeZone(zone))
+          } catch {
+            /* same for an already detached view zone */
+          }
+        }
+      }
+
+      const dismissInlineEdit = (reason, focus) => {
+        const st = inlineState()
+        if (st === undefined) return false
+        clearInlineDecorations()
+        st.controller?.abort()
+        runtime.current.inlineEdit = undefined
+        setInlineView(undefined)
+        if (reason === 'typing') setStatus({ kind: 'idle', message: 'Правка отменена: файл изменился.' })
+        if (focus === true) runtime.current.editor?.focus()
+        return true
+      }
+
+      const openInlineEdit = () => {
+        const editor = runtime.current.editor
+        const monaco = runtime.current.monaco
+        if (editor === undefined || monaco === undefined) return false
+        const model = editor.getModel()
+        if (model === null) {
+          setStatus({ kind: 'error', message: 'Откройте файл, чтобы изменить выделение.' })
+          return false
+        }
+        const key = runtime.current.modelTabs.get(model.uri.toString())
+        const entry = key === undefined ? undefined : stateRef.current.tabs.find((candidate) => candidate.key === key)
+        if (entry === undefined) return false
+        if (entry.readOnly) {
+          setStatus({ kind: 'error', message: 'Файл открыт только для чтения — правка недоступна.' })
+          return false
+        }
+        const selection = editor.getSelection()
+        if (selection === null || selection.isEmpty()) {
+          setStatus({ kind: 'error', message: 'Выделите код, который нужно изменить.' })
+          return false
+        }
+        const start = model.getOffsetAt(selection.getStartPosition())
+        const end = model.getOffsetAt(selection.getEndPosition())
+        const text = model.getValue()
+        dismissInlineEdit('restart')
+        runtime.current.inlineEdit = {
+          phase: 'input',
+          key,
+          hostId: entry.hostId,
+          token: entry.token,
+          modelVersion: model.getVersionId(),
+          start,
+          end,
+          oldText: text.slice(start, end),
+          text,
+          instruction: '',
+          error: '',
+          controller: undefined,
+          decorations: undefined,
+          zone: undefined,
+        }
+        publishInline()
+        window.setTimeout(() => inlineInputRef.current?.focus(), 0)
+        return true
+      }
+
+      const setInlineInstruction = (value) => {
+        const st = inlineState()
+        if (st === undefined || st.phase !== 'input') return
+        st.instruction = value
+        publishInline()
+      }
+
+      const paintInlinePreview = () => {
+        const st = inlineState()
+        const editor = runtime.current.editor
+        const monaco = runtime.current.monaco
+        if (st === undefined || st.proposal === undefined || editor === undefined || monaco === undefined) return
+        const model = editor.getModel()
+        if (model === null) return
+        clearInlineDecorations()
+        const change = st.proposal.changes[0]
+        const startPosition = model.getPositionAt(change.start)
+        const endPosition = model.getPositionAt(change.end)
+        const range = new monaco.Range(
+          startPosition.lineNumber,
+          startPosition.column,
+          endPosition.lineNumber,
+          endPosition.column,
+        )
+        st.decorations = editor.deltaDecorations(
+          [],
+          [{ range, options: { inlineClassName: 'dsh-ide-inline-old', hoverMessage: { value: 'Этот фрагмент будет заменён' } } }],
+        )
+        const replacement = change.newText
+        const node = document.createElement('div')
+        node.className = 'dsh-ide-inline-preview'
+        const head = document.createElement('div')
+        head.className = 'dsh-ide-inline-preview-head'
+        head.textContent =
+          replacement === '' ? 'Предложение · удалить фрагмент' : `Предложение · ${replacement.split('\n').length} стр.`
+        const body = document.createElement('pre')
+        body.className = 'dsh-ide-inline-preview-body'
+        body.textContent = replacement === '' ? 'Фрагмент будет удалён целиком.' : replacement
+        node.appendChild(head)
+        node.appendChild(body)
+        // editor.changeViewZones() returns nothing: the zone id has to be taken
+        // from the accessor, otherwise there is nothing to remove later and the
+        // accepted preview stays in the buffer view forever.
+        st.zone = undefined
+        editor.changeViewZones((accessor) => {
+          st.zone = accessor.addZone({
+            afterLineNumber: endPosition.lineNumber,
+            heightInLines: replacement === '' ? 2 : replacement.split('\n').length + 1,
+            domNode: node,
+          })
+        })
+      }
+
+      const submitInlineEdit = async () => {
+        const st = inlineState()
+        if (st === undefined || st.phase !== 'input') return
+        const instruction = st.instruction.trim()
+        if (instruction === '') {
+          st.error = 'Опишите, что изменить.'
+          publishInline()
+          inlineInputRef.current?.focus()
+          return
+        }
+        // Tab permission is not Edit permission: the model receives a selection
+        // plus an instruction only after this explicit, separate consent.
+        if (prefsRef.current?.inlineEditConsent !== true) {
+          st.error = 'Сначала разрешите отправку выделения модели.'
+          publishInline()
+          return
+        }
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        if (model === null) return
+        if (model.getVersionId() !== st.modelVersion) {
+          st.phase = 'stale'
+          st.error = 'Файл изменился, запросите новую правку.'
+          publishInline()
+          return
+        }
+        st.phase = 'pending'
+        st.error = ''
+        const requestId = ++runtime.current.inlineSeq
+        st.requestId = requestId
+        const controller = new AbortController()
+        st.controller = controller
+        publishInline()
+        try {
+          const payload = await call(
+            'inlineEdit',
+            {
+              id: st.hostId,
+              sessionId: stateRef.current.sessionId,
+              token: st.token,
+              modelVersion: st.modelVersion,
+              start: st.start,
+              end: st.end,
+              text: st.text,
+              instruction,
+            },
+            controller.signal,
+          )
+          if (inlineState() !== st || st.requestId !== requestId) return
+          st.controller = undefined
+          st.proposal = payload.proposal
+          st.phase = 'preview'
+          paintInlinePreview()
+          publishInline()
+        } catch (cause) {
+          if (inlineState() !== st || st.requestId !== requestId) return
+          st.controller = undefined
+          if (cause?.name === 'AbortError' || cause?.code === 'cancelled') st.phase = 'input'
+          else {
+            st.phase = 'failed'
+            st.error = describeError(cause)
+          }
+          publishInline()
+        }
+      }
+
+      const refineInlineEdit = () => {
+        const st = inlineState()
+        if (st === undefined) return
+        clearInlineDecorations()
+        st.controller?.abort()
+        st.controller = undefined
+        st.proposal = undefined
+        st.phase = 'input'
+        st.error = ''
+        publishInline()
+        window.setTimeout(() => inlineInputRef.current?.focus(), 0)
+      }
+
+      const allowInlineEdit = async () => {
+        const st = inlineState()
+        try {
+          await call('prefs', { patch: { inlineEditConsent: true } })
+        } catch (cause) {
+          if (inlineState() === st && st !== undefined) {
+            st.error = describeError(cause)
+            publishInline()
+          }
+          return
+        }
+        const next = { ...(prefsRef.current ?? {}), inlineEditConsent: true }
+        prefsRef.current = next
+        setPreferences(next)
+        if (inlineState() === st && st !== undefined) {
+          st.error = ''
+          publishInline()
+        }
+        inlineInputRef.current?.focus()
+      }
+
+      const acceptInlineEdit = () => {
+        const st = inlineState()
+        const editor = runtime.current.editor
+        const monaco = runtime.current.monaco
+        if (st === undefined || editor === undefined || monaco === undefined) return false
+        if (st.phase !== 'preview' || st.proposal === undefined) return false
+        const model = editor.getModel()
+        if (model === null) return false
+        if (runtime.current.modelTabs.get(model.uri.toString()) !== st.key) {
+          dismissInlineEdit('switch')
+          return false
+        }
+        const change = st.proposal.changes[0]
+        // Version alone is not enough: the range text must still be the text the
+        // model was shown. Otherwise the proposal is stale and nothing is written.
+        if (model.getVersionId() !== st.modelVersion || model.getValue().slice(change.start, change.end) !== change.oldText) {
+          st.phase = 'stale'
+          st.error = 'Файл изменился, запросите новую правку.'
+          clearInlineDecorations()
+          publishInline()
+          return false
+        }
+        const startPosition = model.getPositionAt(change.start)
+        const endPosition = model.getPositionAt(change.end)
+        const range = new monaco.Range(
+          startPosition.lineNumber,
+          startPosition.column,
+          endPosition.lineNumber,
+          endPosition.column,
+        )
+        dismissInlineEdit('accepted')
+        const textBefore = model.getValue()
+        runtime.current.tab.internalEdit = true
+        try {
+          editor.pushUndoStop()
+          editor.executeEdits('dsh-ide-inline', [{ range, text: change.newText }])
+          editor.pushUndoStop()
+        } finally {
+          runtime.current.tab.internalEdit = false
+        }
+        recordChange(st.key, pathOfTab(st.key), textBefore, model.getValue())
+        setStatus({ kind: 'ok', message: 'Правка применена. Ctrl+Z — отменить.' })
+        editor.focus()
         return true
       }
 
@@ -3450,6 +5442,7 @@ function IdeBody(props) {
           }
           // An edit we made ourselves (Tab, Ctrl+→) must not cancel or re-ask.
           if (internal || staging) return
+          if (runtime.current.inlineEdit !== undefined) dismissInlineEdit('typing')
           const tab = runtime.current.tab, plan = tab.plan
           const typed = event.changes.length === 1 ? event.changes[0] : undefined
           if (plan?.kind === 'insert' && !tab.phantom && !plan.edits.length && plan.range.start === plan.range.end &&
@@ -3499,14 +5492,20 @@ function IdeBody(props) {
           }, 250)
         })
 
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-          void handlersRef.current.saveActive?.()
-        })
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW, () => handlersRef.current.closeActive?.())
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP, () => handlersRef.current.openQuick?.())
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS, () => {
-          void handlersRef.current.saveAll?.()
-        })
+        // Chords the user can remap are matched here rather than registered with
+        // addCommand: a registered chord cannot be changed afterwards, and a
+        // remapped one has to stop firing as well.
+        if (typeof editor.onKeyDown === 'function') {
+          editor.onKeyDown((event) => {
+            const id = matchChord(runtime.current.keymap, event)
+            if (id === undefined) return
+            const run = handlersRef.current[COMMAND_HANDLERS[id]]
+            if (typeof run !== 'function') return
+            event.preventDefault()
+            event.stopPropagation()
+            run()
+          })
+        }
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => {
           handlersRef.current.openOutput?.()
           void handlersRef.current.requestGhost?.('explicit')
@@ -3519,6 +5518,7 @@ function IdeBody(props) {
           editor.addCommand(
             monaco.KeyCode.Escape,
             () => {
+              if (handlersRef.current.cancelInline?.() === true) return
               cancelGhostRequest()
               if (handlersRef.current.rejectGhost?.() === true) return
               const selection = editor.getSelection()
@@ -3532,8 +5532,30 @@ function IdeBody(props) {
             'editorTextFocus && dshIdeGhostVisible',
           )
         }
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
+        // Settings, the trace panel and the quote command are dispatched above,
+        // from the same remappable keymap.
+        // Inline Edit. The chord comes from the keymap (Ctrl+Shift+K by default,
+        // remappable in settings); the action only puts the command in Monaco's
+        // own context menu.
+        editor.addAction({
+          id: 'dsh-ide.inline-edit',
+          label: 'Изменить выделение…',
+          contextMenuGroupId: '1_modification',
+          contextMenuOrder: 1,
+          precondition: 'editorTextFocus',
+          run: () => handlersRef.current.openInlineEdit?.(),
+        })
+        // Link the active file and the lines highlighted in it into the chat.
+        // An action, not a bare command: the same declaration draws the entry in
+        // Monaco's own context menu; the chord is dispatched from the keymap.
+        editor.addAction({
+          id: 'dsh-ide.add-to-chat',
+          label: 'Добавить в чат',
+          contextMenuGroupId: '1_modification',
+          contextMenuOrder: 0.5,
+          precondition: 'editorTextFocus',
+          run: () => handlersRef.current.addToChat?.(),
+        })
 
         return () => {
           cancelGhostRequest()
@@ -3558,6 +5580,7 @@ function IdeBody(props) {
       React.useEffect(() => {
         cancelGhostRequest()
         clearGhost()
+        dismissInlineEdit('switch')
         const editor = runtime.current.editor
         if (!editor || !monaco || activeKey === '') return
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === activeKey)
@@ -3601,6 +5624,191 @@ function IdeBody(props) {
         dirtyTabs.clear()
         for (const candidate of tabs) if (candidate.dirty) dirtyTabs.add(candidate.key)
       }, [tabs])
+
+      // The changes pane reads the Host's checkpoint index when it opens: a turn
+      // that happened while the pane was closed shows up on the next open, and a
+      // closed pane costs no reads at all.
+      React.useEffect(() => {
+        if (!changesOpen) return undefined
+        if (typeof sessionId !== 'string' || sessionId === '') return undefined
+        let cancelled = false
+        setAssistant((current) => ({ ...current, phase: 'pending', error: '' }))
+        call('agentChanges', { sessionId })
+          .then((payload) => {
+            if (cancelled) return
+            setAssistant({
+              phase: 'ready',
+              available: payload !== null && payload.available === true,
+              turns: Array.isArray(payload?.turns) ? payload.turns : [],
+              error: '',
+            })
+          })
+          .catch((cause) => {
+            if (cancelled || cause?.code === 'cancelled') return
+            setAssistant({ phase: 'failed', available: true, turns: [], error: describeError(cause) })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [changesOpen, changesReload, sessionId])
+
+      // Decisions on assistant turns live here rather than inside the explorer:
+      // the same two buttons also sit on the side-by-side comparison, and a
+      // second copy of that state would drift from this one.
+      const acceptAssistant = (turn, file) => {
+        const key = `${turn.seq}:${file.index}`
+        // The assistant already wrote the file. Accepting records that the user
+        // looked at the comparison and keeps the result; nothing is written.
+        setAssistantWork((current) => ({ ...current, [key]: { phase: 'accepted', error: '' } }))
+      }
+
+      // «Принять все» is the same decision for every file of the turn: the
+      // files are already on disk, so this only stops asking about them.
+      const acceptAssistantAll = (turn) => {
+        const files = Array.isArray(turn?.files) ? turn.files : []
+        setAssistantWork((current) => {
+          const next = { ...current }
+          for (const file of files) next[`${turn.seq}:${file.index}`] = { phase: 'accepted', error: '' }
+          return next
+        })
+      }
+
+      const revertAssistant = async (turn, file) => {
+        const key = `${turn.seq}:${file.index}`
+        setAssistantWork((current) => ({ ...current, [key]: { phase: 'saving', error: '' } }))
+        try {
+          await call('agentChangeRestore', { sessionId, seq: turn.seq, index: file.index })
+          setAssistantWork((current) => ({ ...current, [key]: { phase: 'reverted', error: '' } }))
+          setChangesReload((value) => value + 1)
+          // The comparison showed the text that was just replaced.
+          setDiffView((current) => (current !== undefined && `${current.seq}:${current.index}` === key ? undefined : current))
+          setStatus({ kind: 'ok', message: `Правки отменены: ${file.display || file.path}` })
+        } catch (cause) {
+          if (cause?.code === 'cancelled') return
+          setAssistantWork((current) => ({ ...current, [key]: { phase: 'failed', error: describeError(cause) } }))
+        }
+      }
+
+      // «Отменить все» reverts file by file: the Host writes one file per call,
+      // so a failure on the second file keeps the first one reverted and the
+      // pane shows both outcomes instead of pretending it was atomic.
+      const revertAssistantAll = async (turn) => {
+        const files = Array.isArray(turn?.files) ? turn.files : []
+        for (const file of files) await revertAssistant(turn, file)
+        setDiffView(undefined)
+      }
+
+      const openAssistantDiff = async (turn, file) => {
+        if (typeof sessionId !== 'string' || sessionId === '') return
+        // `files` keeps the whole turn in the footer list, so «Принять все» and
+        // «Отменить все» act on the same set the pane shows.
+        setDiffView({
+          phase: 'pending',
+          turn,
+          file,
+          files: Array.isArray(turn.files) ? turn.files : [],
+          seq: turn.seq,
+          index: file.index,
+          path: file.path,
+          display: file.display,
+          error: '',
+        })
+        try {
+          const payload = await call('agentChangeText', { sessionId, seq: turn.seq, index: file.index })
+          setDiffView((current) => {
+            if (current === undefined || current.seq !== turn.seq || current.index !== file.index) return current
+            return { ...current, ...payload, phase: 'ready', error: '' }
+          })
+        } catch (cause) {
+          if (cause?.code === 'cancelled') return
+          setDiffView((current) => {
+            if (current === undefined || current.seq !== turn.seq || current.index !== file.index) return current
+            return { ...current, phase: 'failed', error: describeError(cause) }
+          })
+        }
+      }
+
+      // The explorer pane is far too narrow for two columns, so the comparison
+      // opens over the editor the way Cursor shows a change before accepting it.
+      const diffKey = diffView === undefined ? '' : `${diffView.phase}:${diffView.seq}:${diffView.index}`
+      React.useEffect(() => {
+        const container = diffContainerRef.current
+        if (!monaco || diffView === undefined || diffView.phase !== 'ready' || container === undefined) return undefined
+        const language = typeof diffView.language === 'string' && diffView.language !== '' ? diffView.language : 'plaintext'
+        const uid = `${diffView.seq}-${diffView.index}`
+        const original = monaco.editor.createModel(
+          String(diffView.before ?? ''),
+          language,
+          monaco.Uri.parse(`inmemory://dsh-ide/diff-before/${uid}`),
+        )
+        const modified = monaco.editor.createModel(
+          String(diffView.after ?? ''),
+          language,
+          monaco.Uri.parse(`inmemory://dsh-ide/diff-after/${uid}`),
+        )
+        const editor = monaco.editor.createDiffEditor(container, {
+          readOnly: true,
+          renderSideBySide: true,
+          // Monaco switches a narrow diff editor to the inline (unified) view by
+          // default, which is exactly what «два окна» must not do: this pane is
+          // narrower than the default 900px breakpoint almost always.
+          useInlineViewWhenSpaceIsLimited: false,
+          renderSideBySideInlineBreakpoint: 0,
+          // Same wrapping as the request: long lines must not force a horizontal
+          // scroll in a pane that is shown side by side on every width.
+          wordWrap: 'on',
+          diffWordWrap: 'on',
+          // The overview ruler is what shows where the changes are on the
+          // scrollbar; without it the two columns give no map of the diff.
+          renderOverviewRuler: true,
+          overviewRulerBorder: false,
+          renderIndicators: true,
+          automaticLayout: true,
+          ignoreTrimWhitespace: false,
+          scrollBeyondLastLine: false,
+          // `themeName()` answers 'dark'/'light', which are not Monaco theme
+          // ids, so the diff fell back to the default light theme while the
+          // plain editor already used vs-dark.
+          theme: themeName() === 'dark' ? 'vs-dark' : 'vs',
+        })
+        editor.setModel({ original, modified })
+        runtime.current.diffEditor = { editor, original, modified }
+        return () => {
+          runtime.current.diffEditor = undefined
+          editor.dispose()
+          original.dispose()
+          modified.dispose()
+        }
+      }, [monaco, diffKey])
+
+      // A search hit opens the file and then puts the caret on the matched line.
+      // The reveal waits until the tab really owns the editor model, otherwise the
+      // caret would land in the previous file while the new tab is still loading.
+      React.useEffect(() => {
+        const pending = runtime.current.pendingReveal
+        if (pending === undefined) return
+        const entry = tabs.find((candidate) => candidate.key === activeKey)
+        if (entry === undefined || normalPath(entry.path) !== pending.path) return
+        const editor = runtime.current.editor
+        if (editor === undefined) return
+        const model = editor.getModel()
+        if (model === null || runtime.current.modelTabs.get(model.uri.toString()) !== entry.key) return
+        runtime.current.pendingReveal = undefined
+        const line = pending.offset === undefined
+          ? Math.max(1, Math.min(pending.line, model.getLineCount()))
+          : model.getPositionAt(Math.min(pending.offset, model.getValueLength())).lineNumber
+        const end = pending.end === undefined ? line : Math.max(line, Math.min(pending.end, model.getLineCount()))
+        if (end === line) {
+          editor.setPosition({ lineNumber: line, column: 1 })
+        } else {
+          editor.setSelection({ startLineNumber: line, startColumn: 1, endLineNumber: end, endColumn: model.getLineMaxColumn(end) })
+        }
+        if (typeof editor.revealLineInCenterIfOutsideViewport === 'function') {
+          editor.revealLineInCenterIfOutsideViewport(line)
+        }
+        setCursor({ line, column: 1 })
+        editor.focus()
+      }, [activeKey, tabs])
 
       React.useEffect(() => {
         if (tab === undefined || typeof tab.id !== 'string') return
@@ -3672,6 +5880,15 @@ function IdeBody(props) {
         const apply = (request) => {
           if (request === undefined || request.path === '' || request.nonce <= consumedOpen.current) return
           consumedOpen.current = request.nonce
+          // A chip click names lines: the caret lands there once the tab owns
+          // the model, through the same one-shot reveal a search hit uses.
+          if (request.lineRange !== undefined) {
+            runtime.current.pendingReveal = {
+              path: normalPath(request.path),
+              line: request.lineRange.start,
+              end: request.lineRange.end,
+            }
+          }
           void openFile(request.path, { activate: true })
         }
         apply(latestOpen(sessionId))
@@ -3797,10 +6014,25 @@ function IdeBody(props) {
         toggleOutput,
         openOutput: () => setPanel({ tab: 'trajectory', index: 0 }),
         openSettings: () => setSettingsOpen(true),
+        openPalette: () => setPaletteOpen(true),
+        openSearch: () => {
+          setShowTree(true)
+          setChangesOpen(false)
+          setSearchOpen(true)
+        },
         requestGhost: (kind) => void requestGhost(kind === 'explicit' ? 'explicit' : 'auto'),
         acceptGhost,
         acceptWord,
         rejectGhost,
+        quoteSelection: () => quoteEditorFragment(),
+        addToChat: () => {
+          if (activeTab === undefined) return
+          addFileToChat(activeTab.path, false)
+        },
+        nextTab: () => cycleTab(1),
+        prevTab: () => cycleTab(-1),
+        openInlineEdit: () => openInlineEdit(),
+        cancelInline: () => dismissInlineEdit('esc', true),
       }
 
       const withEditor = (run) => {
@@ -3931,6 +6163,14 @@ function IdeBody(props) {
 
       // The same top-level arrangement as VS Code. Commands the IDE cannot honour
       // are disabled with the reason in their tooltip instead of being hidden.
+      // Menu labels follow the live keymap: a remapped chord must not keep the
+      // old default printed next to the command.
+      const menuChords = resolveKeymap(keybindingsOf(preferences))
+      const chordLabel = (commandId) => {
+        const chord = menuChords.get(commandId)
+        return chord === undefined ? undefined : chordText(chord)
+      }
+
       const menus = [
         {
           id: 'file',
@@ -3938,21 +6178,26 @@ function IdeBody(props) {
           items: [
             { id: 'new', label: 'Новый файл…', run: () => createFile() },
             { id: 'new-folder', label: 'Новая папка…', run: () => createDirectory() },
-            { id: 'open', label: 'Открыть файл…', key: 'Ctrl+P', run: openQuick },
+            { id: 'open', label: 'Открыть файл…', key: chordLabel('quick-open'), run: openQuick },
             { separator: true },
-            { id: 'save', label: 'Сохранить', key: 'Ctrl+S', run: () => void saveActive() },
-            { id: 'save-all', label: 'Сохранить всё', key: 'Ctrl+Shift+S', run: () => void saveAll() },
+            { id: 'save', label: 'Сохранить', key: chordLabel('save'), run: () => void saveActive() },
+            { id: 'save-all', label: 'Сохранить всё', key: chordLabel('save-all'), run: () => void saveAll() },
             { separator: true },
-            { id: 'close', label: 'Закрыть вкладку', key: 'Ctrl+W', run: closeActive },
+            { id: 'explain', label: 'Объяснить выделенное…', run: () => draftQuestion('explain') },
+            { id: 'prepare-plan', label: 'Подготовить план…', run: () => draftQuestion('plan') },
+            { separator: true },
+            { id: 'close', label: 'Закрыть вкладку', key: chordLabel('close-tab'), run: closeActive },
             { id: 'close-all', label: 'Закрыть все вкладки', run: closeAllTabs },
             { separator: true },
             { id: 'refresh', label: 'Обновить дерево', run: () => setReloadSignal((previous) => previous + 1) },
             { id: 'toggle-tree', label: showTree ? 'Скрыть проводник' : 'Показать проводник', run: () => setShowTree(!showTree) },
-        {
-          id: 'swap-explorer',
-          label: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
-          run: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
-        },
+            {
+              id: 'swap-explorer',
+              label: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
+              run: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
+            },
+            { separator: true },
+            { id: 'settings', label: 'Настройки IDE…', key: chordLabel('settings'), run: () => setSettingsOpen(true) },
             { id: 'open-folder', label: 'Открыть папку…', disabled: true, hint: 'Рабочая папка задаётся сессией DSH; другая папка открывается только в новой сессии.' },
           ],
         },
@@ -3977,10 +6222,13 @@ function IdeBody(props) {
           label: 'Выделение',
           items: [
             { id: 'select-all', label: 'Выделить всё', key: 'Ctrl+A', run: () => runAction('editor.action.selectAll') },
-            { id: 'select-line', label: 'Выделить строку', key: 'Ctrl+L', run: () => runAction('expandLineSelection') },
+            { id: 'select-line', label: 'Выделить строку', run: () => runAction('expandLineSelection') },
             { separator: true },
             { id: 'expand', label: 'Расширить выделение', key: 'Shift+Alt+→', run: () => runAction('editor.action.smartSelect.expand') },
             { id: 'shrink', label: 'Сузить выделение', key: 'Shift+Alt+←', run: () => runAction('editor.action.smartSelect.shrink') },
+            { separator: true },
+            { id: 'quote', label: 'Строки в чат', key: chordLabel('quote'), run: () => handlersRef.current.quoteSelection?.() },
+            { id: 'inline-edit', label: 'Изменить выделение…', key: chordLabel('inline-edit'), run: () => handlersRef.current.openInlineEdit?.() },
           ],
         },
         {
@@ -3988,6 +6236,7 @@ function IdeBody(props) {
           label: 'Вид',
           items: [
             { id: 'word-wrap', label: wordWrap ? 'Отключить перенос по словам' : 'Включить перенос по словам', run: toggleWordWrap },
+            { id: 'palette', label: 'Палитра команд…', key: chordLabel('command-palette'), run: () => setPaletteOpen(true) },
             { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показывать скрытые файлы', run: () => setHidden(!hidden) },
             { separator: true },
             { id: 'zoom-in', label: 'Увеличить шрифт', run: () => zoom(1) },
@@ -3997,11 +6246,10 @@ function IdeBody(props) {
             {
               id: 'output',
               label: panel === undefined ? 'Показать панель вывода' : 'Скрыть панель вывода',
-              key: 'Ctrl+',
+              key: chordLabel('output'),
               run: toggleOutput,
             },
             { separator: true },
-            { id: 'settings', label: 'Настройки IDE…', key: 'Ctrl+,', run: () => setSettingsOpen(true) },
             { id: 'connect-model', label: 'Подключить модель…', run: () => setModelDialog(true) },
             { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
           ],
@@ -4010,7 +6258,7 @@ function IdeBody(props) {
           id: 'go',
           label: 'Переход',
           items: [
-            { id: 'goto-file', label: 'Перейти к файлу…', key: 'Ctrl+P', run: openQuick },
+            { id: 'goto-file', label: 'Перейти к файлу…', key: chordLabel('quick-open'), run: openQuick },
             { id: 'goto-line', label: 'Перейти к строке…', key: 'Ctrl+G', run: () => runAction('editor.action.gotoLine') },
             { separator: true },
             {
@@ -4085,21 +6333,29 @@ function IdeBody(props) {
             {
               id: 'shortcuts',
               label: 'Горячие клавиши',
-              run: () =>
-                setInfo({
-                  title: 'Горячие клавиши',
-                  lines: [
-                    'Ctrl+S — сохранить файл, Ctrl+Shift+S — сохранить всё',
-                    'Ctrl+W — закрыть вкладку, Ctrl+P — открыть файл по имени',
-                    'Ctrl+G — перейти к строке, Ctrl+Space — подсказка модели',
-                  ],
-                }),
+              run: () => {
+                // Built from the same table the editor dispatches, so the help
+                // cannot drift from the real map.
+                const keymapNow = resolveKeymap(keybindingsOf(preferences))
+                const lines = []
+                for (const command of KEY_COMMANDS) {
+                  const chord = keymapNow.get(command.id)
+                  const text = chord === undefined ? command.chord : chordText(chord)
+                  lines.push(`${text} — ${command.label.toLowerCase()}`)
+                }
+                lines.push('Tab — принять подсказку, Esc — отклонить, Ctrl+→ — принять слово')
+                lines.push('Все клавиши, кроме Tab и Esc, переназначаются: Параметры → Клавиши')
+                setInfo({ title: 'Горячие клавиши', lines })
+              },
             },
           ],
         },
       ]
 
       const activeTab = tabs.find((candidate) => candidate.key === activeKey)
+      // Buttons of the comparison show the same decision as the row in the pane.
+      const diffWork = diffView === undefined ? undefined : assistantWork[`${diffView.seq}:${diffView.index}`]
+      const diffDecided = diffWork !== undefined && (diffWork.phase === 'accepted' || diffWork.phase === 'reverted')
       const segments = activeTab === undefined ? [] : activeTab.path.split('/')
       const statusMessage = status.kind === 'error' || status.kind === 'ok' || status.kind === 'busy' ? status.message : ''
 
@@ -4119,7 +6375,7 @@ function IdeBody(props) {
 
       return h(
         'div',
-        { className: 'dsh-ide-root', 'data-theme': themeName() },
+        { className: 'dsh-ide-root', 'data-theme': themeName(), onKeyDown: onRootKeyDown },
         menuId === ''
           ? null
           : h('div', {
@@ -4179,20 +6435,31 @@ function IdeBody(props) {
               'button',
               {
                 type: 'button',
-                className: 'dsh-ide-activity-button',
-                title: 'Быстрое открытие файла (Ctrl+P)',
-                onClick: openQuick,
+                className: `dsh-ide-activity-button${searchOpen ? ' dsh-ide-activity-button-active' : ''}`,
+                title: 'Поиск в файлах (Ctrl+Shift+F)',
+                'aria-label': 'Поиск в файлах',
+                onClick: () => {
+                  setShowTree(true)
+                  setChangesOpen(false)
+                  setSearchOpen(true)
+                },
               },
-              h(
-                'svg',
-                { width: '18', height: '18', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-                h('path', {
-                  fill: 'none',
-                  stroke: 'currentColor',
-                  strokeWidth: '1.3',
-                  d: 'M7 2.6a4.4 4.4 0 1 0 0 8.8 4.4 4.4 0 0 0 0-8.8zM10.4 10.4 14 14',
-                }),
-              ),
+              h('span', { className: 'dsh-ide-activity-glyph' }, '🔍'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: `dsh-ide-activity-button${changesOpen ? ' dsh-ide-activity-button-active' : ''}`,
+                title: changes.length === 0 ? 'Изменения этой сессии' : `Изменения этой сессии: ${changes.length}`,
+                'aria-label': 'Изменения',
+                onClick: () => {
+                  setShowTree(true)
+                  setSearchOpen(false)
+                  setChangesOpen((open) => !open)
+                },
+              },
+              h('span', { className: 'dsh-ide-activity-glyph' }, '🕘'),
             ),
             h('span', { className: 'dsh-ide-activity-spacer' }),
             h(
@@ -4218,8 +6485,37 @@ function IdeBody(props) {
                   hidden,
                   reloadSignal,
                   activePath: activeTab === undefined ? '' : activeTab.path,
-                  onOpenFile: (path) => {
+                  onOpenFile: (path, line) => {
+                    if (typeof line === 'number') {
+                      runtime.current.pendingReveal = { path: normalPath(path), line }
+                    }
                     void openFile(path, { activate: true })
+                  },
+                  searchOpen,
+                  onCloseSearch: () => setSearchOpen(false),
+                  changesOpen,
+                  changes,
+                  assistant,
+                  assistantWork,
+                  onOpenDiff: (turn, file) => {
+                    void openAssistantDiff(turn, file)
+                  },
+                  onAcceptAssistant: acceptAssistant,
+                  onRevertAssistant: (turn, file) => {
+                    void revertAssistant(turn, file)
+                  },
+                  onReloadChanges: () => setChangesReload((value) => value + 1),
+                  onCloseChanges: () => setChangesOpen(false),
+                  onOpenChange: openChange,
+                  onRevertChange: revertChange,
+                  onInsertReference: (path, line) => {
+                    insertChatReference(path, { lineRange: { start: line, end: line } })
+                  },
+                  onQuoteFile: (path, directory) => {
+                    addFileToChat(path, directory)
+                  },
+                  onQuoteLines: (path) => {
+                    requestQuoteLines(path, false)
                   },
                   onToggleHidden: setHidden,
                   createRequest,
@@ -4244,7 +6540,14 @@ function IdeBody(props) {
             : null,
           h(
             'div',
-            { className: 'dsh-ide-editor', style: { order: explorerSide === 'left' ? 2 : 0 } },
+            {
+              className: 'dsh-ide-editor',
+              style: { order: explorerSide === 'left' ? 2 : 0 },
+              onDragOver: onEditorDragOver,
+              onDragLeave: onEditorDragLeave,
+              onDrop: onEditorDrop,
+            },
+            dragOver === '' ? null : h('div', { className: 'dsh-ide-drop-overlay' }, h('span', { className: 'dsh-ide-drop-overlay-text' }, `Сослаться в чате: ${mentionLabel(dragOver)}`)),
             h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab, onContextMenu: openTabMenu }),
             consent === undefined
               ? null
@@ -4271,6 +6574,127 @@ function IdeBody(props) {
                     ),
                   ),
                 ),
+            inlineView === undefined
+              ? null
+              : h(
+                  'div',
+                  { className: 'dsh-ide-inline', 'data-phase': inlineView.phase },
+                  h(
+                    'span',
+                    { className: 'dsh-ide-inline-label' },
+                    inlineView.phase === 'preview' ? 'Предложение' : inlineView.phase === 'pending' ? 'Правка' : 'Изменить выделение',
+                  ),
+                  inlineView.phase === 'input' || inlineView.phase === 'pending'
+                    ? h('input', {
+                        ref: inlineInputRef,
+                        className: 'dsh-ide-inline-input',
+                        value: inlineView.instruction,
+                        placeholder: 'Что изменить в выделенном коде?',
+                        disabled: inlineView.phase === 'pending',
+                        onChange: (event) => setInlineInstruction(event.target.value),
+                        onKeyDown: (event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            void submitInlineEdit()
+                          } else if (event.key === 'Escape') {
+                            event.preventDefault()
+                            dismissInlineEdit('esc', true)
+                          }
+                        },
+                      })
+                    : null,
+                  inlineView.phase === 'pending' ? h('span', { className: 'dsh-ide-inline-text' }, 'Модель готовит правку…') : null,
+                  inlineView.phase === 'preview'
+                    ? h('span', { className: 'dsh-ide-inline-text' }, `+${inlineView.addedLines} / −${inlineView.removedLines} строк`)
+                    : null,
+                  inlineView.error === '' ? null : h('span', { className: 'dsh-ide-inline-error' }, inlineView.error),
+                  h(
+                    'span',
+                    { className: 'dsh-ide-inline-actions' },
+                    inlineView.phase === 'input' && (preferences === undefined || preferences.inlineEditConsent !== true)
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button dsh-ide-button-primary',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              void allowInlineEdit()
+                            },
+                          },
+                          'Разрешить',
+                        )
+                      : null,
+                    inlineView.phase === 'input'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button dsh-ide-button-primary',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              void submitInlineEdit()
+                            },
+                          },
+                          'Отправить',
+                        )
+                      : null,
+                    inlineView.phase === 'preview'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button dsh-ide-button-primary',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              acceptInlineEdit()
+                            },
+                          },
+                          'Принять',
+                        )
+                      : null,
+                    inlineView.phase === 'preview'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              refineInlineEdit()
+                            },
+                          },
+                          'Уточнить',
+                        )
+                      : null,
+                    inlineView.phase === 'stale' || inlineView.phase === 'failed'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              dismissInlineEdit('close', true)
+                            },
+                          },
+                          'Закрыть',
+                        )
+                      : null,
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-ide-button',
+                        onClick: (event) => {
+                          event.preventDefault()
+                          dismissInlineEdit('esc', true)
+                        },
+                      },
+                      'Отмена',
+                    ),
+                  ),
+                ),
             h(
               'div',
               { className: 'dsh-ide-breadcrumbs' },
@@ -4294,7 +6718,32 @@ function IdeBody(props) {
                   h('div', { className: 'dsh-ide-empty-text' }, explorerSide === 'left' ? 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.' : 'Ctrl+P — открыть файл по имени, или выберите его в проводнике справа.'),
                 )
               : null,
-            h('div', { className: 'dsh-ide-stage', ref: hostRef }),
+            h(
+              'div',
+              { className: 'dsh-ide-stage-wrap' },
+              h('div', { className: 'dsh-ide-stage', ref: hostRef }),
+              // Side-by-side comparison of one assistant file, drawn over the
+              // editor: two panes need the width, the explorer pane has none.
+            diffView === undefined
+              ? null
+              : h(DiffReview, {
+                  view: diffView,
+                  work: assistantWork,
+                  onAccept: (file) => acceptAssistant(diffView.turn, file),
+                  onRevert: (file) => {
+                    void revertAssistant(diffView.turn, file)
+                  },
+                  onAcceptAll: () => acceptAssistantAll(diffView.turn),
+                  onRevertAll: () => {
+                    void revertAssistantAll(diffView.turn)
+                  },
+                  onOpenFile: (path) => {
+                    void openFile(path, { activate: true })
+                  },
+                  onClose: () => setDiffView(undefined),
+                  containerRef: diffContainerRef,
+                }),
+            ),
             panel === undefined ? null : h('div', { className: 'dsh-ide-panel-resize', onMouseDown: beginPanelResize }),
             panel === undefined
               ? null
@@ -4317,6 +6766,30 @@ function IdeBody(props) {
               activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item' }, `Стр ${cursor.line}, Стлб ${cursor.column}`),
               activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item' }, activeTab.readOnly ? 'Только чтение' : activeTab.eol === 'crlf' ? 'CRLF' : 'LF'),
               activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item' }, 'UTF-8'),
+              activeTab === undefined
+                ? null
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action',
+                      title: `Добавить файл и выделенные строки в чат ссылкой (${ADD_TO_CHAT_KEY})`,
+                      onClick: () => handlersRef.current.addToChat?.(),
+                    },
+                    'В чат',
+                  ),
+              activeTab === undefined
+                ? null
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action',
+                      title: 'Вставить выделение или текущую строку в чат текстом (Ctrl+L)',
+                      onClick: () => void quoteEditorFragment(),
+                    },
+                    'Цитата',
+                  ),
             ),
           ),
         ),
@@ -4340,6 +6813,27 @@ function IdeBody(props) {
                 setModelDialog(false)
                 setSettingsOpen(false)
               },
+            })
+          : null,
+        paletteOpen
+          ? h(CommandPalette, {
+              commands: menus.flatMap((menu) =>
+                menu.items
+                  .filter((item) => item.separator !== true && typeof item.run === 'function')
+                  .map((item) => ({
+                    id: `${menu.id}:${item.id}`,
+                    label: item.label,
+                    group: menu.label,
+                    key: item.key,
+                    disabled: item.disabled === true,
+                    run: item.run,
+                  })),
+              ),
+              onPick: (entry) => {
+                setPaletteOpen(false)
+                entry.run()
+              },
+              onClose: () => setPaletteOpen(false),
             })
           : null,
         quick !== undefined
@@ -4373,6 +6867,50 @@ function IdeBody(props) {
           : h(TabContextMenu, { menu: tabMenu, items: tabMenuItems, onClose: () => setTabMenu(undefined) }),
         prompt === undefined ? null : h(PromptDialog, { prompt, onClose: () => setPrompt(undefined) }),
         info === undefined ? null : h(InfoDialog, { info, onClose: () => setInfo(undefined) }),
+        quotePrompt === undefined
+          ? null
+          : h(
+              'div',
+              { className: 'dsh-ide-modal', onClick: () => setQuotePrompt(undefined) },
+              h(
+                'div',
+                { className: 'dsh-ide-modal-card', onClick: (event) => event.stopPropagation() },
+                h('div', { className: 'dsh-ide-modal-title' }, 'Добавить в чат'),
+                h('div', { className: 'dsh-ide-modal-text' }, baseName(quotePrompt.path)),
+                quotePrompt.directory === true
+                  ? null
+                  : h('input', {
+                      className: 'dsh-ide-input dsh-ide-input-number',
+                      type: 'text',
+                      inputMode: 'numeric',
+                      autoFocus: true,
+                      placeholder: 'Например, 3 или 3-7 (пусто — весь файл)',
+                      value: quotePrompt.value,
+                      onChange: (event) => setQuotePrompt({ ...quotePrompt, value: event.target.value }),
+                      onKeyDown: (event) => {
+                        if (event.key === 'Enter') applyQuoteLines('reference')
+                        else if (event.key === 'Escape') setQuotePrompt(undefined)
+                      },
+                    }),
+                h(
+                  'div',
+                  { className: 'dsh-ide-modal-actions' },
+                  h('button', { type: 'button', className: 'dsh-ide-button', onClick: () => setQuotePrompt(undefined) }, 'Отмена'),
+                  quotePrompt.directory === true
+                    ? null
+                    : h(
+                        'button',
+                        { type: 'button', className: 'dsh-ide-button', onClick: () => applyQuoteLines('text') },
+                        'Текст строк',
+                      ),
+                  h(
+                    'button',
+                    { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: () => applyQuoteLines('reference') },
+                    'Ссылка @',
+                  ),
+                ),
+              ),
+            ),
       )
     }
 
@@ -4382,10 +6920,12 @@ function IdeBody(props) {
 .dsh-ide-root { display:flex; flex-direction:column; height:100%; min-height:0; position:relative;
   --ide-bg:#1e1e1e; --ide-panel:#252526; --ide-panel-2:#2d2d2d; --ide-border:#3c3c3c; --ide-text:#cccccc;
   --ide-muted:#8a8a8a; --ide-hover:#2a2d2e; --ide-active:#37373d; --ide-select:#094771; --ide-accent:#007acc; --ide-error:#f48771;
+  --ide-fg:#cccccc; --ide-fg-dim:#8a8a8a; --ide-mono:'Cascadia Code','Fira Code',Consolas,ui-monospace,monospace;
   background:var(--ide-bg); color:var(--ide-text);
   font:400 12px/1.45 var(--dsh-font-ui, system-ui, -apple-system, Segoe UI, sans-serif); }
 .dsh-ide-root[data-theme="light"] { --ide-bg:#ffffff; --ide-panel:#f3f3f3; --ide-panel-2:#ececec; --ide-border:#e2e2e2;
-  --ide-text:#2b2b2b; --ide-muted:#6b6b6b; --ide-hover:#e8e8e8; --ide-active:#e4e6f1; --ide-select:#cce4ff; --ide-accent:#0066bf; --ide-error:#b5200d; }
+  --ide-text:#2b2b2b; --ide-muted:#6b6b6b; --ide-hover:#e8e8e8; --ide-active:#e4e6f1; --ide-select:#cce4ff; --ide-accent:#0066bf; --ide-error:#b5200d;
+  --ide-fg:#2b2b2b; --ide-fg-dim:#6b6b6b; }
 .dsh-ide-root * { box-sizing:border-box; }
 .dsh-ide-top { display:flex; align-items:center; gap:6px; padding:3px 8px; background:var(--ide-panel);
   border-bottom:1px solid var(--ide-border); flex:0 0 auto; min-height:32px; }
@@ -4460,6 +7000,136 @@ function IdeBody(props) {
   border:1px solid var(--ide-border); font:400 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); outline:none; }
 .dsh-ide-search-input:focus { border-color:var(--ide-accent); }
 .dsh-ide-tree { flex:1 1 auto; overflow:auto; padding:2px 0 10px; }
+.dsh-ide-search-status { padding:0 8px 6px; color:var(--ide-fg-dim); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-search-file { border-bottom:1px solid var(--ide-border); padding-bottom:3px; }
+.dsh-ide-search-file:last-child { border-bottom:0; }
+.dsh-ide-search-file-head { display:flex; align-items:baseline; gap:6px; padding:6px 8px 3px; position:sticky; top:0;
+  background:var(--ide-panel); z-index:1; }
+.dsh-ide-search-file-name { font:600 11.5px/1.3 var(--dsh-font-ui, system-ui, sans-serif); color:var(--ide-fg); white-space:nowrap; }
+.dsh-ide-search-file-dir { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  color:var(--ide-fg-dim); font:400 10px/1.3 var(--ide-mono); }
+.dsh-ide-search-file-count { flex:0 0 auto; padding:0 5px; border-radius:7px; background:var(--ide-hover);
+  color:var(--ide-fg-dim); font:400 10px/1.5 var(--ide-mono); }
+.dsh-ide-search-row { display:flex; align-items:center; gap:2px; padding-left:8px; }
+.dsh-ide-search-row:hover { background:var(--ide-hover); }
+.dsh-ide-search-hit { flex:1 1 auto; min-width:0; display:flex; align-items:baseline; gap:6px; padding:2px 6px 2px 0;
+  border:0; background:transparent; color:inherit; text-align:left; cursor:pointer; font:inherit; }
+.dsh-ide-search-line { flex:0 0 auto; min-width:3ch; text-align:right; color:var(--ide-fg-dim);
+  font:400 10.5px/1.4 var(--ide-mono); }
+.dsh-ide-search-path { color:var(--ide-fg-dim); font:400 10px/1.3 var(--ide-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-search-preview { flex:1 1 auto; min-width:0; color:var(--ide-fg); font:400 11px/1.35 var(--ide-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-search-mark { background:rgba(255, 196, 0, .32); color:inherit; border-radius:2px; }
+.dsh-ide-change-hint { padding:6px 10px; color:var(--ide-fg-dim);
+  font:400 10.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-list { padding:0 0 10px; }
+.dsh-ide-change-section { padding:8px 10px 3px; font-size:10px; text-transform:uppercase;
+  letter-spacing:.4px; color:var(--ide-fg-dim); border-top:1px solid var(--ide-border); }
+.dsh-ide-change-section:first-of-type { border-top:none; }
+.dsh-ide-assist-list { padding:0 0 4px; }
+.dsh-ide-assist-turn { padding:5px 10px 6px; border-top:1px solid var(--ide-border); }
+.dsh-ide-assist-turn-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px;
+  font:400 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-turn-title { font-weight:600; }
+.dsh-ide-assist-turn-count { color:var(--ide-fg-dim); font:400 10.5px/1.5 var(--ide-mono); }
+/* A turn the recorder forgot: still visible, without actions, so the list never
+   rewrites itself behind the user's back. */
+.dsh-ide-assist-turn-stale { opacity:.55; }
+.dsh-ide-assist-turn-stale .dsh-ide-assist-turn-title { font-weight:500; color:var(--ide-fg-dim); }
+.dsh-ide-assist-file { padding-left:8px; }
+.dsh-ide-assist-file-head { display:flex; align-items:baseline; gap:6px; width:100%; padding:2px 0;
+  background:none; border:none; color:inherit; text-align:left; cursor:pointer;
+  font:400 12px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-file-head:hover { background:var(--ide-hover); }
+.dsh-ide-assist-flag { padding:0 4px; border:1px solid var(--ide-border); border-radius:3px;
+  color:var(--ide-fg-dim); font:400 9px/1.5 var(--ide-mono); }
+.dsh-ide-assist-diff { margin:2px 0 4px 6px; max-height:260px; overflow:auto;
+  background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; }
+.dsh-ide-assist-note { padding:3px 6px; color:var(--ide-fg-dim);
+  font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-hunk { border-top:1px solid var(--ide-border); }
+.dsh-ide-assist-hunk:first-child { border-top:none; }
+.dsh-ide-assist-hunk-head { padding:2px 6px; background:var(--ide-panel); color:var(--ide-fg-dim);
+  font:400 10px/1.5 var(--ide-mono); }
+.dsh-ide-assist-line { padding:0 6px; white-space:pre; font:400 11px/1.45 var(--ide-mono); }
+.dsh-ide-assist-add { background:rgba(137, 209, 133, .14); }
+.dsh-ide-assist-del { background:rgba(244, 135, 113, .14); }
+.dsh-ide-stage-wrap { position:relative; flex:1 1 auto; min-height:0; display:flex; }
+.dsh-ide-diffview { position:absolute; inset:0; z-index:5; display:flex; flex-direction:column;
+  background:var(--ide-bg); }
+.dsh-ide-diffview-head { display:flex; align-items:center; gap:8px; padding:4px 8px; flex:0 0 auto;
+  border-bottom:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-diffview-title { font:600 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); color:var(--ide-fg);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-diffview-sub, .dsh-ide-diffview-note { color:var(--ide-fg-dim);
+  font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-spacer { flex:1 1 auto; }
+.dsh-ide-diffview-error { color:#f48771; font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-action { padding:0 8px; border-radius:4px; cursor:pointer; border:1px solid var(--ide-border);
+  background:var(--ide-panel-2); color:var(--ide-fg);
+  font:400 10.5px/1.8 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-action:hover:not(:disabled) { border-color:rgba(204, 204, 204, .5); }
+.dsh-ide-diffview-action:disabled { opacity:.5; cursor:default; }
+.dsh-ide-diffview-danger:hover:not(:disabled) { border-color:rgba(244, 135, 113, .6); }
+.dsh-ide-diffview-body { flex:1 1 auto; min-height:0; }
+.dsh-ide-diffview-files { flex:0 0 auto; max-height:32%; overflow:auto;
+  border-top:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-diffview-files-head { padding:3px 10px; color:var(--ide-fg-dim); text-transform:uppercase;
+  letter-spacing:.3px; font:400 10px/1.6 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-file { display:flex; align-items:baseline; gap:8px; padding:2px 10px;
+  border-top:1px solid rgba(60, 60, 60, .45); }
+.dsh-ide-diffview-file:hover { background:var(--ide-hover); }
+.dsh-ide-assist-accept, .dsh-ide-assist-revert { padding:0 6px; border-radius:4px; cursor:pointer;
+  border:1px solid var(--ide-border); background:var(--ide-panel); color:var(--ide-fg);
+  font:400 10.5px/1.7 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-accept:hover:not(:disabled) { border-color:rgba(137, 209, 133, .6); }
+.dsh-ide-assist-revert:hover:not(:disabled) { border-color:rgba(244, 135, 113, .6); }
+.dsh-ide-assist-accept:disabled, .dsh-ide-assist-revert:disabled { opacity:.5; cursor:default; }
+.dsh-ide-assist-work { color:var(--ide-fg-dim); font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-work-accepted { color:#89d185; }
+.dsh-ide-assist-work-reverted { color:#dcdcaa; }
+.dsh-ide-assist-work-failed { color:#f48771; }
+.dsh-ide-assist-error { padding:2px 0 3px 8px; color:#f48771;
+  font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-row { padding:5px 10px; border-top:1px solid var(--ide-border); }
+.dsh-ide-change-row:first-child { border-top:none; }
+.dsh-ide-change-head { display:flex; align-items:baseline; gap:6px; width:100%; padding:0;
+  background:none; border:none; color:inherit; text-align:left; cursor:pointer;
+  font:400 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-change-dir { color:var(--ide-fg-dim); font-size:10.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-change-meta { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:2px;
+  font:400 10.5px/1.5 var(--ide-font-mono, ui-monospace, monospace); }
+.dsh-ide-change-added { color:#89d185; }
+.dsh-ide-change-removed { color:#f48771; }
+.dsh-ide-change-status { padding:0 5px; border-radius:8px; border:1px solid var(--ide-border);
+  font:400 10px/1.5 var(--dsh-font-ui, system-ui, sans-serif); color:var(--ide-fg-dim); }
+.dsh-ide-change-buffer { color:#dcdcaa; border-color:rgba(220, 220, 170, .45); }
+.dsh-ide-change-saved { color:#89d185; border-color:rgba(137, 209, 133, .45); }
+.dsh-ide-change-reverted { color:var(--ide-fg-dim); }
+.dsh-ide-change-revert { margin-left:auto; padding:0 6px; border-radius:4px; cursor:pointer;
+  border:1px solid var(--ide-border); background:var(--ide-panel); color:var(--ide-fg);
+  font:400 10.5px/1.7 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-revert:hover { border-color:var(--ide-accent); }
+.dsh-ide-change-error { color:#f48771; }
+.dsh-ide-palette-layer { position:absolute; inset:0; z-index:30; display:flex; justify-content:center;
+  align-items:flex-start; padding-top:8vh; background:rgba(0, 0, 0, .35); }
+.dsh-ide-palette { width:min(560px, 92%); max-height:70%; display:flex; flex-direction:column;
+  background:var(--ide-panel); border:1px solid var(--ide-border); border-radius:6px; overflow:hidden;
+  box-shadow:0 12px 32px rgba(0, 0, 0, .45); }
+.dsh-ide-palette-input { padding:8px 10px; border:none; border-bottom:1px solid var(--ide-border);
+  background:var(--ide-bg); color:var(--ide-fg); outline:none;
+  font:400 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-palette-list { overflow:auto; padding:4px 0; }
+.dsh-ide-palette-item { display:flex; align-items:baseline; gap:8px; width:100%; padding:4px 10px;
+  border:none; background:none; color:var(--ide-fg); text-align:left; cursor:pointer;
+  font:400 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-palette-item:hover { background:rgba(255, 255, 255, .06); }
+.dsh-ide-palette-item-off { opacity:.45; cursor:default; }
+.dsh-ide-palette-group { margin-left:auto; color:var(--ide-fg-dim); font-size:10.5px; }
+.dsh-ide-palette-key { color:var(--ide-fg-dim); font:400 10.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-palette-empty { padding:10px; color:var(--ide-fg-dim);
+  font:400 12px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-activity-glyph { font:400 13px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-row { display:flex; align-items:center; gap:4px; width:100%; border:0; background:transparent; color:inherit;
   text-align:left; cursor:pointer; padding:2px 6px 2px 6px; font:inherit; line-height:18px; white-space:nowrap; }
 .dsh-ide-row:hover { background:var(--ide-hover); }
@@ -4560,11 +7230,31 @@ function IdeBody(props) {
 .dsh-ide-status-spacer { flex:1 1 auto; }
 .dsh-ide-status-item { flex:0 0 auto; }
 .dsh-ide-status-item:hover { background:rgba(255,255,255,.12); border-radius:3px; padding:0 3px; margin:0 -3px; }
+.dsh-ide-status-action { cursor:pointer; border:none; background:transparent; color:inherit; font:inherit; }
+.dsh-ide-status-action:hover { background:rgba(255,255,255,.12); border-radius:3px; }
+.dsh-ide-drop-overlay { position:absolute; inset:0; z-index:25; display:flex; align-items:center; justify-content:center;
+  background:rgba(0,0,0,.5); pointer-events:none; }
+.dsh-ide-drop-overlay-text { padding:10px 18px; border:2px dashed var(--ide-accent); border-radius:8px; background:var(--ide-panel);
+  color:var(--ide-text); font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-consent { display:flex; align-items:center; gap:8px; flex:0 0 auto; padding:6px 10px; background:#3a2d1f;
   border-bottom:1px solid var(--ide-border); color:#e8d6b8; font-size:11.5px; }
 .dsh-ide-root[data-theme="light"] .dsh-ide-consent { background:#fff4d6; color:#4d3a12; }
 .dsh-ide-consent-text { flex:1 1 auto; min-width:0; }
 .dsh-ide-consent-actions { display:flex; gap:6px; flex:0 0 auto; }
+.dsh-ide-inline { display:flex; align-items:center; gap:8px; flex:0 0 auto; padding:6px 10px;
+  border-bottom:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-inline-label { text-transform:uppercase; letter-spacing:.4px; font-size:10px; color:var(--ide-fg-dim); flex:0 0 auto; }
+.dsh-ide-inline-input { flex:1 1 auto; min-width:0; background:var(--ide-bg); color:var(--ide-fg);
+  border:1px solid var(--ide-border); border-radius:4px; padding:3px 6px; font:inherit; outline:none; }
+.dsh-ide-inline-input:focus { border-color:var(--ide-accent); }
+.dsh-ide-inline-text { flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; font-size:11.5px; }
+.dsh-ide-inline-error { flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; font-size:11.5px; color:#f48771; }
+.dsh-ide-inline-actions { display:flex; gap:6px; flex:0 0 auto; }
+.dsh-ide-inline-old { background:rgba(244,135,113,.18); text-decoration:line-through; }
+.dsh-ide-inline-preview { background:rgba(137,209,133,.12); border-left:2px solid #89d185;
+  font:400 12px/1.45 var(--ide-mono); white-space:pre; overflow:auto; padding:2px 8px; color:var(--ide-fg); }
+.dsh-ide-inline-preview-head { font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:var(--ide-fg-dim); }
+.dsh-ide-inline-preview-body { margin:0; font:inherit; white-space:pre; }
 .dsh-ide-settings { position:absolute; inset:0; z-index:20; display:flex; flex-direction:column;
   background:var(--ide-bg); color:var(--ide-text); }
 .dsh-ide-settings-head { display:flex; align-items:center; gap:10px; padding:8px 14px;
@@ -4597,6 +7287,23 @@ function IdeBody(props) {
 .dsh-ide-setting-desc { margin-top:2px; max-width:720px; color:var(--ide-muted);
   font:400 12px/1.55 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-setting-control { margin-top:8px; display:flex; align-items:center; gap:6px; }
+.dsh-ide-keys { display:flex; flex-direction:column; border:1px solid var(--ide-border);
+  border-radius:4px; overflow:hidden; background:var(--ide-panel-2); max-width:720px; }
+.dsh-ide-keys-row { display:grid; grid-template-columns:minmax(150px, 1fr) 210px 26px; gap:10px;
+  align-items:center; padding:5px 10px; border-top:1px solid var(--ide-border); }
+.dsh-ide-keys-row:first-child { border-top:none; }
+.dsh-ide-keys-head { padding:4px 10px; background:var(--ide-panel); font-size:10px;
+  text-transform:uppercase; letter-spacing:.4px; color:var(--ide-fg-dim); }
+.dsh-ide-keys-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font:400 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-keys-default { margin-left:6px; font-size:10.5px; color:var(--ide-fg-dim); }
+.dsh-ide-keys-chord { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.dsh-ide-keys-row[data-invalid="true"] .dsh-ide-key-input { border-color:#f48771; }
+.dsh-ide-keys-reset { justify-self:end; }
+.dsh-ide-key-input { width:100%; padding:2px 7px; border-radius:4px; border:1px solid var(--ide-border);
+  background:var(--ide-bg); color:var(--ide-fg); font:500 12px/1.5 var(--dsh-font-mono, ui-monospace, monospace); outline:none; }
+.dsh-ide-key-input:focus { border-color:var(--ide-accent); }
+.dsh-ide-key-error { color:#f48771; font:400 10.5px/1.35 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-setting-input { width:230px; max-width:100%; }
 .dsh-ide-setting-textarea { width:100%; min-height:96px; resize:vertical; font:400 12.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); padding:6px 8px; }
 .dsh-ide-setting-control input[type="checkbox"] { width:14px; height:14px; accent-color:var(--ide-accent); }
@@ -4661,12 +7368,35 @@ function IdeBody(props) {
       inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'theme'],
       apply(ctx) {
         services = {
+          ctx,
           theme: ctx.theme,
           sidebarRight: ctx.sidebarRight,
           sidebarRightTabs: ctx.sidebarRightTabs,
+          // The session input machine — the owner of `slash/input-insert-reference`
+          // — lives on the session's own client context, which the sessions
+          // service hands out per retained binding. Absent for a tab that is not
+          // bound to a retained session.
+          sessionContext: (id) => {
+            if (typeof id !== 'string' || id === '') return undefined
+            try {
+              const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+              if (sessions === undefined || sessions === null || typeof sessions.binding !== 'function') return undefined
+              const binding = sessions.binding(id)
+              if (binding === undefined || binding === null) return undefined
+              return typeof binding.ctx === 'object' ? binding.ctx : undefined
+            } catch (cause) {
+              return undefined
+            }
+          },
         }
 
         ctx.effect(injectStyles, 'dsh-ide: styles')
+
+        // Chips link files the way `@` does, but carry their line range into
+        // the sent message. The source is registered eagerly when the shell's
+        // trigger service is already up; `ensureChatSource` retries on the
+        // first chip otherwise.
+        ensureChatSource()
 
         ctx.effect(() => {
           const dispose = ctx.sidebarRightTabs.register({

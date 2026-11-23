@@ -1,0 +1,2566 @@
+{
+  "build": "3.23.23",
+  "scope": "resources/app/extensions/*/package.json; declarations only",
+  "skipped": [
+    "node_modules"
+  ],
+  "extensions": [
+    {
+      "folder": "bat",
+      "name": "bat",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "bat"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "clojure",
+      "name": "clojure",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "clojure"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "coffeescript",
+      "name": "coffeescript",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "breakpoints",
+        "snippets",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "coffeescript"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "configuration-editing",
+      "name": "configuration-editing",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/configurationEditingMain",
+      "browser": "./dist/browser/configurationEditingMain",
+      "activation": [
+        "onProfile",
+        "onProfile:github",
+        "onLanguage:json",
+        "onLanguage:jsonc"
+      ],
+      "categories": [
+        "languages",
+        "jsonValidation"
+      ],
+      "commands": [],
+      "languages": [
+        "jsonc",
+        "json"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "cpp",
+      "name": "cpp",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "configurationDefaults",
+        "languages",
+        "grammars",
+        "problemPatterns",
+        "problemMatchers",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "c",
+        "cpp",
+        "cuda-cpp"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "csharp",
+      "name": "csharp",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "configurationDefaults",
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "csharp"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "css",
+      "name": "css",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "css"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "css-language-features",
+      "name": "css-language-features",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./client/dist/node/cssClientMain",
+      "browser": "./client/dist/browser/cssClientMain",
+      "activation": [
+        "onLanguage:css",
+        "onLanguage:less",
+        "onLanguage:scss",
+        "onCommand:_css.applyCodeAction"
+      ],
+      "categories": [
+        "configuration",
+        "configurationDefaults",
+        "jsonValidation"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-agent-exec",
+      "name": "cursor-agent-exec",
+      "version": "0.0.1",
+      "description": "Provides agent execution capabilities for Cursor, enabling agents to run commands, interact with files, and use tools with user permissions and approvals",
+      "entry": "./dist/main",
+      "activation": [
+        "*"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-agent-host",
+      "name": "cursor-agent-host",
+      "version": "0.0.1",
+      "description": "Hosts Cursor agent orchestration in the AgentExec extension host",
+      "entry": "./dist/main.js",
+      "activation": [
+        "*"
+      ],
+      "categories": [
+        "configuration"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-agent-worker",
+      "name": "cursor-agent-worker",
+      "version": "0.0.1",
+      "description": "Install and run Cursor agent worker from extension startup",
+      "entry": "./dist/main",
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-always-local",
+      "name": "cursor-always-local",
+      "version": "0.0.1",
+      "description": "Implements experimentation features for Cursor",
+      "entry": "./dist/main",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onStartupFinished",
+        "onResolveRemoteAuthority:background-composer"
+      ],
+      "categories": [
+        "commands",
+        "keybindings",
+        "menus",
+        "jsonValidation",
+        "configuration"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-browser-automation",
+      "name": "cursor-browser-automation",
+      "version": "1.0.0",
+      "description": "MCP server for browser automation in Cursor",
+      "entry": "./dist/extension.js",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-checkout",
+      "name": "cursor-checkout",
+      "version": "0.0.1",
+      "description": "Checkout provider for branch migration operations",
+      "entry": "./dist/main",
+      "activation": [
+        "*"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-commits",
+      "name": "cursor-commits",
+      "version": "0.0.1",
+      "description": "Tracks requests and commits for Cursor online metrics",
+      "entry": "./dist/main",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [
+        "commands",
+        "keybindings",
+        "menus"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-computer-use",
+      "name": "cursor-computer-use",
+      "version": "1.0.0",
+      "description": "Computer use in Cursor",
+      "entry": "./dist/extension.js",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-deeplink",
+      "name": "cursor-deeplink",
+      "version": "0.0.1",
+      "description": "Handles deep-link URIs.",
+      "entry": "./dist/main",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onStartupFinished",
+        "onUri"
+      ],
+      "categories": [
+        "commands"
+      ],
+      "commands": [
+        "cursor-deeplink.debug.triggerDeeplink"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-explorer",
+      "name": "cursor-explorer",
+      "version": "0.0.1",
+      "description": "Workspace extension for Cursor Explorer",
+      "entry": "./dist/main",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-file-service",
+      "name": "cursor-file-service",
+      "version": "1.0.0",
+      "description": "Handles indexing and retrieval for Cursor",
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-local-agent-runtime",
+      "name": "cursor-local-agent-runtime",
+      "version": "0.0.1",
+      "description": "Hosts Cursor Private Inference outside workspace extension hosts",
+      "entry": "./dist/main",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "*"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-mcp",
+      "name": "cursor-mcp",
+      "version": "0.0.1",
+      "description": "Handles MCP for Cursor",
+      "entry": "./dist/main",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "onStartupFinished",
+        "onUri"
+      ],
+      "categories": [
+        "commands",
+        "keybindings",
+        "menus",
+        "configuration"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-ndjson-ingest",
+      "name": "cursor-ndjson-ingest",
+      "version": "0.0.1",
+      "description": "HTTP server for ingesting NDJSON logs to workspace/.cursor/debug.log",
+      "entry": "./dist/main",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "onCommand:cursor.ndjsonIngest.start",
+        "onCommand:cursor.ndjsonIngest.reassignPort"
+      ],
+      "categories": [
+        "commands",
+        "configuration"
+      ],
+      "commands": [
+        "cursor.ndjsonIngest.start",
+        "cursor.ndjsonIngest.stop",
+        "cursor.ndjsonIngest.copyCurl",
+        "cursor.ndjsonIngest.reassignPort",
+        "cursor.ndjsonIngest.showStatus"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-polyfills-remote",
+      "name": "cursor-polyfills-remote",
+      "version": "0.0.1",
+      "description": "Polyfills for workspace extension host",
+      "entry": "./dist/main",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "*"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-resolver",
+      "name": "cursor-resolver",
+      "version": "0.0.1",
+      "description": "Background composer remote authority resolver for Cursor",
+      "entry": "./dist/main",
+      "browser": "./dist/browser/main",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onResolveRemoteAuthority:background-composer"
+      ],
+      "categories": [
+        "resourceLabelFormatters"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-resolver-helper",
+      "name": "cursor-resolver-helper",
+      "version": "0.0.1",
+      "description": "Connection token provider for Cursor resolver",
+      "entry": "./dist/main",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onResolveRemoteAuthority:background-composer",
+        "onStartupFinished"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-retrieval",
+      "name": "cursor-retrieval",
+      "version": "0.0.1",
+      "description": "Handles indexing and retrieval for Cursor",
+      "entry": "./dist/main",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [
+        "commands",
+        "keybindings",
+        "menus",
+        "configuration",
+        "languages"
+      ],
+      "commands": [
+        "cursor.grepClient.debug",
+        "cursor.codebaseTelemetry.triggerSnapshot"
+      ],
+      "languages": [
+        "ignore",
+        "ignore"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-shadow-workspace",
+      "name": "cursor-shadow-workspace",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "browser": "./dist/browser/extension",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [
+        "commands",
+        "configuration"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-socket",
+      "name": "cursor-socket",
+      "version": "0.0.1",
+      "description": "TCP/TLS socket provider for Cursor extensions",
+      "entry": "./dist/main",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onResolveRemoteAuthority:background-composer",
+        "onStartupFinished"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "cursor-worktree-textmate",
+      "name": "worktree-textmate",
+      "version": "0.0.1",
+      "description": "Provides TextMate-only syntax highlighting for .cursor/worktrees files without activating language servers.",
+      "kind": [
+        "ui"
+      ],
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "worktree-typescript",
+        "worktree-typescriptreact",
+        "worktree-javascript",
+        "worktree-javascriptreact",
+        "worktree-python",
+        "worktree-go",
+        "worktree-rust",
+        "worktree-java",
+        "worktree-c",
+        "worktree-cpp",
+        "worktree-php",
+        "worktree-ruby",
+        "worktree-html",
+        "worktree-css",
+        "worktree-json",
+        "worktree-yaml",
+        "worktree-sql",
+        "worktree-swift",
+        "worktree-shellscript",
+        "worktree-protobuf",
+        "worktree-hcl",
+        "worktree-terraform",
+        "worktree-terraform-vars",
+        "worktree-terraform-stack",
+        "worktree-terraform-deploy",
+        "worktree-terraform-test",
+        "worktree-terraform-mock",
+        "worktree-terraform-search"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "dart",
+      "name": "dart",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "dart"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "debug-auto-launch",
+      "name": "debug-auto-launch",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [
+        "commands"
+      ],
+      "commands": [
+        "extension.node-debug.toggleAutoAttach"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "debug-server-ready",
+      "name": "debug-server-ready",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "activation": [
+        "onDebugResolve"
+      ],
+      "categories": [
+        "debuggers"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "diff",
+      "name": "diff",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "diff"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "docker",
+      "name": "docker",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "dockerfile"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "dotenv",
+      "name": "dotenv",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "dotenv"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "emmet",
+      "name": "emmet",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/node/emmetNodeMain",
+      "browser": "./dist/browser/emmetBrowserMain",
+      "activation": [
+        "onCommand:emmet.expandAbbreviation",
+        "onLanguage"
+      ],
+      "categories": [
+        "configuration",
+        "commands",
+        "menus"
+      ],
+      "commands": [
+        "editor.emmet.action.wrapWithAbbreviation",
+        "editor.emmet.action.removeTag",
+        "editor.emmet.action.updateTag",
+        "editor.emmet.action.matchTag",
+        "editor.emmet.action.balanceIn",
+        "editor.emmet.action.balanceOut",
+        "editor.emmet.action.prevEditPoint",
+        "editor.emmet.action.nextEditPoint",
+        "editor.emmet.action.mergeLines",
+        "editor.emmet.action.selectPrevItem",
+        "editor.emmet.action.selectNextItem",
+        "editor.emmet.action.splitJoinTag",
+        "editor.emmet.action.toggleComment",
+        "editor.emmet.action.evaluateMathExpression",
+        "editor.emmet.action.updateImageSize",
+        "editor.emmet.action.incrementNumberByOneTenth",
+        "editor.emmet.action.incrementNumberByOne",
+        "editor.emmet.action.incrementNumberByTen",
+        "editor.emmet.action.decrementNumberByOneTenth",
+        "editor.emmet.action.decrementNumberByOne",
+        "editor.emmet.action.decrementNumberByTen",
+        "editor.emmet.action.reflectCSSValue",
+        "workbench.action.showEmmetCommands"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "extension-editing",
+      "name": "extension-editing",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extensionEditingMain",
+      "browser": "./dist/browser/extensionEditingBrowserMain",
+      "activation": [
+        "onLanguage:json",
+        "onLanguage:markdown"
+      ],
+      "categories": [
+        "jsonValidation",
+        "languages"
+      ],
+      "commands": [],
+      "languages": [
+        "ignore"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "fsharp",
+      "name": "fsharp",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "fsharp"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "git",
+      "name": "git",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/main",
+      "activation": [
+        "*",
+        "onEditSession:file",
+        "onFileSystem:git",
+        "onFileSystem:git-show"
+      ],
+      "categories": [
+        "commands",
+        "continueEditSession",
+        "keybindings",
+        "menus",
+        "submenus",
+        "configuration",
+        "colors",
+        "configurationDefaults",
+        "viewsWelcome"
+      ],
+      "commands": [
+        "git.continueInLocalClone",
+        "git.clone",
+        "git.cloneRecursive",
+        "git.init",
+        "git.openRepository",
+        "git.reopenClosedRepositories",
+        "git.close",
+        "git.closeOtherRepositories",
+        "git.openWorktree",
+        "git.openWorktreeInNewWindow",
+        "git.refresh",
+        "git.rescan",
+        "git.compareWithWorkspace",
+        "git.openChange",
+        "git.openAllChanges",
+        "git.openFile",
+        "git.openFile2",
+        "git.openHEADFile",
+        "git.stage",
+        "git.stageAll",
+        "git.stageAllTracked",
+        "git.stageAllUntracked",
+        "git.stageAllMerge",
+        "git.stageSelectedRanges",
+        "git.diff.stageHunk",
+        "git.diff.stageSelection",
+        "git.revertSelectedRanges",
+        "git.stageChange",
+        "git.stageFile",
+        "git.revertChange",
+        "git.unstage",
+        "git.unstageAll",
+        "git.unstageSelectedRanges",
+        "git.unstageFile",
+        "git.clean",
+        "git.cleanAll",
+        "git.cleanAllTracked",
+        "git.cleanAllUntracked",
+        "git.rename",
+        "git.commit",
+        "git.commitAmend",
+        "git.commitSigned",
+        "git.commitStaged",
+        "git.commitEmpty",
+        "git.commitStagedSigned",
+        "git.commitStagedAmend",
+        "git.commitAll",
+        "git.commitAllSigned",
+        "git.commitAllAmend",
+        "git.commitNoVerify",
+        "git.commitStagedNoVerify",
+        "git.commitEmptyNoVerify",
+        "git.commitStagedSignedNoVerify",
+        "git.commitAmendNoVerify",
+        "git.commitSignedNoVerify",
+        "git.commitStagedAmendNoVerify",
+        "git.commitAllNoVerify",
+        "git.commitAllSignedNoVerify",
+        "git.commitAllAmendNoVerify",
+        "git.commitMessageAccept",
+        "git.commitMessageDiscard",
+        "git.restoreCommitTemplate",
+        "git.undoCommit",
+        "git.checkout",
+        "git.graph.checkout",
+        "git.checkoutDetached",
+        "git.graph.checkoutDetached",
+        "git.branch",
+        "git.branchFrom",
+        "git.deleteBranch",
+        "git.graph.deleteBranch",
+        "git.deleteRemoteBranch",
+        "git.renameBranch",
+        "git.merge",
+        "git.mergeAbort",
+        "git.rebase",
+        "git.createTag",
+        "git.deleteTag",
+        "git.migrateWorktreeChanges",
+        "git.createWorktree",
+        "git.deleteWorktree",
+        "git.deleteWorktreeFromPalette",
+        "git.graph.deleteTag",
+        "git.deleteRemoteTag",
+        "git.fetch",
+        "git.fetchPrune",
+        "git.fetchAll",
+        "git.fetchRef",
+        "git.pull",
+        "git.pullRebase",
+        "git.pullFrom",
+        "git.pullRef",
+        "git.push",
+        "git.pushForce",
+        "git.pushTo",
+        "git.pushToForce",
+        "git.pushTags",
+        "git.pushWithTags",
+        "git.pushWithTagsForce",
+        "git.pushRef",
+        "git.cherryPick",
+        "git.graph.cherryPick",
+        "git.cherryPickAbort",
+        "git.addRemote",
+        "git.removeRemote",
+        "git.sync",
+        "git.syncRebase",
+        "git.publish",
+        "git.showOutput",
+        "git.ignore",
+        "git.revealInExplorer",
+        "git.revealFileInOS.linux",
+        "git.revealFileInOS.mac",
+        "git.revealFileInOS.windows",
+        "git.stashIncludeUntracked",
+        "git.stash",
+        "git.stashStaged",
+        "git.stashPop",
+        "git.stashPopLatest",
+        "git.stashPopEditor",
+        "git.stashApply",
+        "git.stashApplyLatest",
+        "git.stashApplyEditor",
+        "git.stashDrop",
+        "git.stashDropAll",
+        "git.stashDropEditor",
+        "git.stashView",
+        "git.timeline.openDiff",
+        "git.timeline.copyCommitId",
+        "git.timeline.copyCommitMessage",
+        "git.timeline.selectForCompare",
+        "git.timeline.compareWithSelected",
+        "git.timeline.viewCommit",
+        "git.rebaseAbort",
+        "git.closeAllDiffEditors",
+        "git.closeAllUnmodifiedEditors",
+        "git.api.getRepositories",
+        "git.api.getRepositoryState",
+        "git.api.getRemoteSources",
+        "git.acceptMerge",
+        "git.openMergeEditor",
+        "git.resolveAllConflictsInChat",
+        "git.runGitMerge",
+        "git.runGitMergeDiff3",
+        "git.manageUnsafeRepositories",
+        "git.openRepositoriesInParentFolders",
+        "git.viewChanges",
+        "git.viewStagedChanges",
+        "git.viewUntrackedChanges",
+        "git.viewCommit",
+        "git.copyCommitId",
+        "git.copyCommitMessage",
+        "git.blame.toggleEditorDecoration",
+        "git.blame.toggleStatusBarItem"
+      ],
+      "languages": [],
+      "keybindings": [
+        {
+          "command": "git.stageSelectedRanges",
+          "key": "ctrl+k ctrl+alt+s",
+          "when": "editorTextFocus && resourceScheme == file"
+        },
+        {
+          "command": "git.unstageSelectedRanges",
+          "key": "ctrl+k ctrl+n",
+          "when": "editorTextFocus && isInDiffEditor && isInDiffRightEditor && resourceScheme == git"
+        },
+        {
+          "command": "git.revertSelectedRanges",
+          "key": "ctrl+k ctrl+r",
+          "when": "editorTextFocus && resourceScheme == file"
+        }
+      ]
+    },
+    {
+      "folder": "git-base",
+      "name": "git-base",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension.js",
+      "browser": "./dist/browser/extension.js",
+      "activation": [
+        "*"
+      ],
+      "categories": [
+        "commands",
+        "menus",
+        "languages",
+        "grammars"
+      ],
+      "commands": [
+        "git-base.api.getRemoteSources"
+      ],
+      "languages": [
+        "git-commit",
+        "git-rebase",
+        "ignore"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "github",
+      "name": "github",
+      "version": "0.0.1",
+      "description": "%description%",
+      "entry": "./dist/extension.js",
+      "activation": [
+        "*"
+      ],
+      "categories": [
+        "commands",
+        "menus",
+        "configuration",
+        "viewsWelcome",
+        "markdown.previewStyles"
+      ],
+      "commands": [
+        "github.publish",
+        "github.graph.openOnGitHub",
+        "github.timeline.openOnGitHub"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "github-authentication",
+      "name": "github-authentication",
+      "version": "0.0.2",
+      "description": "%description%",
+      "entry": "./dist/extension.js",
+      "browser": "./dist/browser/extension.js",
+      "kind": [
+        "ui",
+        "workspace"
+      ],
+      "activation": [],
+      "categories": [
+        "authentication",
+        "configuration"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "go",
+      "name": "go",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "go"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "groovy",
+      "name": "groovy",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "groovy"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "grunt",
+      "name": "grunt",
+      "version": "1.0.0",
+      "description": "Extension to add Grunt capabilities to VS Code.",
+      "entry": "./dist/main",
+      "activation": [
+        "onTaskType:grunt"
+      ],
+      "categories": [
+        "configuration",
+        "taskDefinitions"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "gulp",
+      "name": "gulp",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/main",
+      "activation": [
+        "onTaskType:gulp"
+      ],
+      "categories": [
+        "configuration",
+        "taskDefinitions"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "handlebars",
+      "name": "handlebars",
+      "version": "10.0.0",
+      "description": "%description%",
+      "kind": [
+        "ui",
+        "workspace"
+      ],
+      "categories": [
+        "languages",
+        "grammars",
+        "htmlLanguageParticipants"
+      ],
+      "commands": [],
+      "languages": [
+        "handlebars"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "hlsl",
+      "name": "hlsl",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "hlsl"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "html",
+      "name": "html",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "html"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "html-language-features",
+      "name": "html-language-features",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./client/dist/node/htmlClientMain",
+      "browser": "./client/dist/browser/htmlClientMain",
+      "activation": [
+        "onLanguage:html",
+        "onLanguage:handlebars"
+      ],
+      "categories": [
+        "configuration",
+        "configurationDefaults",
+        "jsonValidation"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "ini",
+      "name": "ini",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "ini",
+        "properties"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "ipynb",
+      "name": "ipynb",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/ipynbMain.node.js",
+      "browser": "./dist/browser/ipynbMain.browser.js",
+      "kind": [
+        "workspace",
+        "ui"
+      ],
+      "activation": [
+        "onNotebook:jupyter-notebook",
+        "onNotebookSerializer:interactive",
+        "onNotebookSerializer:repl"
+      ],
+      "categories": [
+        "configuration",
+        "commands",
+        "notebooks",
+        "notebookRenderer",
+        "menus"
+      ],
+      "commands": [
+        "ipynb.newUntitledIpynb",
+        "ipynb.openIpynbInNotebookEditor",
+        "ipynb.cleanInvalidImageAttachment",
+        "notebook.cellOutput.copy",
+        "notebook.cellOutput.addToChat",
+        "notebook.cellOutput.openInTextEditor"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "jake",
+      "name": "jake",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/main",
+      "activation": [
+        "onTaskType:jake"
+      ],
+      "categories": [
+        "configuration",
+        "taskDefinitions"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "java",
+      "name": "java",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "configurationDefaults",
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "java"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "javascript",
+      "name": "javascript",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "configurationDefaults",
+        "languages",
+        "grammars",
+        "semanticTokenScopes",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "javascriptreact",
+        "javascript",
+        "jsx-tags"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "json",
+      "name": "json",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "json",
+        "jsonc",
+        "jsonl",
+        "snippets"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "json-language-features",
+      "name": "json-language-features",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./client/dist/node/jsonClientMain",
+      "browser": "./client/dist/browser/jsonClientMain",
+      "activation": [
+        "onLanguage:json",
+        "onLanguage:jsonc",
+        "onLanguage:snippets",
+        "onCommand:json.validate"
+      ],
+      "categories": [
+        "configuration",
+        "configurationDefaults",
+        "jsonValidation",
+        "commands"
+      ],
+      "commands": [
+        "json.clearCache",
+        "json.sort"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "julia",
+      "name": "julia",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "julia",
+        "juliamarkdown"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "latex",
+      "name": "latex",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "tex",
+        "latex",
+        "bibtex",
+        "cpp_embedded_latex",
+        "markdown_latex_combined"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "less",
+      "name": "less",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "problemMatchers"
+      ],
+      "commands": [],
+      "languages": [
+        "less"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "log",
+      "name": "log",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "log"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "lua",
+      "name": "lua",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "lua"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "make",
+      "name": "make",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "makefile"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "markdown-basics",
+      "name": "markdown",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "markdown"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "markdown-language-features",
+      "name": "markdown-language-features",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "browser": "./dist/browser/extension",
+      "activation": [
+        "onLanguage:markdown",
+        "onCommand:markdown.api.render",
+        "onCommand:markdown.api.reloadPlugins",
+        "onWebviewPanel:markdown.preview"
+      ],
+      "categories": [
+        "notebookRenderer",
+        "commands",
+        "menus",
+        "keybindings",
+        "configuration",
+        "configurationDefaults",
+        "jsonValidation",
+        "markdown.previewStyles",
+        "markdown.previewScripts",
+        "customEditors"
+      ],
+      "commands": [
+        "_markdown.copyImage",
+        "_markdown.openImage",
+        "markdown.showPreview",
+        "markdown.showPreviewToSide",
+        "markdown.showLockedPreviewToSide",
+        "markdown.showSource",
+        "markdown.showPreviewSecuritySelector",
+        "markdown.preview.refresh",
+        "markdown.preview.toggleLock",
+        "markdown.findAllFileReferences",
+        "markdown.editor.insertLinkFromWorkspace",
+        "markdown.editor.insertImageFromWorkspace"
+      ],
+      "languages": [],
+      "keybindings": [
+        {
+          "command": "markdown.showPreview",
+          "key": "shift+ctrl+v",
+          "when": "editorLangId == markdown && !notebookEditorFocused"
+        },
+        {
+          "command": "markdown.showPreviewToSide",
+          "key": "ctrl+k v",
+          "when": "editorLangId == markdown && !notebookEditorFocused"
+        }
+      ]
+    },
+    {
+      "folder": "markdown-math",
+      "name": "markdown-math",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "browser": "./dist/browser/extension",
+      "activation": [],
+      "categories": [
+        "languages",
+        "grammars",
+        "notebookRenderer",
+        "markdown.markdownItPlugins",
+        "markdown.previewStyles",
+        "configuration"
+      ],
+      "commands": [],
+      "languages": [
+        "markdown-math"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "media-preview",
+      "name": "media-preview",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "browser": "./dist/browser/extension.js",
+      "kind": [
+        "ui",
+        "workspace"
+      ],
+      "activation": [],
+      "categories": [
+        "configuration",
+        "customEditors",
+        "commands",
+        "menus"
+      ],
+      "commands": [
+        "imagePreview.zoomIn",
+        "imagePreview.zoomOut",
+        "imagePreview.copyImage",
+        "imagePreview.saveImageAs"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "merge-conflict",
+      "name": "merge-conflict",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/mergeConflictMain",
+      "browser": "./dist/browser/mergeConflictMain",
+      "activation": [
+        "onStartupFinished"
+      ],
+      "categories": [
+        "commands",
+        "menus",
+        "configuration"
+      ],
+      "commands": [
+        "merge-conflict.accept.all-current",
+        "merge-conflict.accept.all-incoming",
+        "merge-conflict.accept.all-both",
+        "merge-conflict.accept.current",
+        "merge-conflict.accept.incoming",
+        "merge-conflict.accept.selection",
+        "merge-conflict.accept.both",
+        "merge-conflict.next",
+        "merge-conflict.previous",
+        "merge-conflict.compare",
+        "merge-conflict.resolve-in-chat"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "microsoft-authentication",
+      "name": "microsoft-authentication",
+      "version": "0.0.1",
+      "description": "%description%",
+      "entry": "./dist/extension.js",
+      "browser": "./dist/browser/extension.js",
+      "kind": [
+        "ui",
+        "workspace"
+      ],
+      "activation": [],
+      "categories": [
+        "authentication",
+        "configuration"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "ms-vscode.js-debug",
+      "name": "js-debug",
+      "version": "1.93.0",
+      "description": "An extension for debugging Node.js programs and Chrome.",
+      "entry": "./src/extension.js",
+      "kind": [
+        "workspace"
+      ],
+      "activation": [
+        "onDebugDynamicConfigurations",
+        "onDebugInitialConfigurations",
+        "onFileSystem:jsDebugNetworkFs",
+        "onDebugResolve:pwa-node",
+        "onDebugResolve:node-terminal",
+        "onDebugResolve:pwa-extensionHost",
+        "onDebugResolve:pwa-chrome",
+        "onDebugResolve:pwa-msedge",
+        "onDebugResolve:node",
+        "onDebugResolve:chrome",
+        "onDebugResolve:extensionHost",
+        "onDebugResolve:msedge",
+        "onCommand:extension.js-debug.clearAutoAttachVariables",
+        "onCommand:extension.js-debug.setAutoAttachVariables",
+        "onCommand:extension.js-debug.autoAttachToProcess",
+        "onCommand:extension.js-debug.pickNodeProcess",
+        "onCommand:extension.js-debug.requestCDPProxy"
+      ],
+      "categories": [
+        "menus",
+        "breakpoints",
+        "debuggers",
+        "commands",
+        "keybindings",
+        "configuration",
+        "grammars",
+        "languages",
+        "terminal",
+        "views",
+        "viewsWelcome"
+      ],
+      "commands": [
+        "extension.js-debug.prettyPrint",
+        "extension.js-debug.toggleSkippingFile",
+        "extension.js-debug.addCustomBreakpoints",
+        "extension.js-debug.removeAllCustomBreakpoints",
+        "extension.js-debug.addXHRBreakpoints",
+        "extension.js-debug.removeXHRBreakpoint",
+        "extension.js-debug.editXHRBreakpoints",
+        "extension.pwa-node-debug.attachNodeProcess",
+        "extension.js-debug.npmScript",
+        "extension.js-debug.createDebuggerTerminal",
+        "extension.js-debug.startProfile",
+        "extension.js-debug.stopProfile",
+        "extension.js-debug.revealPage",
+        "extension.js-debug.debugLink",
+        "extension.js-debug.createDiagnostics",
+        "extension.js-debug.getDiagnosticLogs",
+        "extension.node-debug.startWithStopOnEntry",
+        "extension.js-debug.openEdgeDevTools",
+        "extension.js-debug.callers.add",
+        "extension.js-debug.callers.remove",
+        "extension.js-debug.callers.removeAll",
+        "extension.js-debug.callers.goToCaller",
+        "extension.js-debug.callers.gotToTarget",
+        "extension.js-debug.enableSourceMapStepping",
+        "extension.js-debug.disableSourceMapStepping",
+        "extension.js-debug.network.viewRequest",
+        "extension.js-debug.network.clear",
+        "extension.js-debug.network.openBody",
+        "extension.js-debug.network.openBodyInHex",
+        "extension.js-debug.network.replayXHR",
+        "extension.js-debug.network.copyUri"
+      ],
+      "languages": [
+        "wat"
+      ],
+      "keybindings": [
+        {
+          "command": "extension.node-debug.startWithStopOnEntry",
+          "key": "F10",
+          "when": "debugConfigurationType == pwa-node && !inDebugMode || debugConfigurationType == pwa-extensionHost && !inDebugMode || debugConfigurationType == node && !inDebugMode"
+        },
+        {
+          "command": "extension.node-debug.startWithStopOnEntry",
+          "key": "F11",
+          "when": "debugConfigurationType == pwa-node && !inDebugMode && activeViewlet == workbench.view.debug || debugConfigurationType == pwa-extensionHost && !inDebugMode && activeViewlet == workbench.view.debug || debugConfigurationType == node && !inDebugMode && activeViewlet == workbench.view.debug"
+        }
+      ]
+    },
+    {
+      "folder": "ms-vscode.js-debug-companion",
+      "name": "js-debug-companion",
+      "version": "1.1.3",
+      "description": "Companion extension to js-debug that provides capability for remote debugging",
+      "entry": "./out/extension.js",
+      "kind": [
+        "ui"
+      ],
+      "activation": [
+        "onCommand:js-debug-companion.launchAndAttach",
+        "onCommand:js-debug-companion.kill",
+        "onCommand:js-debug-companion.launch",
+        "onCommand:js-debug-companion.defaultBrowser"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "ms-vscode.vscode-js-profile-table",
+      "name": "vscode-js-profile-table",
+      "version": "1.0.11",
+      "description": "Text visualizer for profiles taken from the JavaScript debugger",
+      "entry": "out/extension.js",
+      "browser": "out/extension.web.js",
+      "categories": [
+        "customEditors",
+        "commands",
+        "menus"
+      ],
+      "commands": [
+        "extension.jsProfileVisualizer.table.clearCodeLenses"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "notebook-renderers",
+      "name": "builtin-notebook-renderers",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "notebookRenderer"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "npm",
+      "name": "npm",
+      "version": "1.0.1",
+      "description": "%description%",
+      "entry": "./dist/npmMain",
+      "browser": "./dist/browser/npmBrowserMain",
+      "activation": [
+        "onTaskType:npm",
+        "onLanguage:json",
+        "workspaceContains:package.json"
+      ],
+      "categories": [
+        "languages",
+        "views",
+        "commands",
+        "menus",
+        "configuration",
+        "jsonValidation",
+        "taskDefinitions",
+        "terminalQuickFixes"
+      ],
+      "commands": [
+        "npm.runScript",
+        "npm.debugScript",
+        "npm.openScript",
+        "npm.runInstall",
+        "npm.refresh",
+        "npm.runSelectedScript",
+        "npm.runScriptFromFolder",
+        "npm.packageManager"
+      ],
+      "languages": [
+        "ignore",
+        "properties"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "objective-c",
+      "name": "objective-c",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "objective-c",
+        "objective-cpp"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "ocaml",
+      "name": "ocaml",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "ocaml"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "perl",
+      "name": "perl",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "perl",
+        "raku"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "php",
+      "name": "php",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "php"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "php-language-features",
+      "name": "php-language-features",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/phpMain",
+      "activation": [
+        "onLanguage:php"
+      ],
+      "categories": [
+        "configuration",
+        "jsonValidation"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "powershell",
+      "name": "powershell",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "powershell"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "protobuf",
+      "name": "cursor-protobuf",
+      "version": "0.0.1",
+      "description": "%description%",
+      "kind": [
+        "ui"
+      ],
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "protobuf"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "pug",
+      "name": "pug",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "jade"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "python",
+      "name": "python",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "python"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "r",
+      "name": "r",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "r"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "razor",
+      "name": "razor",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "razor"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "references-view",
+      "name": "references-view",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "browser": "./dist/extension.js",
+      "activation": [
+        "onCommand:references-view.find",
+        "onCommand:editor.action.showReferences"
+      ],
+      "categories": [
+        "configuration",
+        "viewsContainers",
+        "views",
+        "commands",
+        "menus",
+        "keybindings"
+      ],
+      "commands": [
+        "references-view.findReferences",
+        "references-view.findImplementations",
+        "references-view.clearHistory",
+        "references-view.clear",
+        "references-view.refresh",
+        "references-view.pickFromHistory",
+        "references-view.removeReferenceItem",
+        "references-view.copy",
+        "references-view.copyAll",
+        "references-view.copyPath",
+        "references-view.refind",
+        "references-view.showCallHierarchy",
+        "references-view.showOutgoingCalls",
+        "references-view.showIncomingCalls",
+        "references-view.removeCallItem",
+        "references-view.next",
+        "references-view.prev",
+        "references-view.showTypeHierarchy",
+        "references-view.showSupertypes",
+        "references-view.showSubtypes",
+        "references-view.removeTypeItem"
+      ],
+      "languages": [],
+      "keybindings": [
+        {
+          "command": "references-view.findReferences",
+          "key": "shift+alt+f12",
+          "when": "editorHasReferenceProvider"
+        },
+        {
+          "command": "references-view.next",
+          "key": "f4",
+          "when": "reference-list.hasResult"
+        },
+        {
+          "command": "references-view.prev",
+          "key": "shift+f4",
+          "when": "reference-list.hasResult"
+        },
+        {
+          "command": "references-view.showCallHierarchy",
+          "key": "shift+alt+h",
+          "when": "editorHasCallHierarchyProvider"
+        }
+      ]
+    },
+    {
+      "folder": "restructuredtext",
+      "name": "restructuredtext",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "restructuredtext"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "ruby",
+      "name": "ruby",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "ruby",
+        "erb"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "rust",
+      "name": "rust",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "rust"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "scss",
+      "name": "scss",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "problemMatchers"
+      ],
+      "commands": [],
+      "languages": [
+        "scss"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "search-result",
+      "name": "search-result",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension.js",
+      "browser": "./dist/extension.js",
+      "activation": [
+        "onLanguage:search-result"
+      ],
+      "categories": [
+        "configurationDefaults",
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "search-result"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "shaderlab",
+      "name": "shaderlab",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "shaderlab"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "shellscript",
+      "name": "shellscript",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "shellscript"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "simple-browser",
+      "name": "simple-browser",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "browser": "./dist/browser/extension",
+      "kind": [
+        "ui",
+        "workspace"
+      ],
+      "activation": [
+        "onCommand:simpleBrowser.api.open",
+        "onCommand:simpleBrowser.show",
+        "onOpenExternalUri:http",
+        "onOpenExternalUri:https"
+      ],
+      "categories": [
+        "commands"
+      ],
+      "commands": [
+        "simpleBrowser.show"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "sql",
+      "name": "sql",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "sql"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "swift",
+      "name": "swift",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "swift"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "terminal-suggest",
+      "name": "terminal-suggest",
+      "version": "1.0.1",
+      "description": "%description%",
+      "entry": "./dist/terminalSuggestMain",
+      "activation": [
+        "onTerminalCompletionsRequested"
+      ],
+      "categories": [],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-abyss",
+      "name": "theme-abyss",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-cursor",
+      "name": "cursor-themes",
+      "version": "0.0.2",
+      "description": "Default Cursor themes",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-defaults",
+      "name": "theme-defaults",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes",
+        "iconThemes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-kimbie-dark",
+      "name": "theme-kimbie-dark",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-monokai",
+      "name": "theme-monokai",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-monokai-dimmed",
+      "name": "theme-monokai-dimmed",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-quietlight",
+      "name": "theme-quietlight",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-red",
+      "name": "theme-red",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-seti",
+      "name": "vscode-theme-seti",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "iconThemes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-solarized-dark",
+      "name": "theme-solarized-dark",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-solarized-light",
+      "name": "theme-solarized-light",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "theme-tomorrow-night-blue",
+      "name": "theme-tomorrow-night-blue",
+      "version": "1.0.0",
+      "description": "%description%",
+      "categories": [
+        "themes"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "tunnel-forwarding",
+      "name": "tunnel-forwarding",
+      "version": "1.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "activation": [
+        "onTunnel"
+      ],
+      "categories": [
+        "commands"
+      ],
+      "commands": [
+        "tunnel-forwarding.showLog",
+        "tunnel-forwarding.restart"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "typescript-basics",
+      "name": "typescript",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "semanticTokenScopes",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "typescript",
+        "typescriptreact",
+        "jsonc",
+        "json"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "typescript-language-features",
+      "name": "typescript-language-features",
+      "version": "10.0.0",
+      "description": "%description%",
+      "entry": "./dist/extension",
+      "browser": "./dist/browser/extension",
+      "activation": [
+        "onLanguage:javascript",
+        "onLanguage:javascriptreact",
+        "onLanguage:typescript",
+        "onLanguage:typescriptreact",
+        "onLanguage:jsx-tags",
+        "onCommand:typescript.tsserverRequest",
+        "onCommand:_typescript.configurePlugin",
+        "onCommand:_typescript.learnMoreAboutRefactorings",
+        "onCommand:typescript.fileReferences",
+        "onTaskType:typescript",
+        "onLanguage:jsonc",
+        "onWalkthrough:nodejsWelcome"
+      ],
+      "categories": [
+        "jsonValidation",
+        "configuration",
+        "commands",
+        "menus",
+        "breakpoints",
+        "taskDefinitions",
+        "problemPatterns",
+        "problemMatchers"
+      ],
+      "commands": [
+        "typescript.reloadProjects",
+        "javascript.reloadProjects",
+        "typescript.selectTypeScriptVersion",
+        "typescript.goToProjectConfig",
+        "javascript.goToProjectConfig",
+        "typescript.openTsServerLog",
+        "typescript.restartTsServer",
+        "typescript.reselectNodeVersion",
+        "typescript.findAllFileReferences",
+        "typescript.goToSourceDefinition",
+        "typescript.sortImports",
+        "javascript.sortImports",
+        "typescript.removeUnusedImports",
+        "javascript.removeUnusedImports",
+        "typescript.experimental.enableTsgo",
+        "typescript.experimental.disableTsgo"
+      ],
+      "languages": [],
+      "keybindings": []
+    },
+    {
+      "folder": "vb",
+      "name": "vb",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "snippets"
+      ],
+      "commands": [],
+      "languages": [
+        "vb"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "vscode-jupyter-keymap",
+      "name": "jupyter-keymap",
+      "version": "1.0.0",
+      "description": "Jupyter keymaps for notebooks",
+      "categories": [
+        "keybindings"
+      ],
+      "commands": [],
+      "languages": [],
+      "keybindings": [
+        {
+          "command": "notebook.find",
+          "key": "F",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "list.focusUp",
+          "key": "K",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "list.focusDown",
+          "key": "J",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.insertCodeCellAboveAndFocusContainer",
+          "key": "A",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.insertCodeCellBelowAndFocusContainer",
+          "key": "B",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.delete",
+          "key": "D D",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "undo",
+          "key": "Z",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "workbench.action.files.save",
+          "key": "S",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.copy",
+          "key": "C",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.cut",
+          "key": "X",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.paste",
+          "key": "V",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.toggleLineNumbers",
+          "key": "shift+L",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.toggleOutputs",
+          "key": "O",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.toggleLineNumbers",
+          "key": "L",
+          "when": "notebookEditorFocused && !inputFocus && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.split",
+          "key": "ctrl+shift+-",
+          "when": "editorTextFocus && inputFocus && notebookEditorFocused && !notebookOutputFocused"
+        },
+        {
+          "command": "notebook.cell.executeAndFocusContainer",
+          "key": "ctrl+enter",
+          "when": "editorTextFocus && inputFocus && notebookEditorFocused || notebookCellListFocused"
+        },
+        {
+          "command": "notebook.cell.executeAndSelectBelow",
+          "key": "shift+enter",
+          "when": "editorTextFocus && inputFocus && notebookEditorFocused || notebookCellListFocused && notebookCellType == 'code'"
+        }
+      ]
+    },
+    {
+      "folder": "xml",
+      "name": "xml",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars"
+      ],
+      "commands": [],
+      "languages": [
+        "xml",
+        "xsl"
+      ],
+      "keybindings": []
+    },
+    {
+      "folder": "yaml",
+      "name": "yaml",
+      "version": "10.0.0",
+      "description": "%description%",
+      "categories": [
+        "languages",
+        "grammars",
+        "configurationDefaults"
+      ],
+      "commands": [],
+      "languages": [
+        "dockercompose",
+        "yaml"
+      ],
+      "keybindings": []
+    }
+  ]
+}

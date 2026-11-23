@@ -57,6 +57,15 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   /** Workspace roots whose owner allowed sending buffer context to the model. */
   completionOptIn: [],
   /**
+   * The owner allowed Inline Edit: sending one selection plus an instruction to
+   * the model. Deliberately separate from `completionOptIn` — allowing inline
+   * hints does not allow sending a selection with a request.
+   */
+  inlineEditConsent: false,
+  /** Command id -> chord text. Only ids the client knows are used; the Host
+   *  stores the strings and never interprets them. */
+  keybindings: Object.freeze({}),
+  /**
    * The instruction sent before the buffer. Empty means "use the shipped one",
    * which the settings drawer shows as the placeholder of the field.
    */
@@ -193,10 +202,18 @@ const BOOLEAN_KEYS = [
   'wholeFileContext',
   'autoModel',
   'noReasoningHint',
+  'inlineEditConsent',
 ]
 
 /** How many workspaces may stay opted in at once. */
 const MAX_OPT_IN = 20
+
+/** How many remapped chords are kept. */
+const MAX_KEYBINDINGS = 40
+
+/** Command ids and chord text the client may store. */
+const KEYBINDING_ID = /^[a-z0-9-]{1,40}$/
+const KEYBINDING_CHORD = /^[A-Za-z0-9+ ,`-]{1,40}$/
 
 /** Longest custom instruction accepted from the settings field. */
 const MAX_SYSTEM_PROMPT = 8000
@@ -253,6 +270,22 @@ function sanitize(patch) {
       if (roots.length >= MAX_OPT_IN) break
     }
     result.completionOptIn = roots
+  }
+  if (patch.keybindings !== undefined) {
+    if (typeof patch.keybindings !== 'object' || patch.keybindings === null || Array.isArray(patch.keybindings)) {
+      throw Object.assign(new Error('Раскладка клавиш должна быть объектом.'), { code: 'bad-request' })
+    }
+    const chords = {}
+    let count = 0
+    for (const [id, value] of Object.entries(patch.keybindings)) {
+      if (count >= MAX_KEYBINDINGS) break
+      if (!KEYBINDING_ID.test(id)) continue
+      const text = String(value ?? '').trim()
+      if (!KEYBINDING_CHORD.test(text)) continue
+      chords[id] = text
+      count += 1
+    }
+    result.keybindings = chords
   }
   return result
 }

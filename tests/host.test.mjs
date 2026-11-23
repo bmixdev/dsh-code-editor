@@ -19,6 +19,12 @@ const ROUTES = [
   'save',
   'settings',
   'complete',
+  'inlineEdit',
+  'searchText',
+  'agentChanges',
+  'agentChangeDiff',
+  'agentChangeRestore',
+  'agentChangeText',
   'resolve',
   'tree',
   'files',
@@ -46,14 +52,24 @@ async function makeWorkspace() {
   return root
 }
 
-function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1', models = [{ id: 'fixture-model', name: 'Fixture model' }] }) {
+function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1', models = [{ id: 'fixture-model', name: 'Fixture model' }], workspaceChanges }) {
   // The catalog is cached per provider for five minutes, so one test's catalog
   // would leak into the next one and hide a model it added.
   resetModelCatalog()
   const routes = new Map()
   const streamCalls = []
+  const listeners = new Map()
   const session = { id: SESSION_ID }
   const ctx = {
+    get(name) {
+      return name === 'workspaceChanges' ? workspaceChanges : undefined
+    },
+    on(name, handler) {
+      const list = listeners.get(name) ?? []
+      list.push(handler)
+      listeners.set(name, list)
+      return () => listeners.set(name, (listeners.get(name) ?? []).filter((entry) => entry !== handler))
+    },
     effect(effect) {
       const cleanup = effect()
       return () => cleanup?.()
@@ -132,7 +148,12 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
     return { status: response.status, body: await response.json() }
   }
 
-  return { call, routes, streamCalls, llm: ctx.llm }
+  /** Deliver one Host event to every listener the plugin registered. */
+  function emit(name, ...args) {
+    for (const handler of listeners.get(name) ?? []) handler(...args)
+  }
+
+  return { call, routes, streamCalls, llm: ctx.llm, emit }
 }
 
 async function withFile(variable, name, run) {
@@ -335,6 +356,33 @@ test('preferences are shared with the code-editor plugin', async () => {
       assert.equal(saved.body.preferences.completionProvider, 'fixture')
       assert.equal(saved.body.preferences.completionModel, 'pinned')
       assert.equal(saved.body.preferences.contextLeft, 1234)
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a keybinding patch keeps only commands and chords the client can use', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root })
+      const saved = await app.call('prefs', {
+        patch: {
+          keybindings: {
+            save: 'Ctrl+Alt+S',
+            'inline-edit': 'Ctrl+Shift+K',
+            'Bad Id': 'Ctrl+Q',
+            ['x'.repeat(41)]: 'Ctrl+Q',
+            quote: '',
+            search: { chord: 'Ctrl+F' },
+          },
+        },
+      })
+      assert.deepEqual(saved.body.preferences.keybindings, {
+        save: 'Ctrl+Alt+S',
+        'inline-edit': 'Ctrl+Shift+K',
+      })
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -736,4 +784,309 @@ test('an unconfigured hint prefers a fast model over the session one', () => {  
   // A catalog with nothing better than the session model keeps it, so a provider
   // with a single model does not lose its only choice.
   assert.equal(rankModels(['fixture-model'], 'fixture')[0], 'fixture-model')
+})
+
+test('inline edit needs its own consent and sends only the selection', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const text = 'export const answer = 42\n'
+      const app = setup({ root, answer: '{"replacement":"43"}' })
+
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      assert.equal(opened.body.text, text)
+      const request = {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        modelVersion: 1,
+        start: text.indexOf('42'),
+        end: text.indexOf('42') + 2,
+        text,
+        instruction: 'поставь 43',
+      }
+
+      // Tab permission was never granted here, and it would not be enough.
+      const denied = await app.call('inlineEdit', request)
+      assert.equal(errorCode(denied.body), 'not-opted-in')
+      assert.equal(app.streamCalls.length, 0)
+
+      const allowed = await app.call('prefs', { patch: { inlineEditConsent: true } })
+      assert.equal(allowed.body.preferences.inlineEditConsent, true)
+
+      const edited = await app.call('inlineEdit', request)
+      assert.equal(edited.status, 200)
+      assert.equal(edited.body.proposal.documentId, opened.body.id)
+      assert.equal(edited.body.proposal.changes.length, 1)
+      assert.equal(edited.body.proposal.changes[0].start, text.indexOf('42'))
+      assert.equal(edited.body.proposal.changes[0].oldText, '42')
+      assert.equal(edited.body.proposal.changes[0].newText, '43')
+      assert.equal(edited.body.proposal.result, 'export const answer = 43\n')
+
+      // The prompt carries the frame around the selection and nothing more.
+      assert.equal(app.streamCalls.length, 1)
+      const sent = app.streamCalls[0].messages[0].content[0].text
+      assert.ok(sent.includes('поставь 43'))
+      assert.ok(sent.includes('--- фрагмент ---\n42\n--- после фрагмента ---'))
+      assert.equal(app.streamCalls[0].purpose, 'code-editor-inline-edit')
+
+      const prose = setup({ root, answer: 'sure!' })
+      const reopened = await prose.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      const bad = await prose.call('inlineEdit', { ...request, id: reopened.body.id, token: reopened.body.token })
+      assert.equal(errorCode(bad.body), 'bad-answer')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an empty replacement deletes the selection and an empty one is refused', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const text = 'export const answer = 42\n'
+      const app = setup({ root, answer: '{"replacement":""}' })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('prefs', { patch: { inlineEditConsent: true } })
+
+      const removed = await app.call('inlineEdit', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        modelVersion: 1,
+        start: 0,
+        end: text.length,
+        text,
+        instruction: 'убери всё',
+      })
+      assert.equal(removed.status, 200)
+      assert.equal(removed.body.proposal.changes[0].newText, '')
+      assert.equal(removed.body.proposal.result, '')
+
+      // An empty selection is the "highlight some code" hint, not a deletion.
+      const empty = await app.call('inlineEdit', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        modelVersion: 1,
+        start: 3,
+        end: 3,
+        text,
+        instruction: 'убери',
+      })
+      assert.equal(errorCode(empty.body), 'bad-request')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('text search answers locally and never calls a model', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+    const result = await app.call('searchText', { sessionId: SESSION_ID, query: 'answer' })
+    assert.equal(result.status, 200)
+    assert.equal(errorCode(result.body), undefined)
+    assert.deepEqual(
+      result.body.matches.map((match) => ({ path: match.path, line: match.line, column: match.column })),
+      [{ path: 'src/index.js', line: 1, column: 14 }],
+    )
+    assert.equal(result.body.truncated, false)
+    // Search is local: nothing about it reaches the provider.
+    assert.equal(app.streamCalls.length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an empty search query is answered without walking the workspace', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+    const empty = await app.call('searchText', { sessionId: SESSION_ID, query: '   ' })
+    assert.equal(empty.status, 200)
+    assert.deepEqual(empty.body, { query: '', matches: [], truncated: false, scanned: 0, bytes: 0 })
+
+    const long = await app.call('searchText', { sessionId: SESSION_ID, query: 'x'.repeat(201) })
+    assert.equal(errorCode(long.body), 'bad-request')
+
+    const unknown = await app.call('searchText', { sessionId: 'missing', query: 'answer' })
+    assert.equal(errorCode(unknown.body), 'no-session')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('assistant changes say the Host keeps no record instead of claiming none happened', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+    const listed = await app.call('agentChanges', { sessionId: SESSION_ID })
+    assert.equal(listed.status, 200)
+    assert.deepEqual(listed.body, { available: false, turns: [] })
+
+    const missing = await app.call('agentChanges', { sessionId: 'missing' })
+    assert.equal(errorCode(missing.body), 'no-session')
+    const diff = await app.call('agentChangeDiff', { sessionId: 'missing', seq: 1, index: 0 })
+    assert.equal(errorCode(diff.body), 'no-session')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an announced workspace turn is listed and its file diff comes from the recorder', async () => {
+  const root = await makeWorkspace()
+  try {
+    const summaries = {
+      12: {
+        turn: 3,
+        cwd: root,
+        files: [{ path: 'src/index.js', display: 'src/index.js', added: 1, deleted: 1 }],
+        total: 1,
+        added: 1,
+        deleted: 1,
+      },
+    }
+    const diffs = []
+    const workspaceChanges = {
+      summary: (sessionId, seq) => (sessionId === SESSION_ID ? summaries[seq] : undefined),
+      async diff(sessionId, seq, index) {
+        diffs.push([sessionId, seq, index])
+        return {
+          kind: 'text',
+          path: 'src/index.js',
+          display: 'src/index.js',
+          before: true,
+          after: true,
+          hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-export const answer = 42', '+export const answer = 43'] }],
+          coarse: false,
+        }
+      },
+    }
+    const app = setup({ root, workspaceChanges })
+    // A different SessionEvent must not be indexed as a changes turn.
+    app.emit('session/event', { id: SESSION_ID }, { type: 'turn/start', seq: 11, time: 1, data: { turn: 3 } })
+    const before = await app.call('agentChanges', { sessionId: SESSION_ID })
+    assert.deepEqual(before.body.turns, [])
+
+    app.emit('session/event', { id: SESSION_ID }, { type: 'workspace/changes', seq: 12, time: 2, data: {} })
+
+    const listed = await app.call('agentChanges', { sessionId: SESSION_ID })
+    assert.equal(listed.body.available, true)
+    assert.equal(listed.body.turns.length, 1)
+    assert.equal(listed.body.turns[0].seq, 12)
+    assert.equal(listed.body.turns[0].turn, 3)
+    assert.equal(listed.body.turns[0].hasSnapshot, false)
+    assert.deepEqual(listed.body.turns[0].files, [
+      { index: 0, path: 'src/index.js', display: 'src/index.js', added: 1, deleted: 1, binary: false, oversized: false },
+    ])
+
+    const diff = await app.call('agentChangeDiff', { sessionId: SESSION_ID, seq: 12, index: 0 })
+    assert.equal(diff.status, 200)
+    assert.equal(diff.body.diff.hunks[0].lines[1], '+export const answer = 43')
+    assert.deepEqual(diffs, [[SESSION_ID, 12, 0]])
+
+    const wrongFile = await app.call('agentChangeDiff', { sessionId: SESSION_ID, seq: 12, index: 5 })
+    assert.equal(errorCode(wrongFile.body), 'bad-request')
+    const unknownTurn = await app.call('agentChangeDiff', { sessionId: SESSION_ID, seq: 99, index: 0 })
+    assert.equal(errorCode(unknownTurn.body), 'not-found')
+    assert.equal(diffs.length, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a turn file is restored on disk only while its hunks still match', async () => {
+  const root = await makeWorkspace()
+  try {
+    const target = path.join(root, 'src', 'index.js')
+    // The workspace holds the turn end, which is what the panel compares against.
+    await writeFile(target, 'export const answer = 43\n', 'utf8')
+    const workspaceChanges = {
+      summary: (sessionId, seq) =>
+        sessionId === SESSION_ID && seq === 5
+          ? { turn: 1, cwd: root, files: [{ path: 'src/index.js', display: 'src/index.js', added: 1, deleted: 1 }], total: 1, added: 1, deleted: 1 }
+          : undefined,
+      async diff() {
+        return {
+          kind: 'text',
+          path: 'src/index.js',
+          display: 'src/index.js',
+          before: true,
+          after: true,
+          hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-export const answer = 42', '+export const answer = 43'] }],
+          coarse: false,
+        }
+      },
+    }
+    const app = setup({ root, workspaceChanges })
+    app.emit('session/event', { id: SESSION_ID }, { type: 'workspace/changes', seq: 5, time: 1, data: {} })
+
+    const restored = await app.call('agentChangeRestore', { sessionId: SESSION_ID, seq: 5, index: 0 })
+    assert.equal(restored.status, 200)
+    assert.equal(restored.body.restored, true)
+    assert.equal(await readFile(target, 'utf8'), 'export const answer = 42\n')
+
+    // A file edited after the turn must not be rewritten from the snapshot.
+    await writeFile(target, 'export const answer = 44\n', 'utf8')
+    const conflict = await app.call('agentChangeRestore', { sessionId: SESSION_ID, seq: 5, index: 0 })
+    assert.equal(errorCode(conflict.body), 'conflict')
+    assert.equal(await readFile(target, 'utf8'), 'export const answer = 44\n')
+
+    const missing = await app.call('agentChangeRestore', { sessionId: 'missing', seq: 5, index: 0 })
+    assert.equal(errorCode(missing.body), 'no-session')
+    const unknown = await app.call('agentChangeRestore', { sessionId: SESSION_ID, seq: 77, index: 0 })
+    assert.equal(errorCode(unknown.body), 'not-found')
+    const wrongIndex = await app.call('agentChangeRestore', { sessionId: SESSION_ID, seq: 5, index: 4 })
+    assert.equal(errorCode(wrongIndex.body), 'bad-request')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a turn file is served as full before and after texts for a real diff view', async () => {
+  const root = await makeWorkspace()
+  try {
+    const target = path.join(root, 'src', 'index.js')
+    await writeFile(target, 'export const answer = 43\n', 'utf8')
+    const workspaceChanges = {
+      summary: (sessionId, seq) =>
+        sessionId === SESSION_ID && seq === 6
+          ? { turn: 2, cwd: root, files: [{ path: 'src/index.js', display: 'src/index.js', added: 1, deleted: 1 }], total: 1, added: 1, deleted: 1 }
+          : undefined,
+      async diff() {
+        return {
+          kind: 'text',
+          path: 'src/index.js',
+          display: 'src/index.js',
+          before: true,
+          after: true,
+          hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-export const answer = 42', '+export const answer = 43'] }],
+          coarse: false,
+        }
+      },
+    }
+    const app = setup({ root, workspaceChanges })
+    app.emit('session/event', { id: SESSION_ID }, { type: 'workspace/changes', seq: 6, time: 1, data: {} })
+
+    const text = await app.call('agentChangeText', { sessionId: SESSION_ID, seq: 6, index: 0 })
+    assert.equal(text.status, 200)
+    assert.deepEqual(text.body, {
+      path: 'src/index.js',
+      display: 'src/index.js',
+      before: 'export const answer = 42\n',
+      after: 'export const answer = 43\n',
+      coarse: false,
+      language: 'javascript',
+    })
+
+    // Once the user edits the file the snapshot no longer describes it, so the
+    // diff view must refuse instead of inventing a comparison.
+    await writeFile(target, 'export const answer = 44\n', 'utf8')
+    const conflict = await app.call('agentChangeText', { sessionId: SESSION_ID, seq: 6, index: 0 })
+    assert.equal(errorCode(conflict.body), 'conflict')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })

@@ -37,8 +37,11 @@ import {
 import { buildContext, postprocessCompletion } from './completion.js'
 import { DEFAULT_SYSTEM_PROMPT, fillPrompt, optedInRoots, readPreferences, writePreferences } from './prefs.js'
 import { buildFileContext, editInstructions, locateEdits, parseEditResponse } from './edits.js'
+import { createProposal, ProposalError, readReplacementAnswer } from './proposal.js'
 import { boundLines, evaluateSuggestion, planEdit, reasonLabel } from './tab.js'
 import { listFiles, listTree } from './tree.js'
+import { searchText as searchWorkspace } from './search.js'
+import { applyHunks, createChangeTracker, revertHunks } from './agentChanges.js'
 import { readSessionState, writeSessionState } from './state.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -58,6 +61,28 @@ const CONTEXT_RIGHT = 1000
 const MAX_CONTEXT_TEXT_CHARS = 4 * 1024 * 1024
 const COMPLETION_DEADLINE_MS = 20000
 const COMPLETION_MAX_CHARS = 400
+/**
+ * Inline Edit: the user describes a change for one selection. A selection is
+ * small by definition, but it is still bounded so a whole-file selection is a
+ * deliberate, visible refusal rather than a 2 MB prompt.
+ */
+const INLINE_EDIT_MAX_SELECTION = 20000
+const INLINE_EDIT_CONTEXT_LINES = 40
+const INLINE_EDIT_MAX_INSTRUCTION = 2000
+const INLINE_EDIT_MAX_ANSWER = 40000
+const INLINE_EDIT_DEADLINE_MS = 60000
+const INLINE_EDIT_SYSTEM_PROMPT =
+  'Ты — движок правки выделенного фрагмента кода. Верни только JSON-объект ' +
+  '{"replacement": "..."} — без markdown-ограждений и пояснений. В replacement положи ' +
+  'новый текст фрагмента целиком, с отступом как у исходного, и не повторяй соседние строки. ' +
+  'Пустая строка в replacement означает удаление фрагмента. Не меняй ничего за пределами фрагмента.'
+/**
+ * Text search: a local scan, bounded on every axis so one query cannot turn into
+ * an unbounded workspace read. `truncated` is part of the answer, because «not
+ * found» and «stopped early» are different facts.
+ */
+const SEARCH_MAX_QUERY = 200
+const SEARCH_DEFAULT_LIMIT = 50
 /**
  * Hints must appear while the user is still looking at the line, so an
  * unconfigured route prefers a small model. The hints below are name-based on
@@ -235,6 +260,13 @@ export function apply(ctx, config) {
   const excludedFiles = new Set()
   let sequence = 0
 
+  /**
+   * Turns announced by live Sessions, if this Host records workspace changes.
+   * The service is optional: without it the editor still works and the changes
+   * panel says so instead of pretending nothing changed.
+   */
+  const changeTracker = createChangeTracker({ recorder: optionalChangeRecorder(ctx) })
+
   const json = (value, status = 200) =>
     new Response(JSON.stringify(value), {
       status,
@@ -258,11 +290,35 @@ export function apply(ctx, config) {
     'dsh-ide: Monaco assets',
   )
 
+  if (typeof ctx.on === 'function') {
+    ctx.effect(
+      () =>
+        ctx.on('session/event', (session, event) => {
+          // `workspace/changes` is a SessionEvent, not a Cordis event: the feed
+          // is the generic post-commit append stream, filtered by type.
+          if (event === null || typeof event !== 'object') return
+          if (event.type !== 'workspace/changes') return
+          changeTracker.note(session?.id, event.seq)
+        }),
+      'dsh-ide: workspace changes feed',
+    )
+    ctx.effect(
+      () => ctx.on('session/disposed', (session) => changeTracker.forget(session?.id)),
+      'dsh-ide: workspace changes cleanup',
+    )
+  }
+
   const handlers = {
     open: (body, signal) => open(body, signal),
     save: (body, signal) => save(body, signal),
     settings: (body) => settings(body),
     complete: (body, signal) => complete(body, signal),
+    inlineEdit: (body, signal) => inlineEdit(body, signal),
+    searchText: (body, signal) => searchText(body, signal),
+    agentChanges: (body) => agentChangesRoute(body),
+    agentChangeDiff: (body, signal) => agentChangeDiffRoute(body, signal),
+    agentChangeRestore: (body, signal) => agentChangeRestoreRoute(body, signal),
+    agentChangeText: (body, signal) => agentChangeTextRoute(body, signal),
     resolve: (body) => resolveSession(body),
     tree: (body, signal) => treeRoute(body, signal),
     files: (body, signal) => filesRoute(body, signal),
@@ -333,6 +389,18 @@ export function apply(ctx, config) {
 
   async function rootTarget(cwd, signal) {
     return ctx.fs.resolve(cwd, { signal })
+  }
+
+  /**
+   * The recorder is a Host service this plugin does not require: a profile
+   * without it must still load, so every access goes through an undefined check.
+   */
+  function optionalChangeRecorder(scope) {
+    try {
+      return typeof scope.get === 'function' ? scope.get('workspaceChanges') : undefined
+    } catch {
+      return undefined
+    }
   }
 
   // ------------------------------------------------------------------- open
@@ -983,6 +1051,330 @@ export function apply(ctx, config) {
       },
       ...(preferences.fullTrace === true ? { conversation: { system: systemPrompt, message: requestText, answer: text } } : {}),
     }
+  }
+
+  // ------------------------------------------------------------ inline edit
+
+  async function inlineEdit(body, signal) {
+    const document = documents.get(body.id)
+    if (document === undefined) return fail('no-document', 'Документ не открыт.')
+    if (body.sessionId !== document.sessionId) return fail('wrong-session', 'Документ принадлежит другой сессии.')
+    if (body.token !== document.token) {
+      return fail('stale-client', 'Редактор потерял актуальную версию файла — переоткройте его.')
+    }
+    const preferences = await readPreferences()
+    // Tab permission is not an Edit permission: an owner who allowed inline
+    // hints did not thereby allow sending a selection with an instruction.
+    if (preferences.inlineEditConsent !== true) {
+      return fail('not-opted-in', 'Правка выделения не разрешена — включите её в строке запроса.')
+    }
+    const session = ctx.sessions.get(document.sessionId)
+    if (session === undefined) return fail('no-session', 'Сессия закрыта — правка выделения недоступна.')
+    if (ctx.sandboxPolicy.resolve({ session }).mode === 'read-only') {
+      return fail('read-only', 'Сессия работает в режиме только для чтения — правка выделения недоступна.')
+    }
+    if (completionExcluded(document.displayPath)) {
+      return fail('excluded-file', 'Файл похож на секрет — отправка выделения модели отключена.')
+    }
+    if (excludedFiles.has(fileKey(document.displayPath))) {
+      return fail('excluded-file', 'Правка выделения выключена для этого файла.')
+    }
+
+    const text = String(body.text ?? '')
+    if (text.length > MAX_CONTEXT_TEXT_CHARS) {
+      return fail('context-too-large', 'Файл слишком велик для правки выделения.')
+    }
+    const start = Number(body.start)
+    const end = Number(body.end)
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > text.length || end <= start) {
+      return fail('bad-request', 'Выделение пустое или выходит за пределы файла.')
+    }
+    if (end - start > INLINE_EDIT_MAX_SELECTION) {
+      return fail(
+        'selection-too-large',
+        `Выделение больше ${INLINE_EDIT_MAX_SELECTION} символов — правка выделения недоступна.`,
+      )
+    }
+    const instruction = String(body.instruction ?? '').trim()
+    if (instruction === '') return fail('bad-request', 'Не описано, что изменить.')
+    if (instruction.length > INLINE_EDIT_MAX_INSTRUCTION) {
+      return fail('bad-request', `Инструкция длиннее ${INLINE_EDIT_MAX_INSTRUCTION} символов.`)
+    }
+    const modelVersion = Number.isFinite(Number(body.modelVersion)) ? Number(body.modelVersion) : undefined
+
+    const selection = ctx.agentDefaultModel.currentSelection()
+    if (selection === null || selection === undefined || typeof selection.model !== 'string' || selection.model === '') {
+      return fail('no-model', 'Модель не выбрана — правка выделения недоступна.')
+    }
+    const provider = String(body.provider ?? preferences.completionProvider ?? '').trim() || selection.provider
+    const model = String(body.model ?? preferences.completionModel ?? '').trim() || selection.model
+
+    const fragment = text.slice(start, end)
+    const before = boundLines(text.slice(0, start), INLINE_EDIT_CONTEXT_LINES, 'end')
+    const after = boundLines(text.slice(end), INLINE_EDIT_CONTEXT_LINES, 'start')
+    const requestText = [
+      `Файл: ${document.displayPath}`,
+      `Язык: ${document.language}`,
+      `Задача: ${instruction}`,
+      '',
+      'Контекст файла; менять можно только фрагмент между маркерами.',
+      '--- до фрагмента ---',
+      before,
+      '--- фрагмент ---',
+      fragment,
+      '--- после фрагмента ---',
+      after,
+    ].join('\n')
+
+    const deadline = AbortSignal.timeout(INLINE_EDIT_DEADLINE_MS)
+    const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    const startedAt = Date.now()
+    let buffer = ''
+    let streamError = ''
+    const iterator = ctx.llm.stream({
+      provider,
+      model,
+      system: INLINE_EDIT_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: [{ type: 'text', text: requestText }] }],
+      temperature: 0.2,
+      signal: combined,
+      sessionId: document.sessionId,
+      purpose: 'code-editor-inline-edit',
+    })[Symbol.asyncIterator]()
+    for (;;) {
+      const step = await iterator.next()
+      if (step.done) break
+      const chunk = step.value
+      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') buffer += chunk.text
+      else if (chunk?.type === 'error') {
+        streamError = String(chunk.message ?? chunk.error?.message ?? chunk.error ?? 'unknown')
+      } else if (chunk?.type === 'finish' && chunk.reason?.kind === 'error' && streamError === '') {
+        streamError = String(chunk.reason.failure?.message ?? chunk.reason.failure?.code ?? 'unknown')
+      }
+      if (buffer.length > INLINE_EDIT_MAX_ANSWER) break
+    }
+
+    const replacement = readReplacementAnswer(buffer)
+    // An empty stream, prose or broken JSON is a failure, not a deletion: only
+    // a well-formed `{"replacement":""}` may delete the selection.
+    if (replacement === undefined) {
+      const detail = streamError === '' ? '' : `: ${streamError}`
+      return fail('bad-answer', `Модель вернула ответ не в ожидаемом формате${detail}.`)
+    }
+
+    let proposal
+    try {
+      proposal = createProposal({
+        id: randomUUID(),
+        documentId: document.id,
+        modelVersion,
+        text,
+        eol: document.eol,
+        changes: [{ start, end, oldText: fragment, newText: replacement }],
+      })
+    } catch (error) {
+      if (error instanceof ProposalError) return fail(error.code, error.message)
+      throw error
+    }
+
+    return {
+      proposal,
+      instruction,
+      provider,
+      model,
+      durationMs: Date.now() - startedAt,
+      trace: {
+        kind: 'inline-edit',
+        explicit: true,
+        rawChars: buffer.length,
+        answerChars: replacement.length,
+        removedChars: fragment.length,
+        streamError,
+      },
+    }
+  }
+
+  // ----------------------------------------------------------------- search
+
+  /**
+   * Literal text search over the session workspace. It is local: no model is
+   * asked and the Tab opt-in does not gate it, because neither the query nor the
+   * matches travel anywhere — the scan happens on the machine running the Host.
+   */
+  async function searchText(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — поиск недоступен.')
+    const query = typeof body.query === 'string' ? body.query.trim() : ''
+    // An empty query never walks the tree: it is not «everything matches».
+    if (query === '') return { query, matches: [], truncated: false, scanned: 0, bytes: 0 }
+    if (query.length > SEARCH_MAX_QUERY) {
+      return fail('bad-request', `Строка поиска длиннее ${SEARCH_MAX_QUERY} символов.`)
+    }
+    const requested = Number(body.limit)
+    const limit = Number.isFinite(requested) && requested > 0
+      ? Math.min(200, Math.floor(requested))
+      : SEARCH_DEFAULT_LIMIT
+    const result = await searchWorkspace(ctx, {
+      cwd: scope.cwd,
+      query,
+      limit,
+      hidden: body.hidden === true,
+      signal,
+    })
+    return { query, ...result }
+  }
+
+  // ------------------------------------------------------ assistant changes
+
+  async function agentChangesRoute(body) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — изменения ассистента недоступны.')
+    return {
+      available: changeTracker.available,
+      turns: changeTracker.list(scope.id),
+    }
+  }
+
+  async function agentChangeDiffRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — изменения ассистента недоступны.')
+    const seq = Number(body.seq)
+    const index = Number(body.index)
+    if (!Number.isSafeInteger(seq) || seq < 0) return fail('bad-request', 'Не указан ход изменений.')
+    if (!Number.isSafeInteger(index) || index < 0) return fail('bad-request', 'Не указан файл.')
+    let diff
+    try {
+      diff = await changeTracker.diff(scope.id, seq, index, signal)
+    } catch (error) {
+      // A snapshot read can fail for a live Session; that is a read error, not
+      // an empty comparison, so it must not look like "nothing changed".
+      return fail(error?.code || 'diff-failed', error instanceof Error ? error.message : String(error))
+    }
+    if (diff === undefined) {
+      return fail('not-found', 'Сравнение недоступно: ход не найден, файла нет в списке или сессия уже закрыта.')
+    }
+    return { diff }
+  }
+
+  // Both routes below need the file a turn touched, read from disk.
+  //
+  // Typed errors instead of `fail()` objects: the two callers word their
+  // refusals differently, so each route catches and maps them itself.
+  async function readTurnFile(scope, diff, signal) {
+    const refuse = (code, message) => Object.assign(new Error(message), { code })
+    const policy = ctx.sandboxPolicy.resolve({ session: scope.session })
+    if (policy.mode === 'read-only') throw refuse('read-only', 'Сессия работает в режиме только для чтения — действие недоступно.')
+    const target = await ctx.fs.resolve(diff.path, { cwd: scope.cwd, signal })
+    const root = await ctx.fs.resolve(scope.cwd, { signal })
+    const displayPath = ctx.fs.processPath(target)
+    if (!ctx.fs.contains(root, target)) throw refuse('outside-workspace', `Файл вне рабочей папки сессии: ${displayPath}`)
+    const info = await ctx.fs.stat(target, signal)
+    if (info === undefined || info.type !== 'file') throw refuse('not-found', `Файла больше нет на диске: ${displayPath}`)
+    if (info.size !== undefined && info.size > MAX_EDIT_BYTES) {
+      throw refuse('too-large', 'Файл больше 1 МиБ — сравнение и откат недоступны.')
+    }
+    const bytes = await ctx.fs.readBytes(target, signal, MAX_EDIT_BYTES + 1)
+    if (bytes.byteLength > MAX_EDIT_BYTES) throw refuse('too-large', 'Файл больше 1 МиБ — сравнение и откат недоступны.')
+    const decoded = decodeUtf8(bytes)
+    if (decoded === undefined) throw refuse('unsupported-encoding', 'Файл не является текстом UTF-8.')
+    // The snapshot speaks LF; the file may hold CRLF, so patch normalized text
+    // and put the file's own line endings and BOM back on the way out.
+    return { policy, target, info, decoded, text: decoded.text.replace(/\r\n/g, '\n') }
+  }
+
+  // Turn start and turn end as full texts, so the editor can show a real
+  // side-by-side diff instead of a list of hunks.
+  async function agentChangeTextRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — сравнение правок ассистента недоступно.')
+    const seq = Number(body.seq)
+    const index = Number(body.index)
+    if (!Number.isSafeInteger(seq) || seq < 0) return fail('bad-request', 'Не указан ход изменений.')
+    if (!Number.isSafeInteger(index) || index < 0) return fail('bad-request', 'Не указан файл.')
+
+    let diff
+    try {
+      diff = await changeTracker.diff(scope.id, seq, index, signal)
+    } catch (error) {
+      return fail(error?.code || 'diff-failed', error instanceof Error ? error.message : String(error))
+    }
+    if (diff === undefined) {
+      return fail('not-found', 'Сравнение недоступно: ход не найден, файла нет в списке или сессия уже закрыта.')
+    }
+    if (diff.kind !== 'text') return fail('not-text', 'Файл не текстовый — сравнение недоступно.')
+
+    let file
+    try {
+      file = await readTurnFile(scope, diff, signal)
+    } catch (error) {
+      return fail(error?.code || 'read-failed', error instanceof Error ? error.message : String(error))
+    }
+    const before = diff.before === false ? '' : revertHunks(file.text, diff.hunks)
+    if (before === undefined) return fail('conflict', 'Файл изменился после хода — сравнение недоступно.')
+    if (diff.before !== false && applyHunks(before, diff.hunks) !== file.text) {
+      return fail('conflict', 'Снимок не сходится с файлом — сравнение недоступно.')
+    }
+    return {
+      path: diff.path,
+      display: diff.display,
+      before,
+      after: file.text,
+      coarse: diff.coarse === true,
+      language: languageOf(diff.path),
+    }
+  }
+
+  // Undo one file of one assistant turn: write the turn-start text back.
+  //
+  // Two guards make this safe: the file must still be inside the session root
+  // and writable, and every hunk must still match the file on disk. A file the
+  // user edited after the turn therefore fails with a conflict instead of being
+  // half-rewritten; the panel shows that as an honest refusal.
+  async function agentChangeRestoreRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откат правок ассистента недоступен.')
+    const seq = Number(body.seq)
+    const index = Number(body.index)
+    if (!Number.isSafeInteger(seq) || seq < 0) return fail('bad-request', 'Не указан ход изменений.')
+    if (!Number.isSafeInteger(index) || index < 0) return fail('bad-request', 'Не указан файл.')
+
+    let diff
+    try {
+      diff = await changeTracker.diff(scope.id, seq, index, signal)
+    } catch (error) {
+      return fail(error?.code || 'diff-failed', error instanceof Error ? error.message : String(error))
+    }
+    if (diff === undefined) {
+      return fail('not-found', 'Сравнение недоступно: ход не найден, файла нет в списке или сессия уже закрыта.')
+    }
+    if (diff.kind !== 'text') return fail('not-text', 'Файл не текстовый — откат недоступен.')
+    if (diff.before === false) return fail('no-before', 'Файла не было до этого хода — откат не поддерживается.')
+
+    let file
+    try {
+      file = await readTurnFile(scope, diff, signal)
+    } catch (error) {
+      return fail(error?.code || 'read-failed', error instanceof Error ? error.message : String(error))
+    }
+
+    const previous = revertHunks(file.text, diff.hunks)
+    if (previous === undefined) {
+      return fail('conflict', 'Файл изменился после хода — откат не выполнен, чтобы не потерять правки.')
+    }
+    if (applyHunks(previous, diff.hunks) !== file.text) {
+      return fail('conflict', 'Снимок не сходится с файлом — откат не выполнен.')
+    }
+
+    const eol = detectEol(file.decoded.text)
+    const content = (file.decoded.bom ? '\uFEFF' : '') + (eol === 'crlf' ? previous.replace(/\n/g, '\r\n') : previous)
+    const outcome = await ctx.fs.writeText(
+      file.target,
+      content,
+      { kind: 'replaceIfVersion', version: file.info.version },
+      signal,
+      file.policy,
+    )
+    return { restored: true, path: diff.path, display: diff.display, version: outcome.version }
   }
 
   // ---------------------------------------------------------------- resolve

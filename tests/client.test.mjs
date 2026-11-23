@@ -225,6 +225,7 @@ test('a multiline continuation reserves editor rows until Escape or Tab', async 
   const zones = new Map()
   const decorations = new Map()
   const commands = new Map()
+  const actions = new Map()
   let nextId = 0
   const subscribe = () => ({ dispose() {} })
   let widget, moveCaret, modelChanged
@@ -253,6 +254,11 @@ test('a multiline continuation reserves editor rows until Escape or Tab', async 
     }),
     createContextKey: () => ({ set() {} }),
     addCommand: (key, run) => commands.set(key, run),
+    addAction: (action) => {
+      actions.set(action.id, action)
+      commands.set(`action:${action.id}`, action.run)
+      return { dispose() {} }
+    },
     onDidChangeModelContent: subscribe,
     onDidBlurEditorWidget: subscribe,
     onDidChangeCursorPosition: fn => { moveCaret = fn; return subscribe() },
@@ -265,8 +271,8 @@ test('a multiline continuation reserves editor rows until Escape or Tab', async 
   const monaco = {
     editor: { create: () => editor, ContentWidgetPositionPreference: { EXACT: 0 }, GlyphMarginLane: { Right: 3 } },
     Range: class { constructor(startLineNumber, startColumn, endLineNumber, endColumn) { Object.assign(this, { startLineNumber, startColumn, endLineNumber, endColumn }) } },
-    KeyMod: { CtrlCmd: 256, Shift: 512 },
-    KeyCode: { Space: 1, Tab: 2, Escape: 3, RightArrow: 4, KeyS: 5, KeyW: 6, KeyP: 7, Comma: 8, Backquote: 9 },
+    KeyMod: { CtrlCmd: 256, Shift: 512, Alt: 1024 },
+    KeyCode: { Space: 1, Tab: 2, Escape: 3, RightArrow: 4, KeyS: 5, KeyW: 6, KeyP: 7, Comma: 8, Backquote: 9, KeyL: 10, KeyC: 11, KeyK: 12 },
   }
   const tabs = [{ key: 'test', hostId: 'test', path: 'test.py' }]
   const insert = '\n\tfirst()\n\n\tsecond()'
@@ -304,6 +310,12 @@ test('a multiline continuation reserves editor rows until Escape or Tab', async 
   const pane = host.registrations.find((entry) => entry.config.name === 'sidebar.right.pane.tab')
   pane.component({ tab: { contentId: 'dsh-resource://ide/session/session-1', id: 'tab-1' } })
   const dispose = effects[0]()
+  // Inline Edit stays reachable from Monaco's own context menu; the chord moved
+  // to the remappable keymap (Ctrl+Shift+K by default) and is dispatched there.
+  const inlineAction = actions.get('dsh-ide.inline-edit')
+  assert.equal(inlineAction.label, 'Изменить выделение…')
+  assert.equal(inlineAction.keybindings, undefined)
+  assert.equal(inlineAction.precondition, 'editorTextFocus')
   const request = async () => {
     commands.get(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space)()
     await new Promise(setImmediate)
