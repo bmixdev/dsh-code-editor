@@ -21,7 +21,9 @@
  * Every operation is an exact Fetch route below `/api`, which the connection
  * layer serves only to the owner principal (this machine's GUI page).
  */
+import { spawn } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -34,8 +36,13 @@ import {
   saveCredential,
 } from './catalog.js'
 import { buildContext, postprocessCompletion } from './completion.js'
-import { optedInRoots, readPreferences, writePreferences } from './prefs.js'
+import { DEFAULT_SYSTEM_PROMPT, fillPrompt, optedInRoots, readPreferences, writePreferences } from './prefs.js'
+import { buildFileContext, editInstructions, locateEdits, parseEditResponse } from './edits.js'
+import { createProposal, ProposalError, readReplacementAnswer } from './proposal.js'
+import { boundLines, evaluateSuggestion, planEdit, reasonLabel } from './tab.js'
 import { listFiles, listTree } from './tree.js'
+import { searchText as searchWorkspace } from './search.js'
+import { applyHunks, createChangeTracker, revertHunks } from './agentChanges.js'
 import { readSessionState, writeSessionState } from './state.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -55,6 +62,97 @@ const CONTEXT_RIGHT = 1000
 const MAX_CONTEXT_TEXT_CHARS = 4 * 1024 * 1024
 const COMPLETION_DEADLINE_MS = 20000
 const COMPLETION_MAX_CHARS = 400
+/**
+ * Inline Edit: the user describes a change for one selection. A selection is
+ * small by definition, but it is still bounded so a whole-file selection is a
+ * deliberate, visible refusal rather than a 2 MB prompt.
+ */
+const INLINE_EDIT_MAX_SELECTION = 20000
+const INLINE_EDIT_CONTEXT_LINES = 40
+const INLINE_EDIT_MAX_INSTRUCTION = 2000
+const INLINE_EDIT_MAX_ANSWER = 40000
+const INLINE_EDIT_DEADLINE_MS = 60000
+const INLINE_EDIT_SYSTEM_PROMPT =
+  'Ты — движок правки выделенного фрагмента кода. Верни только JSON-объект ' +
+  '{"replacement": "..."} — без markdown-ограждений и пояснений. В replacement положи ' +
+  'новый текст фрагмента целиком, с отступом как у исходного, и не повторяй соседние строки. ' +
+  'Пустая строка в replacement означает удаление фрагмента. Не меняй ничего за пределами фрагмента.'
+/**
+ * Text search: a local scan, bounded on every axis so one query cannot turn into
+ * an unbounded workspace read. `truncated` is part of the answer, because «not
+ * found» and «stopped early» are different facts.
+ */
+const SEARCH_MAX_QUERY = 200
+const SEARCH_DEFAULT_LIMIT = 50
+/**
+ * Hints must appear while the user is still looking at the line, so an
+ * unconfigured route prefers a small model. The hints below are name-based on
+ * purpose: a catalog entry carries no latency, and the small variants of this
+ * gateway are the ones that answer under a second.
+ */
+const FAST_MODEL_HINTS = ['flash', 'mini', 'haiku', 'lite', 'small', 'fast', 'instant', 'cheap']
+const SLOW_MODEL_HINTS = ['reason', 'think', 'thinking', 'pro', 'max', 'opus', 'sonnet', 'o1', 'o3', 'r1']
+const CATALOG_TTL_MS = 5 * 60 * 1000
+let catalogCache = { provider: '', models: [], at: 0 }
+
+/**
+ * Ranks model ids for a hint request: small variants first, thinking-heavy
+ * families last, and the chat model's own family demoted so the hint does not
+ * land on the same slow model the session uses.
+ */
+export function rankModels(ids, avoidFamily = '') {
+  const score = id => {
+    const lower = id.toLowerCase()
+    let value = 0
+    if (FAST_MODEL_HINTS.some(hint => lower.includes(hint))) value += 2
+    if (SLOW_MODEL_HINTS.some(hint => lower.includes(hint))) value -= 2
+    if (lower.includes('code')) value += 1
+    if (avoidFamily !== '' && lower.split('-')[0] === avoidFamily) value -= 1
+    return value
+  }
+  return ids.slice().sort((left, right) => score(right) - score(left))
+}
+
+/** Forgets the catalog cache; tests need it, and so does a provider switch. */
+export function resetModelCatalog() {
+  catalogCache = { provider: '', models: [], at: 0 }
+}
+
+// listModels has no signal, and a stream adapter can be slow to acknowledge
+// cancellation. Bound the caller's wait independently of provider cleanup.
+async function untilAbort(signal, work) {
+  signal.throwIfAborted()
+  let onAbort
+  const stopped = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  try {
+    return await Promise.race([stopped, work()])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** Ranks a provider's catalog and returns its fastest-looking model id. */
+async function pickFastModel(ctx, provider, avoidFamily = '') {
+  const now = Date.now()
+  if (catalogCache.provider !== provider || now - catalogCache.at > CATALOG_TTL_MS) {
+    let models = []
+    try {
+      const listed = await ctx.llm.listModels(provider)
+      models = Array.isArray(listed) ? listed : []
+    } catch {
+      // An unlistable provider simply has no better suggestion to offer.
+    }
+    catalogCache = { provider, models, at: now }
+  }
+  const ids = catalogCache.models
+    .map(entry => (typeof entry === 'string' ? entry : entry?.id))
+    .filter(id => typeof id === 'string' && id !== '')
+  if (ids.length === 0) return ''
+  return rankModels(ids, avoidFamily)[0] ?? ''
+}
 
 const CONTENT_TYPES = new Map([
   ['.js', 'text/javascript; charset=utf-8'],
@@ -163,6 +261,13 @@ export function apply(ctx, config) {
   const excludedFiles = new Set()
   let sequence = 0
 
+  /**
+   * Turns announced by live Sessions, if this Host records workspace changes.
+   * The service is optional: without it the editor still works and the changes
+   * panel says so instead of pretending nothing changed.
+   */
+  const changeTracker = createChangeTracker({ recorder: optionalChangeRecorder(ctx) })
+
   const json = (value, status = 200) =>
     new Response(JSON.stringify(value), {
       status,
@@ -186,11 +291,35 @@ export function apply(ctx, config) {
     'dsh-ide: Monaco assets',
   )
 
+  if (typeof ctx.on === 'function') {
+    ctx.effect(
+      () =>
+        ctx.on('session/event', (session, event) => {
+          // `workspace/changes` is a SessionEvent, not a Cordis event: the feed
+          // is the generic post-commit append stream, filtered by type.
+          if (event === null || typeof event !== 'object') return
+          if (event.type !== 'workspace/changes') return
+          changeTracker.note(session?.id, event.seq)
+        }),
+      'dsh-ide: workspace changes feed',
+    )
+    ctx.effect(
+      () => ctx.on('session/disposed', (session) => changeTracker.forget(session?.id)),
+      'dsh-ide: workspace changes cleanup',
+    )
+  }
+
   const handlers = {
     open: (body, signal) => open(body, signal),
     save: (body, signal) => save(body, signal),
     settings: (body) => settings(body),
     complete: (body, signal) => complete(body, signal),
+    inlineEdit: (body, signal) => inlineEdit(body, signal),
+    searchText: (body, signal) => searchText(body, signal),
+    agentChanges: (body) => agentChangesRoute(body),
+    agentChangeDiff: (body, signal) => agentChangeDiffRoute(body, signal),
+    agentChangeRestore: (body, signal) => agentChangeRestoreRoute(body, signal),
+    agentChangeText: (body, signal) => agentChangeTextRoute(body, signal),
     resolve: (body) => resolveSession(body),
     tree: (body, signal) => treeRoute(body, signal),
     files: (body, signal) => filesRoute(body, signal),
@@ -198,6 +327,7 @@ export function apply(ctx, config) {
     mkdir: (body, signal) => mkdirRoute(body, signal),
     rename: (body, signal) => renameRoute(body, signal),
     remove: (body, signal) => removeRoute(body, signal),
+    reveal: (body, signal) => revealRoute(body, signal),
     state: (body) => stateRoute(body),
     catalog: () => buildCatalog(ctx),
     credentials: (body) => credentialsRoute(body),
@@ -243,6 +373,7 @@ export function apply(ctx, config) {
     if (code === 'FS_SANDBOX_DENIED' || code === 'FS_READ_ONLY') {
       return { code: 'read-only', message: 'Сессия работает в режиме только для чтения — сохранение запрещено.' }
     }
+    if (error?.name === 'TimeoutError') return { code: 'timeout', message: 'Истекло время ожидания подсказки.' }
     if (code === 'ABORT_ERR' || code === 'ABORTED' || error?.name === 'AbortError') {
       return { code: 'cancelled', message: 'Запрос отменён.' }
     }
@@ -260,6 +391,18 @@ export function apply(ctx, config) {
 
   async function rootTarget(cwd, signal) {
     return ctx.fs.resolve(cwd, { signal })
+  }
+
+  /**
+   * The recorder is a Host service this plugin does not require: a profile
+   * without it must still load, so every access goes through an undefined check.
+   */
+  function optionalChangeRecorder(scope) {
+    try {
+      return typeof scope.get === 'function' ? scope.get('workspaceChanges') : undefined
+    } catch {
+      return undefined
+    }
   }
 
   // ------------------------------------------------------------------- open
@@ -417,6 +560,7 @@ export function apply(ctx, config) {
     if (body.sessionId !== document.sessionId) return fail('wrong-session', 'Документ принадлежит другой сессии.')
     if (body.token !== document.token) return fail('stale-client', 'Редактор потерял актуальную версию файла.')
     const preferences = await readPreferences()
+    const kind = body.kind === 'explicit' ? 'explicit' : body.kind === 'refetch' ? 'refetch' : body.explicit === true ? 'explicit' : 'auto'
     if (
       !optedIn.has(document.workspaceRoot) &&
       !optedInRoots(preferences).includes(document.workspaceRoot)
@@ -434,6 +578,26 @@ export function apply(ctx, config) {
     if (rawText.length > MAX_CONTEXT_TEXT_CHARS) {
       return fail('context-too-large', 'Файл слишком велик для подсказок в редакторе.')
     }
+    if (rawText.length > preferences.maxFileChars) {
+      logCompletion({
+        file: document.displayPath,
+        language: document.language,
+        kind,
+        suppressed: 'file-too-large',
+        fileChars: rawText.length,
+        limit: preferences.maxFileChars,
+      })
+      return {
+        text: '',
+        requestId: randomUUID(),
+        provider: '',
+        model: '',
+        durationMs: 0,
+        reason: reasonLabel('file-too-large'),
+        suppressed: { reason: 'file-too-large' },
+        trajectory: { kind, suppressed: 'file-too-large', fileChars: rawText.length, explicit: kind === 'explicit' },
+      }
+    }
     const left = boundedWindow(body.contextLeft, preferences.contextLeft)
     const right = boundedWindow(body.contextRight, preferences.contextRight)
     const context = buildContext({
@@ -447,6 +611,47 @@ export function apply(ctx, config) {
     // to the same budget it was granted rather than the configured default.
     const prefix = context.prefix === '' ? clip(String(body.prefix ?? ''), left, 'end') : context.prefix
     const suffix = context.suffix === '' ? clip(String(body.suffix ?? ''), right, 'start') : context.suffix
+    if (preferences.triggerInComments !== true && looksLikeCommentLine(prefix)) {
+      logCompletion({ file: document.displayPath, language: document.language, kind, suppressed: 'comment-line' })
+      return {
+        text: '',
+        requestId: randomUUID(),
+        provider: '',
+        model: '',
+        durationMs: 0,
+        reason: reasonLabel('comment-line'),
+        suppressed: { reason: 'comment-line' },
+        trajectory: { kind, suppressed: 'comment-line', explicit: kind === 'explicit' },
+      }
+    }
+    // `aboveLines`/`belowLines` bound the prompt by lines; the character window
+    // above only keeps the request itself bounded. Both are settings the user
+    // can change in the IDE drawer.
+    const windowPrefix = boundLines(prefix, preferences.aboveLines, 'end')
+    const windowSuffix = boundLines(suffix, preferences.belowLines, 'start')
+    const cursorOffset = Math.min(Math.max(0, Math.round(Number(body.offset ?? 0) || 0)), rawText.length)
+    // With whole-file edits on, the model gets the buffer with a cursor marker
+    // and may answer with changes anywhere in the file — that is the part that
+    // turns `main(f)` typed under a bare `def main():` into a proposal to fix
+    // the signature, not just characters at the caret. A structured reply costs
+    // the model a few extra seconds, so while typing it is opt-in: the ordinary
+    // pause gets a fast continuation, and `Ctrl+Space` always asks for edits.
+    const wantsEdits = preferences.multiEdit === true && preferences.maxEdits > 0
+    const multiEdit = wantsEdits && (kind === 'explicit' || preferences.multiEditAuto === true)
+    // 0 means "no ceiling": the request then carries no `maxTokens` at all and
+    // the model stops when it is done. It is the default because a cap below the
+    // model's own output limit silently truncates the answer, and a truncated
+    // structured reply is what lost every edit twice in a row.
+    const tokenBudget = Number.isFinite(Number(preferences.maxTokens)) ? Math.max(0, Math.round(Number(preferences.maxTokens))) : 0
+    // The character guard exists so a runaway stream cannot fill the buffer, not
+    // to shorten a good answer. A structured reply is several times longer than
+    // a one-line continuation, so it gets the larger ceiling.
+    const answerChars = multiEdit ? 8000 : COMPLETION_MAX_CHARS
+    const deadline = AbortSignal.timeout(boundedMs(preferences.deadlineMs, COMPLETION_DEADLINE_MS, 1000, 60000))
+    const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    const flushAfterMs = boundedMs(preferences.flushAfterMs, 250, 0, 5000)
+    const startedAt = Date.now()
+
     const selection = ctx.agentDefaultModel.currentSelection()
     if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
       return fail('no-model', 'Модель не выбрана — подсказки недоступны, редактор работает.')
@@ -469,21 +674,49 @@ export function apply(ctx, config) {
         process.env.DSH_CODE_EDITOR_MODEL ||
         '',
     ).trim()
+    // Where the model came from, so the trajectory can say why the session's own
+    // model appears in a row: an empty preference means "whatever the session
+    // uses", not "a broken completion setting".
+    let modelSource =
+      (typeof body.model === 'string' && body.model.trim() !== '')
+        ? 'request'
+        : String(preferences.completionModel ?? '').trim() !== ''
+          ? 'settings'
+          : typeof config === 'object' && config !== null && String(config.completionModel ?? '').trim() !== ''
+            ? 'config'
+            : String(process.env.DSH_CODE_EDITOR_MODEL ?? '').trim() !== ''
+              ? 'env'
+              : 'session'
     const requestedProvider = String(
       (typeof body.provider === 'string' ? body.provider : '') || preferences.completionProvider || '',
     ).trim() || selection.provider
+    // Nothing is configured, and the session's own model is usually a thinking
+    // one: its hidden reasoning eats the whole six-second window and the row ends
+    // as «модель не вернула продолжение», which reads as a broken feature. When
+    // the settings name no model, a fast model of the same provider is chosen
+    // instead and the trajectory says so; the setting always overrides it.
+    let effectiveModel = requestedModel
+    if (modelSource === 'session' && preferences.autoModel !== false) {
+      const family = String(selection.model).toLowerCase().split('-')[0]
+      const fast = await untilAbort(combined, () => pickFastModel(ctx, requestedProvider, family))
+      if (fast !== '' && fast !== selection.model) {
+        effectiveModel = fast
+        modelSource = 'auto'
+      }
+    }
     const attempts = []
-    if (requestedModel !== '') attempts.push({ provider: requestedProvider, model: requestedModel })
-    if (requestedProvider !== selection.provider) {
+    if (effectiveModel !== '') attempts.push({ provider: requestedProvider, model: effectiveModel })
+    if (requestedProvider !== selection.provider && (kind === 'explicit' || attempts.length === 0)) {
       // A provider without a model cannot be called: ask its catalog for the
       // first advertised model so the choice still means something.
       try {
-        const models = await ctx.llm.listModels(requestedProvider)
+        const models = await untilAbort(combined, () => ctx.llm.listModels(requestedProvider))
         const first = Array.isArray(models) ? models[0] : undefined
         if (first !== undefined && typeof first.id === 'string') {
           attempts.push({ provider: requestedProvider, model: first.id })
         }
       } catch {
+        combined.throwIfAborted()
         // The failure surfaces as "no model answered" below, with the provider
         // named in the log line.
       }
@@ -492,41 +725,59 @@ export function apply(ctx, config) {
       attempts.push({ provider: selection.provider, model: selection.model })
     }
 
-    const systemPrompt =
-      'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
-      'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
-      'уже написанного кода. Продолжение должно быть коротким (1–5 строк) и синтаксически уместным. ' +
-      'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
-      'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
-      'Если уместного продолжения нет, ответь пустой строкой.'
+    // The instruction is a setting. Empty means the shipped text; a saved one
+    // may use the same placeholders, so the user can keep "1–{{answerLines}}
+    // строк" working while changing the rest of the wording.
+    const promptTemplate =
+      String(preferences.systemPrompt ?? '').trim() === '' ? DEFAULT_SYSTEM_PROMPT : preferences.systemPrompt
+    const basePrompt = fillPrompt(promptTemplate, {
+      answerLines: preferences.answerLines,
+      language: document.language,
+      file: document.displayPath,
+    })
+    // A chat model narrates before it writes. The line below asks for code
+    // first; it cannot switch off hidden reasoning (that is the route's own
+    // setting), but it keeps the visible answer free of commentary.
+    const concisePrompt =
+      preferences.noReasoningHint === false
+        ? basePrompt
+        : `${basePrompt}\n\nНе рассуждай вслух: сразу пиши код без пояснений.`
+    const systemPrompt = multiEdit
+      ? `${concisePrompt}\n\n${editInstructions({ maxEdits: preferences.maxEdits })}`
+      : concisePrompt
     // The suffix must follow its own header: an inverted layout tells the model to
     // continue past the text that comes after the cursor, which produced empty
     // answers for every request of the first benchmark.
     const requestText =
-      `Файл: ${document.displayPath}\n` +
-      `Язык: ${document.language}\n\n` +
-      `--- текст до курсора ---\n${prefix}\n--- курсор ---\n` +
-      `--- текст после курсора ---\n${suffix}`
-
-    const deadline = AbortSignal.timeout(COMPLETION_DEADLINE_MS)
-    const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
-    const startedAt = Date.now()
+      multiEdit && preferences.wholeFileContext === true
+        ? buildFileContext({
+            path: document.displayPath,
+            language: document.language,
+            text: rawText,
+            offset: cursorOffset,
+          })
+        : `Файл: ${document.displayPath}\n` +
+          `Язык: ${document.language}\n\n` +
+          `--- текст до курсора ---\n${windowPrefix}\n--- курсор ---\n` +
+          `--- текст после курсора ---\n${windowSuffix}`
 
     // A thinking model spends the output budget on hidden reasoning and then
-    // returns nothing, which reads in the GUI as "completions stopped working".
-    // Pinning the least advertised effort leaves the budget to the code.
-    const leastEffort = async (provider, model) => {
-      try {
-        const info = await ctx.llm.resolveModelInfo(provider, model, combined)
-        const effort = info?.reasoning?.efforts?.[0]
-        return typeof effort?.id === 'string' && effort.id !== '' ? effort.id : undefined
-      } catch {
-        return undefined
-      }
-    }
+    // returns nothing, and it is also what turned a hint into a 20 s wait.
+    // DSH exposes an adapter-owned `off` level that sends `thinking: { type:
+    // disabled }` for routes whose compat declares `thinkingFormat: deepseek`.
+    // Measured against the same gateway on a 20-line Python prompt: `off` put
+    // the first character on the wire in 1.6 s, while the default effort spent
+    // the whole budget on reasoning and never emitted text at all. A level the
+    // route rejects fails before any network I/O, so the chain below falls back
+    // cheaply; `undefined` means "provider default".
+    const effortChain = effortChainFor(preferences.completionEffort)
+    const attemptsForKind = kind === 'explicit' ? attempts : attempts.slice(0, 1)
 
     let text = ''
-    let used = attempts[0]
+    let used = attemptsForKind[0]
+    let effortsAdvertised = []
+    let effortUsed
+    let flushed = false
     // The stream can end without any text and without throwing: a refusal or a
     // transport failure arrives as its own chunk. Collecting the chunk types is
     // what tells that apart from "the model answered nothing" — the empty
@@ -534,80 +785,181 @@ export function apply(ctx, config) {
     const chunkTypes = new Set()
     let streamError = ''
     let finishReason = ''
-    let firstChunk = ''
-    for (const attempt of attempts) {
-      const effort = await leastEffort(attempt.provider, attempt.model)
-      used = effort === undefined ? attempt : { ...attempt, effort }
-      let buffer = ''
-      streamError = ''
-      finishReason = ''
-      try {
-      for await (const chunk of ctx.llm.stream({
-        provider: attempt.provider,
-        model: attempt.model,
-        ...(used.effort === undefined ? {} : { reasoningEffort: used.effort }),
-      system: systemPrompt,
-      // Message content is a list of typed blocks, not a bare string: every
-      // other host-side caller in this installation passes
-      // `[{ type: 'text', text }]`, and a string content made the adapter end
-      // the stream immediately with no chunk at all (2 ms, empty answer).
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: requestText,
-            },
-          ],
-        },
-      ],
-      // 160 tokens was not enough for a reasoning model: it spent the whole
-      // budget on `reasoning_content` and every answer came back empty with
-      // `finish_reason: length`. The effort is pinned to the least advertised
-      // value above and 900 tokens leave room for the five lines of code.
-      maxTokens: 900,
-      temperature: 0.1,
-      signal: combined,
-      sessionId: document.sessionId,
-      purpose: 'code-editor-inline-completion',
-    })) {
-      if (!chunk || typeof chunk !== 'object') continue
-      if (firstChunk === '') {
+    for (const attempt of attemptsForKind) {
+      combined.throwIfAborted()
+      // Asking the route for its reasoning catalogue is only needed when a level
+      // has to be chosen. With the default (empty) preference there is nothing to
+      // choose, and the extra round trip is pure latency on a keystroke.
+      if (effortChain.length === 1 && effortChain[0] === undefined) {
+        effortsAdvertised = []
+      } else {
         try {
-          firstChunk = JSON.stringify(chunk).slice(0, 400)
+          const info = await untilAbort(combined, () => ctx.llm.resolveModelInfo(attempt.provider, attempt.model, combined))
+          effortsAdvertised = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts.map(effort => effort.id) : []
         } catch {
-          firstChunk = '<unserializable chunk>'
+          combined.throwIfAborted()
+          effortsAdvertised = []
         }
       }
-      if (typeof chunk.type === 'string' && chunkTypes.size < 8) chunkTypes.add(chunk.type)
-      if (chunk.type === 'text-delta' && typeof chunk.text === 'string') buffer += chunk.text
-      if (chunk.type === 'error') {
-        const detail = chunk.message ?? chunk.error?.message ?? chunk.error
-        streamError = typeof detail === 'string' && detail !== '' ? detail : 'stream-error'
+      for (const effort of effortChain) {
+        let buffer = ''
+        const stop = new AbortController()
+        const attemptSignal = AbortSignal.any([combined, stop.signal])
+        let timer
+        let iterator
+        let unsupported = false
+        streamError = ''
+        finishReason = ''
+        try {
+          iterator = ctx.llm.stream({
+            provider: attempt.provider,
+            model: attempt.model,
+            ...(effort === undefined ? {} : { reasoningEffort: effort }),
+            system: systemPrompt,
+            // Message content is a list of typed blocks, not a bare string:
+            // every other host-side caller in this installation passes
+            // `[{ type: 'text', text }]`, and a string content made the adapter
+            // end the stream immediately with no chunk at all (2 ms, empty).
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: requestText,
+                  },
+                ],
+              },
+            ],
+            // No token ceiling by default: a thinking model spends part of the
+            // same budget on hidden reasoning, and every cap large enough to fit
+            // an edit list still cut the reply mid-string on a long one. The
+            // deadline and the stream reader bound the answer instead, and the
+            // setting can put a ceiling back when a route bills by tokens.
+            ...(tokenBudget > 0 ? { maxTokens: tokenBudget } : {}),
+            temperature: 0.1,
+            signal: attemptSignal,
+            sessionId: document.sessionId,
+            purpose: 'code-editor-inline-completion',
+          })[Symbol.asyncIterator]()
+          while (true) {
+            const { done, value: chunk } = await untilAbort(attemptSignal, () => iterator.next())
+            if (done) { iterator = undefined; break }
+            if (!chunk || typeof chunk !== 'object') continue
+            if (typeof chunk.type === 'string' && chunkTypes.size < 8) chunkTypes.add(chunk.type)
+            if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+              buffer += chunk.text
+              if (!multiEdit && timer === undefined && chunk.text.length > 0) {
+                if (flushAfterMs === 0) { flushed = true; break }
+                timer = setTimeout(() => { flushed = true; stop.abort() }, flushAfterMs)
+              }
+            }
+            if (chunk.type === 'error') {
+              const detail = chunk.message ?? chunk.error?.message ?? chunk.error
+              streamError = typeof detail === 'string' && detail !== '' ? detail : 'stream-error'
+            }
+            if (chunk.type === 'finish') {
+              // A failed call finishes the stream with `reason.kind: "error"`
+              // and the cause under `reason.failure`; it is not a thrown error
+              // and not a `type: "error"` chunk, so reading only those two made
+              // a rejected request look like "the model answered nothing".
+              const reason = chunk.reason ?? {}
+              if (reason.kind === 'error' && reason.failure !== undefined && reason.failure !== null) {
+                const message = typeof reason.failure.message === 'string' ? reason.failure.message : ''
+                const code = typeof reason.failure.code === 'string' ? reason.failure.code : ''
+                streamError = message !== '' ? message : code !== '' ? code : 'stream-error'
+                if (code !== '') finishReason = code
+              } else {
+                finishReason = typeof reason.kind === 'string' ? reason.kind : 'finish'
+              }
+            }
+            if (typeof chunk.finishReason === 'string' && chunk.finishReason !== '') finishReason = chunk.finishReason
+            if (buffer.length > answerChars) break
+          }
+        } catch (cause) {
+          // Preserve complete edits already received at the deadline, but never
+          // publish partial work when the caller cancelled the request.
+          if (signal?.aborted || buffer.trim() === '') combined.throwIfAborted()
+          if (!flushed) streamError = cause instanceof Error ? cause.message : String(cause)
+        } finally {
+          clearTimeout(timer)
+          if (iterator !== undefined) {
+            stop.abort()
+            // An adapter may still be unwinding next(); do not delay a ready hint.
+            void Promise.resolve().then(() => iterator.return?.()).catch(() => {})
+          }
+        }
+        unsupported = buffer.trim() === '' && isUnsupportedEffort(streamError)
+        if (unsupported && effortChain.indexOf(effort) < effortChain.length - 1) continue
+        used = { provider: attempt.provider, model: attempt.model, ...(effort === undefined ? {} : { effort }) }
+        effortUsed = effort
+        text = buffer
+        break
       }
-      if (chunk.type === 'finish') {
-        const kind = chunk.reason?.kind ?? chunk.reason ?? ''
-        finishReason = typeof kind === 'string' ? kind : 'finish'
-      }
-      if (typeof chunk.finishReason === 'string' && chunk.finishReason !== '') finishReason = chunk.finishReason
-      if (buffer.length > COMPLETION_MAX_CHARS) break
-      }
-      } catch (cause) {
-        streamError = cause instanceof Error ? cause.message : String(cause)
-      }
-      text = buffer
       if (text.trim() !== '') break
     }
 
+    // A whole-file answer carries two parts: the continuation at the cursor and
+    // a list of edits elsewhere. A model that ignores the format simply wrote a
+    // continuation, so the parser falls back to "all of it is the answer".
+    const parsed = multiEdit ? parseEditResponse(text) : { answer: text, edits: [] }
     const answer = postprocessCompletion({
-      completion: text,
+      completion: parsed.answer,
       prefix,
       suffix,
       topLevelKeywords: topLevelKeywordsFor(document.language),
     })
 
     const result = sanitizeCompletion(answer)
+
+    // Where the answer lands and whether it is worth showing. Both decisions
+    // used to live in Cursor's server response (`range_to_replace` plus the
+    // bad-case heuristics); here the Host owns them because it already has the
+    // whole buffer, and every knob below is a saved preference.
+    const requestId = randomUUID()
+    const modelVersion = Number.isFinite(Number(body.modelVersion)) ? Number(body.modelVersion) : undefined
+    const planOptions = {
+      rangeReplace: preferences.rangeReplace,
+      rangeReplaceLines: preferences.rangeReplaceLines,
+      showWhitespaceOnlyChanges: preferences.showWhitespaceOnlyChanges,
+      heuristicDuplicateLine: preferences.heuristicDuplicateLine,
+      heuristicExtendsRange: preferences.heuristicExtendsRange,
+      maxAddedLines: preferences.maxAddedLines,
+      recentRejectThreshold: preferences.recentRejectThreshold,
+      recentRejectWindowMs: preferences.recentRejectWindowMs,
+      heuristicRevertingChange: preferences.heuristicRevertingChange,
+    }
+    const plan = planEdit({
+      text: rawText,
+      offset: Number(body.offset ?? 0),
+      suggestion: result,
+      options: planOptions,
+    })
+    const verdict = evaluateSuggestion({
+      text: rawText,
+      plan,
+      options: planOptions,
+      rejections: readRecords(body.rejections),
+      revertions: readRecords(body.revertions),
+    })
+    const accepted = verdict.accepted && plan.insertText !== ''
+    // Located against the buffer the user actually has, so a snippet the model
+    // remembered slightly wrong is dropped instead of applied in the wrong place.
+    const edits = multiEdit
+      ? locateEdits({
+          text: rawText,
+          edits: parsed.edits,
+          maxEdits: preferences.maxEdits,
+          cursor: cursorOffset,
+        })
+      : []
+    // An answer may carry edits only: "move the call site, insert nothing here".
+    // The plan is then an empty insertion at the cursor, which the continuation
+    // heuristics rightly call empty — but the edits are the whole answer, so the
+    // reply counts as usable and must not be reported as "nothing came back".
+    const hasEdits = edits.length > 0
+    const showable = accepted || hasEdits
+
     // The GUI shows nothing when the answer is empty, so every attempt records
     // what it was and what came back; without this line "smart Tab does not
     // work" is impossible to tell apart from "the model answered nothing".
@@ -616,46 +968,418 @@ export function apply(ctx, config) {
       language: document.language,
       provider: used.provider,
       model: used.model,
+      modelSource,
+      effort: effortUsed ?? '',
       rawChars: text.length,
       answerChars: result.length,
       ms: Date.now() - startedAt,
       attempts: attempts.length,
+      efforts: effortsAdvertised,
+      flushed,
       chunkTypes: [...chunkTypes],
       finishReason,
-      error: streamError,
-      firstChunk,
+      error: streamError !== '',
+      kind,
+      planKind: plan.kind,
+      planChars: plan.insertText.length,
+      planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
+      removedChars: plan.removedText.length,
+      editCount: edits.length,
+      suppressed: showable ? (accepted ? '' : 'edits-only') : verdict.reason,
     })
     // An empty answer is a normal outcome the user has to be able to read, so
-    // it comes back with the same diagnostics block as a real completion.
-    const reason =
-      streamError !== ''
+    // it comes back with the same diagnostics block as a real completion. A
+    // suppressed answer names the check that dropped it. An answer that only
+    // carries edits is not suppressed: the panel says so, and Tab applies them.
+    const reason = !showable
+      ? streamError !== ''
         ? `Модель не ответила: ${streamError}`
         : finishReason === 'length'
-          ? 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
+          ? multiEdit && edits.length === 0
+            ? 'Модель не уложилась в лимит ответа — увеличьте «строк в ответе» или уменьшите число правок.'
+            : 'Модель израсходовала лимит на рассуждения — включите менее «думающую» модель.'
           : text.trim() === ''
             ? 'Модель не вернула продолжение.'
-            : ''
+            : reasonLabel(verdict.reason)
+      : ''
     return {
-      text: result,
+      // `text` stays the final insert text: the client only has to apply it.
+      // A suppressed answer returns an empty string and a reason, never the
+      // rejected code.
+      text: accepted ? plan.insertText : '',
+      requestId,
+      kind,
+      planKind: plan.kind,
+      range: { start: plan.startOffset, end: plan.endOffset },
+      removedText: plan.removedText,
+      // Edits elsewhere in the file, already resolved to offsets. The client
+      // draws them as ghost blocks and applies all of them with Tab in one undo
+      // step, so offsets are never recomputed after the insert.
+      edits,
+      modelVersion,
       provider: used.provider,
       model: used.model,
+      modelSource,
+      effort: effortUsed ?? '',
+      fellBack:
+        attemptsForKind.length > 0 &&
+        (used.provider !== attemptsForKind[0].provider || used.model !== attemptsForKind[0].model),
       durationMs: Date.now() - startedAt,
       reason,
+      suppressed: showable ? undefined : { reason: verdict.reason },
       // The IDE renders these in its output panel: the trajectory explains what
       // was attempted and what came back, the conversation shows the exact text.
       trajectory: {
         attempts: attempts.map(attempt => `${attempt.provider} / ${attempt.model}`),
+        modelSource,
+        effort: effortUsed ?? '',
+        efforts: effortsAdvertised,
+        flushed,
         finishReason,
         streamError,
         chunkTypes: [...chunkTypes],
         rawChars: text.length,
         answerChars: result.length,
-        before: prefix.length,
-        after: suffix.length,
-        explicit: body.explicit === true,
+        before: windowPrefix.length,
+        after: windowSuffix.length,
+        explicit: kind === 'explicit',
+        kind,
+        planKind: plan.kind,
+        planChars: plan.insertText.length,
+        planLines: plan.insertText === '' ? 0 : plan.insertText.split('\n').length,
+        removedChars: plan.removedText.length,
+        edits: edits.length,
+        suppressed: showable ? (accepted ? '' : 'edits-only') : verdict.reason,
       },
-      conversation: { system: systemPrompt, message: requestText, answer: text },
+      ...(preferences.fullTrace === true ? { conversation: { system: systemPrompt, message: requestText, answer: text } } : {}),
     }
+  }
+
+  // ------------------------------------------------------------ inline edit
+
+  async function inlineEdit(body, signal) {
+    const document = documents.get(body.id)
+    if (document === undefined) return fail('no-document', 'Документ не открыт.')
+    if (body.sessionId !== document.sessionId) return fail('wrong-session', 'Документ принадлежит другой сессии.')
+    if (body.token !== document.token) {
+      return fail('stale-client', 'Редактор потерял актуальную версию файла — переоткройте его.')
+    }
+    const preferences = await readPreferences()
+    // Tab permission is not an Edit permission: an owner who allowed inline
+    // hints did not thereby allow sending a selection with an instruction.
+    if (preferences.inlineEditConsent !== true) {
+      return fail('not-opted-in', 'Правка выделения не разрешена — включите её в строке запроса.')
+    }
+    const session = ctx.sessions.get(document.sessionId)
+    if (session === undefined) return fail('no-session', 'Сессия закрыта — правка выделения недоступна.')
+    if (ctx.sandboxPolicy.resolve({ session }).mode === 'read-only') {
+      return fail('read-only', 'Сессия работает в режиме только для чтения — правка выделения недоступна.')
+    }
+    if (completionExcluded(document.displayPath)) {
+      return fail('excluded-file', 'Файл похож на секрет — отправка выделения модели отключена.')
+    }
+    if (excludedFiles.has(fileKey(document.displayPath))) {
+      return fail('excluded-file', 'Правка выделения выключена для этого файла.')
+    }
+
+    const text = String(body.text ?? '')
+    if (text.length > MAX_CONTEXT_TEXT_CHARS) {
+      return fail('context-too-large', 'Файл слишком велик для правки выделения.')
+    }
+    const start = Number(body.start)
+    const end = Number(body.end)
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > text.length || end <= start) {
+      return fail('bad-request', 'Выделение пустое или выходит за пределы файла.')
+    }
+    if (end - start > INLINE_EDIT_MAX_SELECTION) {
+      return fail(
+        'selection-too-large',
+        `Выделение больше ${INLINE_EDIT_MAX_SELECTION} символов — правка выделения недоступна.`,
+      )
+    }
+    const instruction = String(body.instruction ?? '').trim()
+    if (instruction === '') return fail('bad-request', 'Не описано, что изменить.')
+    if (instruction.length > INLINE_EDIT_MAX_INSTRUCTION) {
+      return fail('bad-request', `Инструкция длиннее ${INLINE_EDIT_MAX_INSTRUCTION} символов.`)
+    }
+    const modelVersion = Number.isFinite(Number(body.modelVersion)) ? Number(body.modelVersion) : undefined
+
+    const selection = ctx.agentDefaultModel.currentSelection()
+    if (selection === null || selection === undefined || typeof selection.model !== 'string' || selection.model === '') {
+      return fail('no-model', 'Модель не выбрана — правка выделения недоступна.')
+    }
+    const provider = String(body.provider ?? preferences.completionProvider ?? '').trim() || selection.provider
+    const model = String(body.model ?? preferences.completionModel ?? '').trim() || selection.model
+
+    const fragment = text.slice(start, end)
+    const before = boundLines(text.slice(0, start), INLINE_EDIT_CONTEXT_LINES, 'end')
+    const after = boundLines(text.slice(end), INLINE_EDIT_CONTEXT_LINES, 'start')
+    const requestText = [
+      `Файл: ${document.displayPath}`,
+      `Язык: ${document.language}`,
+      `Задача: ${instruction}`,
+      '',
+      'Контекст файла; менять можно только фрагмент между маркерами.',
+      '--- до фрагмента ---',
+      before,
+      '--- фрагмент ---',
+      fragment,
+      '--- после фрагмента ---',
+      after,
+    ].join('\n')
+
+    const deadline = AbortSignal.timeout(INLINE_EDIT_DEADLINE_MS)
+    const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    const startedAt = Date.now()
+    let buffer = ''
+    let streamError = ''
+    const iterator = ctx.llm.stream({
+      provider,
+      model,
+      system: INLINE_EDIT_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: [{ type: 'text', text: requestText }] }],
+      temperature: 0.2,
+      signal: combined,
+      sessionId: document.sessionId,
+      purpose: 'code-editor-inline-edit',
+    })[Symbol.asyncIterator]()
+    for (;;) {
+      const step = await iterator.next()
+      if (step.done) break
+      const chunk = step.value
+      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') buffer += chunk.text
+      else if (chunk?.type === 'error') {
+        streamError = String(chunk.message ?? chunk.error?.message ?? chunk.error ?? 'unknown')
+      } else if (chunk?.type === 'finish' && chunk.reason?.kind === 'error' && streamError === '') {
+        streamError = String(chunk.reason.failure?.message ?? chunk.reason.failure?.code ?? 'unknown')
+      }
+      if (buffer.length > INLINE_EDIT_MAX_ANSWER) break
+    }
+
+    const replacement = readReplacementAnswer(buffer)
+    // An empty stream, prose or broken JSON is a failure, not a deletion: only
+    // a well-formed `{"replacement":""}` may delete the selection.
+    if (replacement === undefined) {
+      const detail = streamError === '' ? '' : `: ${streamError}`
+      return fail('bad-answer', `Модель вернула ответ не в ожидаемом формате${detail}.`)
+    }
+
+    let proposal
+    try {
+      proposal = createProposal({
+        id: randomUUID(),
+        documentId: document.id,
+        modelVersion,
+        text,
+        eol: document.eol,
+        changes: [{ start, end, oldText: fragment, newText: replacement }],
+      })
+    } catch (error) {
+      if (error instanceof ProposalError) return fail(error.code, error.message)
+      throw error
+    }
+
+    return {
+      proposal,
+      instruction,
+      provider,
+      model,
+      durationMs: Date.now() - startedAt,
+      conversation: preferences.fullTrace === true
+        ? { system: INLINE_EDIT_SYSTEM_PROMPT, message: requestText, answer: buffer }
+        : undefined,
+      trace: {
+        kind: 'inline-edit',
+        explicit: true,
+        rawChars: buffer.length,
+        answerChars: replacement.length,
+        removedChars: fragment.length,
+        streamError,
+      },
+    }
+  }
+
+  // ----------------------------------------------------------------- search
+
+  /**
+   * Literal text search over the session workspace. It is local: no model is
+   * asked and the Tab opt-in does not gate it, because neither the query nor the
+   * matches travel anywhere — the scan happens on the machine running the Host.
+   */
+  async function searchText(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — поиск недоступен.')
+    const query = typeof body.query === 'string' ? body.query.trim() : ''
+    // An empty query never walks the tree: it is not «everything matches».
+    if (query === '') return { query, matches: [], truncated: false, scanned: 0, bytes: 0 }
+    if (query.length > SEARCH_MAX_QUERY) {
+      return fail('bad-request', `Строка поиска длиннее ${SEARCH_MAX_QUERY} символов.`)
+    }
+    const requested = Number(body.limit)
+    const limit = Number.isFinite(requested) && requested > 0
+      ? Math.min(200, Math.floor(requested))
+      : SEARCH_DEFAULT_LIMIT
+    const result = await searchWorkspace(ctx, {
+      cwd: scope.cwd,
+      query,
+      limit,
+      hidden: body.hidden === true,
+      signal,
+    })
+    return { query, ...result }
+  }
+
+  // ------------------------------------------------------ assistant changes
+
+  async function agentChangesRoute(body) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — изменения ассистента недоступны.')
+    return {
+      available: changeTracker.available,
+      turns: changeTracker.list(scope.id),
+    }
+  }
+
+  async function agentChangeDiffRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — изменения ассистента недоступны.')
+    const seq = Number(body.seq)
+    const index = Number(body.index)
+    if (!Number.isSafeInteger(seq) || seq < 0) return fail('bad-request', 'Не указан ход изменений.')
+    if (!Number.isSafeInteger(index) || index < 0) return fail('bad-request', 'Не указан файл.')
+    let diff
+    try {
+      diff = await changeTracker.diff(scope.id, seq, index, signal)
+    } catch (error) {
+      // A snapshot read can fail for a live Session; that is a read error, not
+      // an empty comparison, so it must not look like "nothing changed".
+      return fail(error?.code || 'diff-failed', error instanceof Error ? error.message : String(error))
+    }
+    if (diff === undefined) {
+      return fail('not-found', 'Сравнение недоступно: ход не найден, файла нет в списке или сессия уже закрыта.')
+    }
+    return { diff }
+  }
+
+  // Both routes below need the file a turn touched, read from disk.
+  //
+  // Typed errors instead of `fail()` objects: the two callers word their
+  // refusals differently, so each route catches and maps them itself.
+  async function readTurnFile(scope, diff, signal) {
+    const refuse = (code, message) => Object.assign(new Error(message), { code })
+    const policy = ctx.sandboxPolicy.resolve({ session: scope.session })
+    if (policy.mode === 'read-only') throw refuse('read-only', 'Сессия работает в режиме только для чтения — действие недоступно.')
+    const target = await ctx.fs.resolve(diff.path, { cwd: scope.cwd, signal })
+    const root = await ctx.fs.resolve(scope.cwd, { signal })
+    const displayPath = ctx.fs.processPath(target)
+    if (!ctx.fs.contains(root, target)) throw refuse('outside-workspace', `Файл вне рабочей папки сессии: ${displayPath}`)
+    const info = await ctx.fs.stat(target, signal)
+    if (info === undefined || info.type !== 'file') throw refuse('not-found', `Файла больше нет на диске: ${displayPath}`)
+    if (info.size !== undefined && info.size > MAX_EDIT_BYTES) {
+      throw refuse('too-large', 'Файл больше 1 МиБ — сравнение и откат недоступны.')
+    }
+    const bytes = await ctx.fs.readBytes(target, signal, MAX_EDIT_BYTES + 1)
+    if (bytes.byteLength > MAX_EDIT_BYTES) throw refuse('too-large', 'Файл больше 1 МиБ — сравнение и откат недоступны.')
+    const decoded = decodeUtf8(bytes)
+    if (decoded === undefined) throw refuse('unsupported-encoding', 'Файл не является текстом UTF-8.')
+    // The snapshot speaks LF; the file may hold CRLF, so patch normalized text
+    // and put the file's own line endings and BOM back on the way out.
+    return { policy, target, info, decoded, text: decoded.text.replace(/\r\n/g, '\n') }
+  }
+
+  // Turn start and turn end as full texts, so the editor can show a real
+  // side-by-side diff instead of a list of hunks.
+  async function agentChangeTextRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — сравнение правок ассистента недоступно.')
+    const seq = Number(body.seq)
+    const index = Number(body.index)
+    if (!Number.isSafeInteger(seq) || seq < 0) return fail('bad-request', 'Не указан ход изменений.')
+    if (!Number.isSafeInteger(index) || index < 0) return fail('bad-request', 'Не указан файл.')
+
+    let diff
+    try {
+      diff = await changeTracker.diff(scope.id, seq, index, signal)
+    } catch (error) {
+      return fail(error?.code || 'diff-failed', error instanceof Error ? error.message : String(error))
+    }
+    if (diff === undefined) {
+      return fail('not-found', 'Сравнение недоступно: ход не найден, файла нет в списке или сессия уже закрыта.')
+    }
+    if (diff.kind !== 'text') return fail('not-text', 'Файл не текстовый — сравнение недоступно.')
+
+    let file
+    try {
+      file = await readTurnFile(scope, diff, signal)
+    } catch (error) {
+      return fail(error?.code || 'read-failed', error instanceof Error ? error.message : String(error))
+    }
+    const before = diff.before === false ? '' : revertHunks(file.text, diff.hunks)
+    if (before === undefined) return fail('conflict', 'Файл изменился после хода — сравнение недоступно.')
+    if (diff.before !== false && applyHunks(before, diff.hunks) !== file.text) {
+      return fail('conflict', 'Снимок не сходится с файлом — сравнение недоступно.')
+    }
+    return {
+      path: diff.path,
+      display: diff.display,
+      before,
+      after: file.text,
+      coarse: diff.coarse === true,
+      language: languageOf(diff.path),
+    }
+  }
+
+  // Undo one file of one assistant turn: write the turn-start text back.
+  //
+  // Two guards make this safe: the file must still be inside the session root
+  // and writable, and every hunk must still match the file on disk. A file the
+  // user edited after the turn therefore fails with a conflict instead of being
+  // half-rewritten; the panel shows that as an honest refusal.
+  async function agentChangeRestoreRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откат правок ассистента недоступен.')
+    const seq = Number(body.seq)
+    const index = Number(body.index)
+    if (!Number.isSafeInteger(seq) || seq < 0) return fail('bad-request', 'Не указан ход изменений.')
+    if (!Number.isSafeInteger(index) || index < 0) return fail('bad-request', 'Не указан файл.')
+
+    let diff
+    try {
+      diff = await changeTracker.diff(scope.id, seq, index, signal)
+    } catch (error) {
+      return fail(error?.code || 'diff-failed', error instanceof Error ? error.message : String(error))
+    }
+    if (diff === undefined) {
+      return fail('not-found', 'Сравнение недоступно: ход не найден, файла нет в списке или сессия уже закрыта.')
+    }
+    if (diff.kind !== 'text') return fail('not-text', 'Файл не текстовый — откат недоступен.')
+    if (diff.before === false) return fail('no-before', 'Файла не было до этого хода — откат не поддерживается.')
+
+    let file
+    try {
+      file = await readTurnFile(scope, diff, signal)
+    } catch (error) {
+      return fail(error?.code || 'read-failed', error instanceof Error ? error.message : String(error))
+    }
+
+    const previous = revertHunks(file.text, diff.hunks)
+    if (previous === undefined) {
+      return fail('conflict', 'Файл изменился после хода — откат не выполнен, чтобы не потерять правки.')
+    }
+    if (applyHunks(previous, diff.hunks) !== file.text) {
+      return fail('conflict', 'Снимок не сходится с файлом — откат не выполнен.')
+    }
+
+    const eol = detectEol(file.decoded.text)
+    const content = (file.decoded.bom ? '\uFEFF' : '') + (eol === 'crlf' ? previous.replace(/\n/g, '\r\n') : previous)
+    const outcome = await ctx.fs.writeText(
+      file.target,
+      content,
+      { kind: 'replaceIfVersion', version: file.info.version },
+      signal,
+      file.policy,
+    )
+    return { restored: true, path: diff.path, display: diff.display, version: outcome.version }
   }
 
   // ---------------------------------------------------------------- resolve
@@ -812,6 +1536,42 @@ export function apply(ctx, config) {
     return { path: relative, removed: true }
   }
 
+  // ----------------------------------------------------------------- reveal
+
+  async function revealRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
+    const relative = typeof body.path === 'string' ? body.path.trim() : ''
+    const segments = relative.split(/[\\/]+/)
+    if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
+      return fail('bad-request', 'Укажите путь к файлу или папке внутри рабочей папки.')
+    }
+    const root = await ctx.fs.resolve(scope.cwd, { signal })
+    const target = await ctx.fs.resolve(path.resolve(scope.cwd, relative), { signal })
+    if (!ctx.fs.contains(root, target)) return fail('outside-workspace', 'Показать можно только путь внутри рабочей папки.')
+    const nativePath = ctx.fs.processPath(target)
+    const existing = await stat(nativePath).catch(() => undefined)
+    if (existing === undefined) return fail('not-found', 'Такого файла или папки больше нет — обновите дерево.')
+    try {
+      await launchDetached(revealInvocation(process.platform, nativePath))
+    } catch (error) {
+      return fail('reveal-failed', `Не удалось открыть проводник ОС: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return { path: relative, revealed: true }
+  }
+
+  /** Starts the file manager and lets go of it: the page must not wait for its exit. */
+  function launchDetached(invocation) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(invocation.command, invocation.args, { detached: true, stdio: 'ignore', ...invocation.options })
+      child.once('error', reject)
+      child.once('spawn', () => {
+        child.unref()
+        resolve()
+      })
+    })
+  }
+
   async function stateRoute(body) {
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
@@ -829,10 +1589,12 @@ export function apply(ctx, config) {
   }
 
   async function prefsRoute(body) {
+    // The shipped instruction travels with the preferences so the drawer can show
+    // it as the placeholder of the field: an empty field means "this text".
     if (body.patch !== undefined && typeof body.patch === 'object' && body.patch !== null) {
-      return { preferences: await writePreferences(body.patch) }
+      return { preferences: await writePreferences(body.patch), promptDefault: DEFAULT_SYSTEM_PROMPT }
     }
-    return { preferences: await readPreferences() }
+    return { preferences: await readPreferences(), promptDefault: DEFAULT_SYSTEM_PROMPT }
   }
 
   // ----------------------------------------------------------------- assets
@@ -857,6 +1619,20 @@ export function apply(ctx, config) {
 }
 
 // -------------------------------------------------------------------- pure
+
+/**
+ * Command line that opens the OS file manager with `absolutePath` selected.
+ * The path is an argument, never a shell word, so a file name cannot become a
+ * command. Windows and macOS can select the entry itself; a Linux file manager
+ * only opens a folder, which is the one containing the entry.
+ */
+export function revealInvocation(platform, absolutePath) {
+  if (platform === 'win32') {
+    return { command: 'explorer.exe', args: [`/select,"${absolutePath}"`], options: { windowsVerbatimArguments: true } }
+  }
+  if (platform === 'darwin') return { command: 'open', args: ['-R', absolutePath] }
+  return { command: 'xdg-open', args: [path.dirname(absolutePath)] }
+}
 
 function assetPathOf(pathname) {
   if (typeof pathname !== 'string' || !pathname.startsWith(`${ASSET_PREFIX}/`)) return undefined
@@ -945,6 +1721,78 @@ function relativeOf(cwd, displayPath) {
 function clip(text, limit, side) {
   if (text.length <= limit) return text
   return side === 'end' ? text.slice(text.length - limit) : text.slice(0, limit)
+}
+
+/** A preference that must stay inside a range, with a learned default. */
+function boundedMs(value, fallback, min, max) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return fallback
+  return Math.min(max, Math.max(min, Math.round(number)))
+}
+
+/**
+ * Reasoning levels to try, cheapest first.
+ *
+ * An empty preference means "whatever the provider does by default": every
+ * extra level costs a rejected request first, and the adapter validates the
+ * level against the model's own declaration. `off` stays available because it
+ * is the only level that stops a DeepSeek-style gateway from spending the whole
+ * budget on hidden reasoning — but a route that does not know it refuses the
+ * call before any network I/O, so the fallback is cheap. `undefined` is
+ * "provider default" and closes the chain.
+ */
+const EFFORT_LEVELS = ['off', 'low', 'medium', 'high']
+function effortChainFor(value) {
+  const wanted = typeof value === 'string' ? value.trim() : ''
+  // The empty level is a deliberate choice, not a missing value: asking for it
+  // first is what a provider without a usable `off` needs to answer at all.
+  if (wanted === '') return [undefined]
+  const chain = [wanted]
+  for (const level of EFFORT_LEVELS) {
+    if (!chain.includes(level)) chain.push(level)
+  }
+  // `undefined` closes the chain with "provider default": something has to run
+  // even if every named level is rejected.
+  chain.push(undefined)
+  return chain
+}
+
+function isUnsupportedEffort(message) {
+  return /UNSUPPORTED_REASONING_EFFORT|unsupported reasoning effort|does not support reasoning effort|invalid thinking/i.test(
+    String(message ?? ''),
+  )
+}
+
+/**
+ * Whether the line under the cursor is a comment.
+ *
+ * The editor knows the grammar of every language Monaco shipped; the Host only
+ * needs the cheap answer, because the setting exists to stop suggestions inside
+ * comments, not to parse them.
+ */
+const COMMENT_LINE = /^\s*(?:\/\/|#|--|\/\*|\*|<!--|;;|%|"""|''')/
+function looksLikeCommentLine(text) {
+  const lines = String(text ?? '').split('\n')
+  return COMMENT_LINE.test(lines[lines.length - 1] ?? '')
+}
+
+/**
+ * Client-reported rejection history, bounded on the way in.
+ *
+ * The IDE keeps the list per tab; a request may carry at most twenty entries of
+ * two thousand characters each, so an old entry can never grow a request.
+ */
+function readRecords(value) {
+  if (!Array.isArray(value)) return []
+  const records = []
+  for (const entry of value.slice(0, 20)) {
+    if (entry === null || typeof entry !== 'object') continue
+    const text = typeof entry.text === 'string' ? entry.text.slice(0, 2000) : ''
+    if (text === '') continue
+    const at = Number(entry.at)
+    records.push({ text, at: Number.isFinite(at) ? at : Date.now() })
+  }
+  return records
 }
 
 /**

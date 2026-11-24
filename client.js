@@ -23,6 +23,9 @@ window.__ModuleLoader__.load({
 
     const TAB_ID = '@local/dsh-ide'
     const TAB_KIND = 'dsh-ide'
+    // Bumped with every change that has to reach the browser: the number is
+    // shown in the settings drawer, so "did the tab reload?" stops being a guess.
+    const UI_BUILD = '2026-11-24.10'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -200,9 +203,10 @@ window.__ModuleLoader__.load({
     const openListeners = new Set()
     let openNonce = 0
 
-    function requestOpen(sessionId, filePath) {
+    function requestOpen(sessionId, filePath, lineRange) {
       const path = normalPath(filePath)
-      const request = { path, nonce: ++openNonce }
+      const bounds = chipBounds(lineRange)
+      const request = { path, nonce: ++openNonce, lineRange: bounds === undefined ? undefined : { start: bounds.from, end: bounds.to } }
       pendingOpens.set(sessionId, request)
       for (const listener of openListeners) {
         try {
@@ -234,6 +238,181 @@ window.__ModuleLoader__.load({
       const parts = String(filePath ?? '').split('/')
       parts.pop()
       return parts.join('/')
+    }
+
+    // DSH's own mention shape: a file is `@path`, a directory keeps its trailing
+    // slash (`@dir/`), and a path with spaces is quoted. The transcript parses
+    // exactly these forms back into reference chips, so this is the token both
+    // the drag source and the drop target hand to the composer.
+    // Shortcut for "add this file (and the lines selected in it) to the chat".
+    // It only fires while the IDE panel holds focus: the panel cannot claim a
+    // global chord, DSH's own keymap owns those.
+    const ADD_TO_CHAT_KEY = 'Ctrl+Alt+C'
+
+    const MENTION_UNSAFE = /[\u0000-\u001f\u007f-\u009f"]/u
+    function mentionText(filePath, directory) {
+      const path = normalPath(filePath)
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '')
+      if (path === '') return ''
+      const target = directory === true ? `${path}/` : path
+      if (MENTION_UNSAFE.test(target)) return ''
+      return /\s/u.test(target) ? `@"${target}"` : `@${target}`
+    }
+
+    function mentionLabel(token) {
+      const trimmed = String(token ?? '')
+        .replace(/^@+/, '')
+        .replace(/^"|"$/g, '')
+        .replace(/\/+$/, '')
+      return baseName(trimmed)
+    }
+
+    // A chip this plugin puts into the composer carries its line range inside
+    // itself: the draft shows `state.js:13-19`, and the message keeps
+    // `@state.js (строки 13-19)`. DSH's own `@` source serializes a reference to
+    // the bare path, so the lines would be lost on send; a second source of our
+    // own is the only hook the shell offers for a custom serialization. The
+    // fragment stays out of the visible token:
+    // `#L13-L19` rides after it and is stripped before the path is resolved.
+    const CHIP_SOURCE = 'dsh-ide-file'
+    const CHIP_RANGE = /#L(\d+)(?:-L?(\d+))?$/u
+
+    function chipBounds(lineRange) {
+      if (lineRange === undefined || lineRange === null) return undefined
+      if (typeof lineRange.start !== 'number' || typeof lineRange.end !== 'number') return undefined
+      const from = Math.max(1, Math.round(Math.min(lineRange.start, lineRange.end)))
+      const to = Math.max(1, Math.round(Math.max(lineRange.start, lineRange.end)))
+      return { from, to }
+    }
+
+    function chipRangeWord(range) {
+      return range.from === range.to ? `строка ${range.from}` : `строки ${range.from}-${range.to}`
+    }
+
+    function chipRef(token, lineRange) {
+      const mention = String(token ?? '')
+      if (mention === '') return ''
+      const range = chipBounds(lineRange)
+      if (range === undefined) return mention
+      return `${mention}#L${range.from}${range.from === range.to ? '' : `-L${range.to}`}`
+    }
+
+    function parseChipRef(ref) {
+      const text = String(ref ?? '').trim()
+      if (text === '') return undefined
+      const match = CHIP_RANGE.exec(text)
+      const mention = match === null ? text : text.slice(0, match.index)
+      const path = mention
+        .replace(/^@/u, '')
+        .replace(/^"(.*)"$/u, '$1')
+        .replace(/\/+$/u, '')
+      if (path === '') return undefined
+      const range =
+        match === null ? undefined : chipBounds({ start: Number(match[1]), end: Number(match[2] ?? match[1]) })
+      return { path, range }
+    }
+
+    // The text a chip turns into when the draft is serialized for sending. The
+    // transcript still draws one chip for `@state.js`; the lines follow as
+    // prose, which is the only shape the model can read (a path with a range
+    // suffix would not resolve as a reference).
+    function chipMessageText(ref) {
+      const text = String(ref ?? '').trim()
+      const parsed = parseChipRef(text)
+      if (parsed === undefined || parsed.range === undefined) return text
+      const mention = text.slice(0, text.search(CHIP_RANGE))
+      return `${mention} (${chipRangeWord(parsed.range)})`
+    }
+
+    let chatSourceReady = false
+
+    function chatSource() {
+      return {
+        trigger: '@',
+        name: CHIP_SOURCE,
+        // Chips are inserted, never typed: the `@` menu must not grow a second
+        // file group, so the source answers no candidates.
+        showGroupTitle: false,
+        candidates: () => Promise.resolve([]),
+        onPick: () => undefined,
+        openReference: (session, reference) => openChipReference(session, reference),
+        codec: {
+          // The text the chip shows (and copies) is the mention itself; the
+          // range fragment is ours alone and never leaves the ref.
+          clipboardText: (ref) => {
+            const text = String(ref ?? '')
+            const at = text.search(CHIP_RANGE)
+            return at < 0 ? text : text.slice(0, at)
+          },
+          serialize: (ref) => Promise.resolve(chipMessageText(ref)),
+        },
+      }
+    }
+
+    // Registered once, on the first chip: the `inputTriggers` service belongs
+    // to the shell and may not exist yet when this plugin applies.
+    function ensureChatSource() {
+      if (chatSourceReady) return true
+      const ctx = services.ctx
+      if (ctx === undefined || ctx === null || typeof ctx.get !== 'function') return false
+      let triggers
+      try {
+        triggers = ctx.get('inputTriggers')
+      } catch (cause) {
+        return false
+      }
+      if (triggers === undefined || triggers === null || typeof triggers.registerSource !== 'function') return false
+      let dispose
+      try {
+        dispose = triggers.registerSource(chatSource())
+      } catch (cause) {
+        return false
+      }
+      if (typeof dispose !== 'function') return false
+      chatSourceReady = true
+      try {
+        if (typeof ctx.effect === 'function') {
+          // The source dies with the plugin, and the flag that guards its
+          // registration dies with it: a reloaded plugin registers again.
+          ctx.effect(
+            () => () => {
+              chatSourceReady = false
+              try {
+                dispose()
+              } catch (cause) {
+                /* already gone */
+              }
+            },
+            'dsh-ide: @ reference source',
+          )
+        }
+      } catch (cause) {
+        /* the source stands for the life of the app either way */
+      }
+      return true
+    }
+
+    // A click on one of our chips reveals the file in the IDE pane and puts the
+    // selection on the lines the chip names.
+    function openChipReference(session, reference) {
+      const parsed = parseChipRef(reference === undefined || reference === null ? '' : reference.ref)
+      if (parsed === undefined) return false
+      const sessionId = session === undefined || session === null ? undefined : session.sessionId
+      if (typeof sessionId !== 'string' || sessionId === '') return false
+      const sidebar = services.sidebarRight
+      try {
+        if (sidebar && typeof sidebar.openResourceIn === 'function') {
+          sidebar.openResourceIn(sessionId, fileAddress(sessionId, parsed.path), { kind: TAB_KIND })
+        } else if (sidebar && typeof sidebar.openResource === 'function') {
+          sidebar.openResource(fileAddress(sessionId, parsed.path))
+        }
+      } catch (cause) {
+        /* an unwired sidebar must not swallow the click */
+      }
+      const range = parsed.range === undefined ? undefined : { start: parsed.range.from, end: parsed.range.to }
+      requestOpen(sessionId, parsed.path, range)
+      return true
     }
 
     function sessionIdFromElement(element) {
@@ -393,6 +572,144 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------- explorer
 
     /**
+     * Smallest single region two versions of a text differ in: the common
+     * prefix and suffix are the same in both, so one replacement describes the
+     * change. Used for the change history, where storing whole files per edit
+     * would be wasteful.
+     */
+    function changedRegion(before, after) {
+      if (before === after) return undefined
+      let start = 0
+      const limit = Math.min(before.length, after.length)
+      while (start < limit && before.charCodeAt(start) === after.charCodeAt(start)) start += 1
+      let tail = 0
+      while (
+        tail < limit - start &&
+        before.charCodeAt(before.length - 1 - tail) === after.charCodeAt(after.length - 1 - tail)
+      ) {
+        tail += 1
+      }
+      return {
+        start,
+        before: before.slice(start, before.length - tail),
+        after: after.slice(start, after.length - tail),
+      }
+    }
+
+    /**
+     * Review of one assistant turn: the side-by-side comparison plus the list of
+     * files that turn touched. Each file carries the same two decisions Cursor
+     * offers (keep / undo), and the header applies them to the whole turn.
+     *
+     * A component rather than inline JSX: the editor surface of `IdeBody` is
+     * already the largest expression in this file.
+     */
+    function DiffReview({ view, work, onAccept, onRevert, onAcceptAll, onRevertAll, onOpenFile, onClose, containerRef }) {
+      const files = Array.isArray(view.files) ? view.files : []
+      const stateOf = (file) => work[`${view.seq}:${file.index}`]
+      const decided = (file) => {
+        const current = stateOf(file)
+        return current !== undefined && (current.phase === 'accepted' || current.phase === 'reverted')
+      }
+      const busy = files.some((file) => stateOf(file)?.phase === 'saving')
+      const totalAdded = files.reduce((sum, file) => sum + (Number(file.added) || 0), 0)
+      const totalDeleted = files.reduce((sum, file) => sum + (Number(file.deleted) || 0), 0)
+      const phaseLabel = (phase) =>
+        phase === 'accepted' ? 'принято' : phase === 'reverted' ? 'отменено' : phase === 'saving' ? 'откатываю…' : 'не вышло'
+      return h(
+        'div',
+        { className: 'dsh-ide-diffview', 'data-phase': view.phase },
+        h(
+          'div',
+          { className: 'dsh-ide-diffview-head' },
+          h('span', { className: 'dsh-ide-diffview-title' }, view.display || view.path),
+          h(
+            'span',
+            { className: 'dsh-ide-diffview-sub' },
+            `${files.length === 1 ? '1 файл' : `файлов: ${files.length}`} · +${totalAdded} −${totalDeleted} · начало и конец хода`,
+          ),
+          h('span', { className: 'dsh-ide-diffview-spacer' }),
+          view.phase === 'pending' ? h('span', { className: 'dsh-ide-diffview-note' }, 'Читаю снимок…') : null,
+          view.phase === 'failed' ? h('span', { className: 'dsh-ide-diffview-error' }, view.error) : null,
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-diffview-action',
+              disabled: busy,
+              title: 'Оставить правки всех файлов хода',
+              onClick: () => onAcceptAll(),
+            },
+            'Принять все',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-diffview-action dsh-ide-diffview-danger',
+              disabled: busy,
+              title: 'Вернуть все файлы хода к его началу',
+              onClick: () => onRevertAll(),
+            },
+            'Отменить все',
+          ),
+          h('button', { type: 'button', className: 'dsh-ide-diffview-action', onClick: () => onClose() }, 'Закрыть'),
+        ),
+        h('div', { className: 'dsh-ide-diffview-body', ref: containerRef }),
+        files.length === 0
+          ? null
+          : h(
+              'div',
+              { className: 'dsh-ide-diffview-files' },
+              h('div', { className: 'dsh-ide-diffview-files-head' }, files.length === 1 ? '1 файл' : `Файлов: ${files.length}`),
+              files.map((file) => {
+                const display = String(file.display || file.path)
+                const state = stateOf(file)
+                return h(
+                  'div',
+                  { key: String(file.index), className: 'dsh-ide-diffview-file' },
+                  h('span', { className: 'dsh-ide-change-name' }, baseName(display)),
+                  dirName(display) === '' ? null : h('span', { className: 'dsh-ide-change-dir' }, dirName(display)),
+                  h('span', { className: 'dsh-ide-change-added' }, `+${file.added}`),
+                  h('span', { className: 'dsh-ide-change-removed' }, `−${file.deleted}`),
+                  state === undefined
+                    ? null
+                    : h('span', { className: `dsh-ide-assist-work dsh-ide-assist-work-${state.phase}` }, phaseLabel(state.phase)),
+                  h('span', { className: 'dsh-ide-diffview-spacer' }),
+                  h(
+                    'button',
+                    { type: 'button', className: 'dsh-ide-diffview-action', onClick: () => onOpenFile(file.path) },
+                    'Открыть',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-diffview-action',
+                      disabled: decided(file) || busy,
+                      title: 'Оставить правки этого файла как есть',
+                      onClick: () => onAccept(file),
+                    },
+                    'Принять',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-diffview-action dsh-ide-diffview-danger',
+                      disabled: decided(file) || busy,
+                      title: 'Вернуть этот файл к состоянию до хода',
+                      onClick: () => onRevert(file),
+                    },
+                    'Отменить',
+                  ),
+                )
+              }),
+            ),
+      )
+    }
+
+    /**
      * Workspace explorer. Folders load on first expand; the filter box switches
      * the view to a flat, fuzzy list served by the `files` route so a match in
      * a collapsed folder is still findable.
@@ -403,6 +720,18 @@ window.__ModuleLoader__.load({
       const activePath = typeof props.activePath === 'string' ? props.activePath : ''
       const onOpenFile = props.onOpenFile
       const onToggleHidden = props.onToggleHidden
+      const onInsertReference = props.onInsertReference
+      const searchOpen = props.searchOpen === true
+      const onCloseSearch = props.onCloseSearch
+      const changesOpen = props.changesOpen === true
+      const changes = Array.isArray(props.changes) ? props.changes : []
+      const onCloseChanges = props.onCloseChanges
+      const onOpenChange = props.onOpenChange
+      const onRevertChange = props.onRevertChange
+      // Host-side checkpoints: read-only view of what the assistant changed,
+      // fetched on demand because the diff needs a snapshot read per file.
+      const assistant = props.assistant === undefined ? { phase: 'idle', available: true, turns: [], error: '' } : props.assistant
+      const assistantTurns = Array.isArray(assistant.turns) ? assistant.turns : []
       // The menu bar asks for a refresh without owning the tree's internal state.
       const reloadSignal = props.reloadSignal === undefined ? 0 : props.reloadSignal
 
@@ -420,7 +749,19 @@ window.__ModuleLoader__.load({
       // the name is typed straight into the tree instead of a modal dialog.
       const [draft, setDraft] = React.useState(undefined)
       const [draftError, setDraftError] = React.useState('')
+      /** Per-file decision in the assistant list: `{phase, error}` keyed by `seq:index`.
+       * It lives in `IdeBody`, because the same decision has to be visible both
+       * in this list and in the toolbar of the side-by-side comparison. */
+      const assistantWork = props.assistantWork === undefined ? {} : props.assistantWork
+      const onOpenDiff = props.onOpenDiff
+      const onAcceptAssistant = props.onAcceptAssistant
+      const onRevertAssistant = props.onRevertAssistant
       const [rootOpen, setRootOpen] = React.useState(true)
+      // File content search: the panel owns its query and results, the explorer
+      // only decides whether to show it instead of the tree.
+      const [searchQuery, setSearchQuery] = React.useState('')
+      const [searchResult, setSearchResult] = React.useState({ phase: 'idle', matches: [], truncated: false, error: '' })
+      const searchInputRef = React.useRef(undefined)
       const expandedRef = React.useRef(new Set())
       const selected = props.selected
       const selectRow = (path, type) => {
@@ -429,6 +770,41 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         expandedRef.current = expanded
       }, [expanded])
+      // The scan happens on the Host and is local: it works without the Tab
+      // opt-in and never reaches a model. A new keystroke aborts the old walk so
+      // a slow folder cannot answer a query the user already replaced.
+      React.useEffect(() => {
+        if (!searchOpen) return undefined
+        const needle = searchQuery.trim()
+        if (needle === '' || typeof sessionId !== 'string' || sessionId === '') {
+          setSearchResult({ phase: 'idle', matches: [], truncated: false, error: '' })
+          return undefined
+        }
+        const controller = new AbortController()
+        const timer = window.setTimeout(() => {
+          setSearchResult((previous) => ({ ...previous, phase: 'pending', error: '' }))
+          void call('searchText', { sessionId, query: needle, limit: 50 }, controller.signal)
+            .then((payload) => {
+              if (controller.signal.aborted) return
+              const matches = payload !== null && Array.isArray(payload.matches) ? payload.matches : []
+              setSearchResult({ phase: 'ready', matches, truncated: payload?.truncated === true, error: '' })
+            })
+            .catch((cause) => {
+              if (controller.signal.aborted) return
+              if (cause !== null && typeof cause === 'object' && cause.code === 'cancelled') return
+              setSearchResult({ phase: 'failed', matches: [], truncated: false, error: describeError(cause) })
+            })
+        }, 250)
+        return () => {
+          window.clearTimeout(timer)
+          controller.abort()
+        }
+      }, [searchOpen, searchQuery, sessionId])
+      React.useEffect(() => {
+        if (!searchOpen) return undefined
+        const timer = window.setTimeout(() => searchInputRef.current?.focus(), 0)
+        return () => window.clearTimeout(timer)
+      }, [searchOpen])
       // New files and folders land in the selected folder, or next to the
       // selected file, exactly like the VS Code explorer.
       const targetDirectory = () => {
@@ -463,9 +839,18 @@ window.__ModuleLoader__.load({
           items.push({ id: 'toggle', label: expanded.has(target.path) ? 'Свернуть' : 'Развернуть', run: () => toggle(target.path, cache.has(target.path)) })
           items.push({ id: 'new-file', label: 'Новый файл…', run: () => props.onNewFile(target.path) })
           items.push({ id: 'new-folder', label: 'Новая папка…', run: () => props.onNewFolder(target.path) })
+          if (typeof props.onQuoteFile === 'function') {
+            items.push({ id: 'quote', label: 'Добавить в чат', key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, true) })
+          }
           items.push({ separator: true })
         } else {
           items.push({ id: 'open', label: 'Открыть', run: () => onOpenFile(target.path) })
+          if (typeof props.onQuoteFile === 'function') {
+            items.push({ id: 'quote', label: 'Добавить в чат', key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, false) })
+          }
+          if (typeof props.onQuoteLines === 'function') {
+            items.push({ id: 'quote-lines', label: 'Добавить строки в чат…', run: () => props.onQuoteLines(target.path) })
+          }
           items.push({ separator: true })
         }
         items.push({
@@ -474,12 +859,18 @@ window.__ModuleLoader__.load({
           run: () => copy(workspaceRoot === '' ? target.path : `${workspaceRoot.replace(/[\\/]+$/, '')}/${target.path}`),
         })
         items.push({ id: 'copy-relative', label: 'Копировать относительный путь', run: () => copy(target.path) })
+        items.push({
+          id: 'reveal',
+          label: 'Показать в проводнике ОС',
+          run: () => {
+            void call('reveal', { sessionId, path: target.path }).catch((cause) => setError(describeError(cause)))
+          },
+        })
         items.push({ separator: true })
         items.push({ id: 'rename', label: 'Переименовать…', key: 'F2', run: () => props.onRename(target.path, target.name, target.type) })
         items.push({ id: 'delete', label: 'Удалить', key: 'Delete', run: () => props.onDelete(target.path, target.name, target.type) })
         items.push({ separator: true })
         items.push({ id: 'terminal', label: 'Открыть во встроенном терминале', disabled: true, hint: 'Встроенного терминала в IDE нет: плагин не получает PTY.' })
-        items.push({ id: 'reveal', label: 'Показать в проводнике ОС', disabled: true, hint: 'Плагин не имеет доступа к оболочке рабочей машины.' })
         return items
       }
 
@@ -682,6 +1073,16 @@ window.__ModuleLoader__.load({
                     selectRow(file.path, file.type === 'directory' ? 'directory' : 'file')
                     onOpenFile(file.path)
                   },
+                  draggable: true,
+                  onDragStart: (event) => {
+                    const token = mentionText(file.path, file.type === 'directory')
+                    if (token === '') return
+                    // Both payloads carry the mention token, so a drop that lands
+                    // on the chat composer itself also becomes a reference.
+                    event.dataTransfer.setData('application/x-dsh-ide-file', token)
+                    event.dataTransfer.setData('text/plain', token)
+                    event.dataTransfer.effectAllowed = 'copy'
+                  },
                   onContextMenu: (event) => {
                     event.preventDefault()
                     selectRow(file.path, file.type === 'directory' ? 'directory' : 'file')
@@ -725,6 +1126,14 @@ window.__ModuleLoader__.load({
                     selectRow(path, isDirectory ? 'directory' : 'file')
                     if (isDirectory) toggle(path, cache.has(path))
                     else onOpenFile(path)
+                  },
+                  draggable: true,
+                  onDragStart: (event) => {
+                    const token = mentionText(path, isDirectory)
+                    if (token === '') return
+                    event.dataTransfer.setData('application/x-dsh-ide-file', token)
+                    event.dataTransfer.setData('text/plain', token)
+                    event.dataTransfer.effectAllowed = 'copy'
                   },
                   onContextMenu: (event) => {
                     event.preventDefault()
@@ -783,6 +1192,358 @@ window.__ModuleLoader__.load({
         if (rootOpen) walk('', 1)
         if (rootListing === undefined) rows.push(h('div', { key: 'loading', className: 'dsh-ide-tree-empty', style: { paddingLeft: '20px' } }, pending === '' ? 'Загрузка…' : 'Читаю папку…'))
         if (error !== '') rows.unshift(h('div', { key: 'tree-error', className: 'dsh-ide-tree-error' }, error))
+      }
+
+      if (changesOpen) {
+        // The comparison is read per file, on demand: the recorder keeps the
+        // snapshots, and pulling every file of every turn up front would be a
+        // lot of reads for a list the user may not open at all.
+        const assistantKey = (turn, file) => `${turn.seq}:${file.index}`
+        const assistantRows = []
+        if (assistant.phase === 'pending') {
+          assistantRows.push(h('div', { key: 'assistant-pending', className: 'dsh-ide-tree-empty' }, 'Читаю ходы…'))
+        } else if (assistant.phase === 'failed') {
+          assistantRows.push(h('div', { key: 'assistant-error', className: 'dsh-ide-tree-error' }, assistant.error))
+        } else if (assistant.available === false) {
+          assistantRows.push(h('div', { key: 'assistant-off', className: 'dsh-ide-tree-empty' }, 'Этот Host не ведёт контрольные точки ходов'))
+        } else if (assistantTurns.length === 0) {
+          assistantRows.push(h('div', { key: 'assistant-empty', className: 'dsh-ide-tree-empty' }, 'Ассистент ещё не менял файлы в этой сессии'))
+        } else {
+          for (const turn of assistantTurns) {
+            const files = Array.isArray(turn.files) ? turn.files : []
+            assistantRows.push(
+              h(
+                'div',
+                {
+                  key: `turn-${turn.seq}`,
+                  className: turn.stale === true ? 'dsh-ide-assist-turn dsh-ide-assist-turn-stale' : 'dsh-ide-assist-turn',
+                  role: 'listitem',
+                },
+                h(
+                  'div',
+                  { className: 'dsh-ide-assist-turn-head' },
+                  h('span', { className: 'dsh-ide-assist-turn-title' }, turn.turn === 0 ? 'Ход' : `Ход ${turn.turn}`),
+                  h(
+                    'span',
+                    { className: 'dsh-ide-assist-turn-count' },
+                    turn.stale === true ? 'снимок недоступен' : `+${turn.added} −${turn.deleted} · файлов: ${turn.total}`,
+                  ),
+                ),
+                // A stale turn kept its place in the list on purpose: dropping it
+                // would erase history the user already saw, so it is shown greyed
+                // out without actions instead of disappearing.
+                turn.stale === true
+                  ? h(
+                      'div',
+                      { className: 'dsh-ide-assist-note' },
+                      'Снимок хода больше недоступен — сравнение и откат открыть нельзя.',
+                    )
+                  : files.map((file) => {
+                  const key = assistantKey(turn, file)
+                  const display = String(file.display || file.path)
+                  const work = assistantWork[key]
+                  const decided = work !== undefined && (work.phase === 'accepted' || work.phase === 'reverted')
+                  return h(
+                    'div',
+                    { key, className: 'dsh-ide-assist-file' },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-ide-assist-file-head',
+                        title: `${display} — сравнение начала и конца хода`,
+                        onClick: () => {
+                          if (typeof onOpenDiff === 'function') onOpenDiff(turn, file)
+                        },
+                      },
+                      h('span', { className: 'dsh-ide-change-name' }, baseName(display)),
+                      dirName(display) === '' ? null : h('span', { className: 'dsh-ide-change-dir' }, dirName(display)),
+                      file.binary === true ? h('span', { className: 'dsh-ide-assist-flag' }, 'bin') : null,
+                      file.oversized === true ? h('span', { className: 'dsh-ide-assist-flag' }, 'большой') : null,
+                    ),
+                    h(
+                      'div',
+                      { className: 'dsh-ide-change-meta' },
+                      h('span', { className: 'dsh-ide-change-added' }, `+${file.added}`),
+                      h('span', { className: 'dsh-ide-change-removed' }, `−${file.deleted}`),
+                      typeof onOpenFile === 'function'
+                        ? h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-ide-change-revert',
+                              title: 'Открыть файл в редакторе',
+                              onClick: () => onOpenFile(file.path),
+                            },
+                            'Открыть',
+                          )
+                        : null,
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-assist-accept',
+                          disabled: decided || work?.phase === 'saving',
+                          title: 'Оставить правки ассистента как есть',
+                          onClick: () => {
+                            if (typeof onAcceptAssistant === 'function') onAcceptAssistant(turn, file)
+                          },
+                        },
+                        'Принять правки',
+                      ),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-assist-revert',
+                          disabled: decided || work?.phase === 'saving',
+                          title: 'Вернуть файл к состоянию до хода',
+                          onClick: () => {
+                            if (typeof onRevertAssistant === 'function') onRevertAssistant(turn, file)
+                          },
+                        },
+                        'Отменить правки',
+                      ),
+                      work === undefined
+                        ? null
+                        : h(
+                            'span',
+                            { className: `dsh-ide-assist-work dsh-ide-assist-work-${work.phase}` },
+                            work.phase === 'accepted'
+                              ? 'принято'
+                              : work.phase === 'reverted'
+                                ? 'отменено'
+                                : work.phase === 'saving'
+                                  ? 'откатываю…'
+                                  : 'не вышло',
+                          ),
+                    ),
+                    work !== undefined && work.phase === 'failed' && work.error !== ''
+                      ? h('div', { className: 'dsh-ide-assist-error' }, work.error)
+                      : null,
+                  )
+                }),
+              ),
+            )
+          }
+        }
+        const rows =
+          changes.length === 0
+            ? [h('div', { key: 'changes-empty', className: 'dsh-ide-tree-empty' }, 'Принятых правок в этой сессии пока нет')]
+            : changes.map((change) => {
+                const added = change.after === '' ? 0 : change.after.split('\n').length
+                const removed = change.before === '' ? 0 : change.before.split('\n').length
+                const status = change.reverted === true ? 'возвращено' : change.saved === true ? 'сохранено' : 'в буфере'
+                return h(
+                  'div',
+                  { key: String(change.id), className: 'dsh-ide-change-row', role: 'listitem' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-change-head',
+                      title: `${change.path} · ${status}`,
+                      onClick: () => {
+                        if (typeof onOpenChange === 'function') onOpenChange(change)
+                      },
+                    },
+                    h('span', { className: 'dsh-ide-change-name' }, baseName(change.path)),
+                    dirName(change.path) === '' ? null : h('span', { className: 'dsh-ide-change-dir' }, dirName(change.path)),
+                  ),
+                  h(
+                    'div',
+                    { className: 'dsh-ide-change-meta' },
+                    h('span', { className: 'dsh-ide-change-added' }, `+${added}`),
+                    h('span', { className: 'dsh-ide-change-removed' }, `−${removed}`),
+                    h('span', { className: `dsh-ide-change-status dsh-ide-change-${status === 'в буфере' ? 'buffer' : status === 'сохранено' ? 'saved' : 'reverted'}` }, status),
+                    change.error === undefined ? null : h('span', { className: 'dsh-ide-change-error' }, change.error),
+                    change.reverted === true
+                      ? null
+                      : h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-change-revert',
+                            title: 'Вернуть текст до правки',
+                            onClick: () => {
+                              if (typeof onRevertChange === 'function') onRevertChange(change)
+                            },
+                          },
+                          'Вернуть',
+                        ),
+                  ),
+                )
+              })
+        return h(
+          'div',
+          { className: 'dsh-ide-explorer' },
+          h(
+            'div',
+            { className: 'dsh-ide-explorer-head' },
+            h('span', { className: 'dsh-ide-explorer-title' }, 'ИЗМЕНЕНИЯ'),
+            h(
+              'span',
+              { className: 'dsh-ide-explorer-actions' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-icon-button',
+                  title: 'Закрыть список изменений',
+                  'aria-label': 'Закрыть список изменений',
+                  onClick: () => {
+                    if (typeof onCloseChanges === 'function') onCloseChanges()
+                  },
+                },
+                '✕',
+              ),
+            ),
+          ),
+          h('div', { className: 'dsh-ide-change-section' }, 'Правки ассистента'),
+          h('div', { className: 'dsh-ide-change-hint' }, 'Снимок начала и конца хода — не текущий диск'),
+          h('div', { className: 'dsh-ide-tree dsh-ide-assist-list', role: 'list' }, assistantRows),
+          h('div', { className: 'dsh-ide-change-section' }, 'Мои правки'),
+          h('div', { className: 'dsh-ide-change-hint' }, 'Правки этой сессии: принято в буфер, сохранено, возвращено'),
+          h('div', { className: 'dsh-ide-tree dsh-ide-change-list', role: 'list' }, rows),
+        )
+      }
+
+      if (searchOpen) {
+        const statusText =
+          searchResult.phase === 'failed'
+            ? searchResult.error
+            : searchResult.phase === 'pending' && searchResult.matches.length === 0
+              ? 'Ищу…'
+              : searchResult.phase === 'ready'
+                ? `${searchResult.matches.length}${searchResult.truncated ? '+' : ''} совпадений${
+                    searchResult.truncated ? ' · упёрлись в лимит, покажу не всё' : ''
+                  }`
+                : 'Введите текст — поиск идёт по рабочей папке'
+        // Group by file: a flat list of `path:line` rows reads as one grey wall,
+        // and there is no visible boundary between two files with the same name.
+        const groups = []
+        const groupOf = new Map()
+        for (const match of searchResult.matches) {
+          let group = groupOf.get(match.path)
+          if (group === undefined) {
+            group = { path: match.path, hits: [] }
+            groupOf.set(match.path, group)
+            groups.push(group)
+          }
+          group.hits.push(match)
+        }
+        const previewParts = (match) => {
+          const preview = String(match.preview ?? '')
+          const needle = typeof match.match === 'string' ? match.match : ''
+          if (needle === '') return [preview]
+          const at = preview.toLowerCase().indexOf(needle.toLowerCase())
+          if (at < 0) return [preview]
+          return [
+            preview.slice(0, at),
+            h('mark', { key: 'mark', className: 'dsh-ide-search-mark' }, preview.slice(at, at + needle.length)),
+            preview.slice(at + needle.length),
+          ]
+        }
+        const rows =
+          searchResult.phase === 'failed'
+            ? [h('div', { key: 'search-error', className: 'dsh-ide-tree-error' }, searchResult.error)]
+            : searchResult.phase === 'ready' && searchResult.matches.length === 0
+              ? [h('div', { key: 'search-empty', className: 'dsh-ide-tree-empty' }, 'Ничего не найдено')]
+              : groups.map((group) =>
+                  h(
+                    'div',
+                    { key: group.path, className: 'dsh-ide-search-file', role: 'group' },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-search-file-head', title: group.path },
+                      h('span', { className: 'dsh-ide-search-file-name' }, baseName(group.path)),
+                      dirName(group.path) === '' ? null : h('span', { className: 'dsh-ide-search-file-dir' }, dirName(group.path)),
+                      h('span', { className: 'dsh-ide-search-file-count' }, String(group.hits.length)),
+                    ),
+                    group.hits.map((match, index) =>
+                      h(
+                        'div',
+                        {
+                          key: `${match.line}:${match.column}:${index}`,
+                          className: 'dsh-ide-search-row',
+                          role: 'listitem',
+                        },
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-search-hit',
+                            title: `${match.path}:${match.line}:${match.column}`,
+                            onClick: () => {
+                              if (typeof onOpenFile === 'function') onOpenFile(match.path, match.line)
+                            },
+                          },
+                          h('span', { className: 'dsh-ide-search-line' }, String(match.line)),
+                          h('span', { className: 'dsh-ide-search-preview' }, previewParts(match)),
+                        ),
+                        typeof onInsertReference === 'function'
+                          ? h(
+                              'button',
+                              {
+                                type: 'button',
+                                className: 'dsh-ide-icon-button',
+                                title: 'Добавить ссылку в чат',
+                                'aria-label': 'Добавить ссылку в чат',
+                                onClick: () => onInsertReference(match.path, match.line),
+                              },
+                              '@',
+                            )
+                          : null,
+                      ),
+                    ),
+                  ),
+                )
+        return h(
+          'div',
+          { className: 'dsh-ide-explorer' },
+          h(
+            'div',
+            { className: 'dsh-ide-explorer-head' },
+            h('span', { className: 'dsh-ide-explorer-title' }, 'ПОИСК В ФАЙЛАХ'),
+            h(
+              'span',
+              { className: 'dsh-ide-explorer-actions' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-ide-icon-button',
+                  title: 'Закрыть поиск',
+                  'aria-label': 'Закрыть поиск',
+                  onClick: () => {
+                    if (typeof onCloseSearch === 'function') onCloseSearch()
+                  },
+                },
+                '✕',
+              ),
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsh-ide-explorer-search' },
+            h('input', {
+              ref: searchInputRef,
+              className: 'dsh-ide-search-input',
+              type: 'search',
+              value: searchQuery,
+              placeholder: 'Текст для поиска',
+              'aria-label': 'Поиск по содержимому файлов',
+              onChange: (event) => setSearchQuery(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key !== 'Escape') return
+                if (searchQuery !== '') setSearchQuery('')
+                else if (typeof onCloseSearch === 'function') onCloseSearch()
+              },
+            }),
+          ),
+          h('div', { className: 'dsh-ide-search-status' }, statusText),
+          h('div', { className: 'dsh-ide-tree dsh-ide-search-results', role: 'list' }, rows),
+        )
       }
 
       return h(
@@ -1237,6 +1998,75 @@ window.__ModuleLoader__.load({
       return scored.slice(0, 60).map((entry) => entry.file)
     }
 
+    /**
+     * Command palette. It runs the very same closures the menu bar runs, so a
+     * command cannot exist in one place and be missing or different in the
+     * other; a disabled menu item stays disabled here for the same reason.
+     */
+    function CommandPalette({ commands, onPick, onClose }) {
+      const [query, setQuery] = React.useState('')
+      const needle = query.trim().toLowerCase()
+      const visible = commands.filter(
+        (entry) => needle === '' || `${entry.group} ${entry.label} ${entry.key === undefined ? '' : entry.key}`.toLowerCase().includes(needle),
+      )
+      const run = (entry) => {
+        if (entry.disabled === true) return
+        onPick(entry)
+      }
+      return h(
+        'div',
+        { className: 'dsh-ide-palette-layer', onClick: onClose },
+        h(
+          'div',
+          { className: 'dsh-ide-palette', onClick: (event) => event.stopPropagation() },
+          h('input', {
+            className: 'dsh-ide-palette-input',
+            type: 'text',
+            autoFocus: true,
+            placeholder: 'Команда…',
+            spellCheck: false,
+            value: query,
+            'aria-label': 'Палитра команд',
+            onChange: (event) => setQuery(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                onClose()
+                return
+              }
+              if (event.key !== 'Enter') return
+              event.preventDefault()
+              const first = visible.find((entry) => entry.disabled !== true)
+              if (first === undefined) onClose()
+              else run(first)
+            },
+          }),
+          h(
+            'div',
+            { className: 'dsh-ide-palette-list', role: 'list' },
+            visible.length === 0
+              ? h('div', { className: 'dsh-ide-palette-empty' }, 'Ничего не найдено')
+              : visible.map((entry) =>
+                  h(
+                    'button',
+                    {
+                      key: entry.id,
+                      type: 'button',
+                      className: `dsh-ide-palette-item${entry.disabled === true ? ' dsh-ide-palette-item-off' : ''}`,
+                      disabled: entry.disabled === true,
+                      title: entry.disabled === true ? 'Недоступно' : entry.label,
+                      onClick: () => run(entry),
+                    },
+                    h('span', { className: 'dsh-ide-palette-label' }, entry.label),
+                    h('span', { className: 'dsh-ide-palette-group' }, entry.group),
+                    entry.key === undefined ? null : h('span', { className: 'dsh-ide-palette-key' }, entry.key),
+                  ),
+                ),
+          ),
+        ),
+      )
+    }
+
     function QuickOpen({ files, loading, error, onPick, onClose }) {
       const [query, setQuery] = React.useState('')
       const [index, setIndex] = React.useState(0)
@@ -1512,9 +2342,10 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function SettingsPanel({ preferences, sessionModel, onClose, onSave, onAddModel }) {
+    function SettingsPanel({ preferences, sessionModel, promptDefault, onClose, onSave, onAddModel }) {
       const [provider, setProvider] = React.useState(preferences.completionProvider || '')
       const [model, setModel] = React.useState(preferences.completionModel || '')
+      const [systemPrompt, setSystemPrompt] = React.useState(preferences.systemPrompt || '')
       const [autoSuggest, setAutoSuggest] = React.useState(preferences.autoSuggest !== false)
       const [contextLeft, setContextLeft] = React.useState(String(preferences.contextLeft ?? 4000))
       const [contextRight, setContextRight] = React.useState(String(preferences.contextRight ?? 1000))
@@ -1527,6 +2358,26 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = React.useState('')
       const [query, setQuery] = React.useState('')
       const [section, setSection] = React.useState('completion')
+      // Chord drafts, one per IDE command. Empty means "the default chord"; the
+      // Host stores only the strings that parse and differ from the default.
+      const [keyDraft, setKeyDraft] = React.useState(() => {
+        const initial = {}
+        const stored = keybindingsOf(preferences)
+        for (const command of KEY_COMMANDS) {
+          const saved = stored === undefined || stored === null ? undefined : stored[command.id]
+          initial[command.id] = typeof saved === 'string' && saved !== '' ? saved : command.chord
+        }
+        return initial
+      })
+      // Every Tab knob lives in one object: it starts from the stored
+      // preferences and travels back to the Host as one patch.
+      const [options, setOptions] = React.useState(() => {
+        const initial = {}
+        for (const entry of TAB_PREFERENCES) {
+          initial[entry.key] = preferences[entry.key] === undefined ? entry.value : preferences[entry.key]
+        }
+        return initial
+      })
       const initialProvider = React.useRef(provider).current
 
       const refreshCatalog = React.useCallback(async () => {
@@ -1612,14 +2463,35 @@ window.__ModuleLoader__.load({
           const parsed = Number(value)
           return Number.isFinite(parsed) ? Math.round(parsed) : fallback
         }
-        onSave({
+        const patch = {
           completionProvider: provider,
           completionModel: model,
           autoSuggest,
           contextLeft: toNumber(contextLeft, 4000),
           contextRight: toNumber(contextRight, 1000),
           apiKeyRef: keyRef,
-        })
+          systemPrompt: systemPrompt.trim(),
+        }
+        for (const entry of TAB_PREFERENCES) {
+          patch[entry.key] =
+            entry.kind === 'boolean'
+              ? options[entry.key] === true
+              : entry.kind === 'text'
+                ? String(options[entry.key] ?? entry.value)
+                : toNumber(options[entry.key], entry.value)
+        }
+        const issues = keyIssues()
+        if (issues.size > 0) {
+          setMessage(`Клавиши: ${issues.values().next().value}`)
+          return
+        }
+        const keybindings = {}
+        for (const command of KEY_COMMANDS) {
+          const text = String(keyDraft[command.id] ?? command.chord).trim()
+          if (text !== command.chord) keybindings[command.id] = text
+        }
+        patch.keybindings = keybindings
+        onSave(patch)
       }
 
       const providerOptions = []
@@ -1645,7 +2517,16 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const modelOptions = [h('option', { key: '', value: '' }, 'Первая доступная у провайдера')]
+      const autoModelOn = options.autoModel === undefined ? true : options.autoModel === true
+      const deadlineSetting = TAB_PREFERENCES.find((entry) => entry.key === 'deadlineMs')
+      const deadlineDefault = deadlineSetting === undefined ? 6000 : deadlineSetting.value
+      const modelOptions = [
+        h(
+          'option',
+          { key: '', value: '' },
+          sessionInfo !== undefined ? `Как у сессии (${sessionInfo.model})${autoModelOn ? ' · авто' : ''}` : 'Как у сессии',
+        ),
+      ]
       const knownModels = new Set()
       for (const entry of models) {
         modelOptions.push(h('option', { key: entry.id, value: entry.id }, entry.name || entry.id))
@@ -1706,8 +2587,39 @@ window.__ModuleLoader__.load({
         setting(
           'model',
           'Автодополнение: модель',
-          'Пустое значение — первая модель провайдера.',
+          autoModelOn
+            ? 'Пустое значение — модель сессии, но при включённом автопереключении (ниже) подсказка идёт на быстрой модели из каталога провайдера.'
+            : 'Пустое значение — модель сессии; для другого провайдера — его первая модель.',
           h('select', { className: 'dsh-ide-input dsh-ide-setting-input', value: model, onChange: (event) => setModel(event.target.value) }, modelOptions),
+        ),
+        setting(
+          'auto-model',
+          'Автодополнение: автопереключение модели',
+          'Включено — если модель не выбрана, брать быструю из каталога провайдера. Выключено — подсказки идут на модели сессии. Явно выбранная модель важнее этой настройки.',
+          h(
+            'label',
+            { className: 'dsh-ide-setting-check' },
+            h('input', {
+              type: 'checkbox',
+              checked: autoModelOn,
+              onChange: (event) => setOptions((previous) => ({ ...previous, autoModel: event.target.checked })),
+            }),
+            h('span', {}, 'Брать быструю автоматически'),
+          ),
+        ),
+        setting(
+          'deadline',
+          'Автодополнение: максимальное ожидание',
+          'Сколько миллисекунд ждать ответ, прежде чем показать «Истекло время ожидания подсказки». 1000–60000 (6000 = 6 с, 60000 = 60 с).',
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-input-number',
+            type: 'number',
+            min: 1000,
+            max: 60000,
+            step: 1000,
+            value: String(options.deadlineMs === undefined ? deadlineDefault : options.deadlineMs),
+            onChange: (event) => setOptions((previous) => ({ ...previous, deadlineMs: event.target.value })),
+          }),
         ),
         setting(
           'catalog',
@@ -1722,7 +2634,7 @@ window.__ModuleLoader__.load({
         setting(
           'auto-suggest',
           'Автодополнение: автоподсказки',
-          'Предлагать подсказку по паузе 200 мс; выключено — только по Ctrl+Space.',
+          'Предлагать подсказку по паузе из настройки «Задержка запроса»; выключено — только по Ctrl+Space.',
           h(
             'label',
             { className: 'dsh-ide-setting-check' },
@@ -1787,6 +2699,12 @@ window.__ModuleLoader__.load({
 
       const contextRows = [
         setting(
+          'build',
+          'Сборка интерфейса',
+          'Если номер не совпадает с последним изменением, вкладка IDE работает на старом коде: нажмите Ctrl+Shift+R.',
+          h('span', { className: 'dsh-ide-setting-value' }, UI_BUILD),
+        ),
+        setting(
           'context-left',
           'Контекст: символов до курсора',
           'От 200 до 20000.',
@@ -1814,8 +2732,208 @@ window.__ModuleLoader__.load({
         ),
       ]
 
+      const optionValue = (entry) => (options[entry.key] === undefined ? entry.value : options[entry.key])
+      const optionRow = (entry) => {
+        if (entry.kind === 'boolean') {
+          return setting(
+            entry.key,
+            entry.title,
+            entry.hint,
+            h(
+              'label',
+              { className: 'dsh-ide-setting-check' },
+              h('input', {
+                type: 'checkbox',
+                checked: optionValue(entry) === true,
+                onChange: (event) => setOptions((previous) => ({ ...previous, [entry.key]: event.target.checked })),
+              }),
+              h('span', {}, 'Включено'),
+            ),
+          )
+        }
+        if (entry.kind === 'text') {
+          return setting(
+            entry.key,
+            entry.title,
+            entry.hint,
+            h(
+              'select',
+              {
+                className: 'dsh-ide-input dsh-ide-setting-input',
+                value: String(optionValue(entry)),
+                onChange: (event) => setOptions((previous) => ({ ...previous, [entry.key]: event.target.value })),
+              },
+              (entry.choices === undefined ? [] : entry.choices).map((choice) =>
+                h('option', { key: choice.value, value: choice.value }, choice.label),
+              ),
+            ),
+          )
+        }
+        return setting(
+          entry.key,
+          entry.title,
+          entry.hint,
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-input-number',
+            type: 'number',
+            min: entry.min,
+            max: entry.max,
+            value: String(optionValue(entry)),
+            onChange: (event) => setOptions((previous) => ({ ...previous, [entry.key]: event.target.value })),
+          }),
+        )
+      }
+
+      // Two groups because they answer different questions: "when and what do we
+      // ask" versus "what do we refuse to show".
+      const REQUEST_KEYS = [
+        'completionEffort',
+        'debounceMs',
+        'flushAfterMs',
+        'aboveLines',
+        'belowLines',
+        'answerLines',
+        'rangeReplaceLines',
+        'maxFileChars',
+        'snoozeAfterRejectMs',
+        'multiEdit',
+        'multiEditAuto',
+        'maxEdits',
+        'maxTokens',
+        'wholeFileContext',
+        'noReasoningHint',
+        'rangeReplace',
+        'partialAccept',
+        'refetchAfterAccept',
+        'triggerInComments',
+        'showRemovedDecorations',
+        'explainSuppressed',
+        'fullTrace',
+        'showChat',
+      ]
+      const CHECK_KEYS = [
+        'showWhitespaceOnlyChanges',
+        'maxAddedLines',
+        'recentRejectThreshold',
+        'recentRejectWindowMs',
+        'heuristicDuplicateLine',
+        'heuristicExtendsRange',
+        'heuristicRevertingChange',
+      ]
+      const rowsForKeyList = (keys) =>
+        keys
+          .map((key) => TAB_PREFERENCES.find((entry) => entry.key === key))
+          .filter((entry) => entry !== undefined)
+          .map(optionRow)
+
+      const promptRow = setting(
+        'system-prompt',
+        'Системная инструкция',
+        'С чем редактор обращается к модели. Пустое поле — стандартная инструкция (она показана серым). Подстановки: {{answerLines}}, {{language}}, {{file}}.',
+        h('textarea', {
+          className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-setting-textarea',
+          rows: 6,
+          placeholder: promptDefault === undefined ? '' : promptDefault,
+          value: systemPrompt,
+          onChange: (event) => setSystemPrompt(event.target.value),
+        }),
+      )
+
+      const hintsRows = [promptRow, ...rowsForKeyList(REQUEST_KEYS)]
+      const hintFilterRows = rowsForKeyList(CHECK_KEYS)
+
+      // A chord the user typed may be unparsable or already taken; the section
+      // says which, and `submit` refuses to save while any row is unhappy.
+      const keyIssues = () => {
+        const issues = new Map()
+        const seen = new Map()
+        for (const command of KEY_COMMANDS) {
+          const text = String(keyDraft[command.id] ?? command.chord).trim()
+          if (text === '') {
+            issues.set(command.id, 'Пусто — останется клавиша по умолчанию.')
+            continue
+          }
+          const parsed = parseChord(text)
+          if (parsed === undefined) {
+            issues.set(command.id, 'Не понял клавишу')
+            continue
+          }
+          const signature = `${parsed.ctrl ? 1 : 0}${parsed.alt ? 1 : 0}${parsed.shift ? 1 : 0}${parsed.meta ? 1 : 0}:${parsed.key}`
+          const other = seen.get(signature)
+          if (other !== undefined) {
+            issues.set(command.id, `Занято: ${other.label}`)
+            continue
+          }
+          seen.set(signature, command)
+        }
+        return issues
+      }
+
+      const keyIssuesNow = keyIssues()
+      // The chord list is wide and shallow, so it is a table rather than one
+      // setting block per command: the name column stays readable and the
+      // default chord sits next to the field instead of under the title.
+      const keyCommandRows = (() => {
+        const visible = KEY_COMMANDS.filter((command) => matches(`${command.label} ${command.chord}`))
+        if (visible.length === 0) return []
+        return [
+          h(
+            'div',
+            { className: 'dsh-ide-keys', key: 'keys-table' },
+            h(
+              'div',
+              { className: 'dsh-ide-keys-row dsh-ide-keys-head' },
+              h('span', { className: 'dsh-ide-keys-name' }, 'Команда'),
+              h('span', { className: 'dsh-ide-keys-chord' }, 'Клавиша'),
+              h('span', { className: 'dsh-ide-keys-reset' }, ''),
+            ),
+            visible.map((command) => {
+              const issue = keyIssuesNow.get(command.id)
+              return h(
+                'div',
+                { className: 'dsh-ide-keys-row', key: command.id, 'data-invalid': issue !== undefined },
+                h(
+                  'span',
+                  { className: 'dsh-ide-keys-name' },
+                  command.label,
+                  keyDraft[command.id] === command.chord
+                    ? null
+                    : h('span', { className: 'dsh-ide-keys-default' }, `по умолчанию ${command.chord}`),
+                ),
+                h(
+                  'span',
+                  { className: 'dsh-ide-keys-chord' },
+                  h('input', {
+                    className: 'dsh-ide-input dsh-ide-key-input',
+                    value: keyDraft[command.id],
+                    spellCheck: false,
+                    'aria-label': command.label,
+                    'aria-invalid': issue !== undefined,
+                    onChange: (event) => setKeyDraft((current) => ({ ...current, [command.id]: event.target.value })),
+                  }),
+                  issue === undefined ? null : h('span', { className: 'dsh-ide-key-error' }, issue),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dsh-ide-icon-button dsh-ide-keys-reset',
+                    title: `Вернуть по умолчанию: ${command.chord}`,
+                    onClick: () => setKeyDraft((current) => ({ ...current, [command.id]: command.chord })),
+                  },
+                  '↺',
+                ),
+              )
+            }),
+          ),
+        ]
+      })()
+
       const sections = [
         { id: 'completion', label: 'Автодополнение', rows: completionRows },
+        { id: 'hints', label: 'Подсказки ИИ', rows: hintsRows },
+        { id: 'hints-filters', label: 'Проверки подсказок', rows: hintFilterRows },
+        { id: 'keys', label: 'Клавиши', rows: keyCommandRows },
         { id: 'key', label: 'API-ключ', rows: keyRows },
         { id: 'context', label: 'Контекст', rows: contextRows },
       ]
@@ -1951,6 +3069,34 @@ window.__ModuleLoader__.load({
         props && typeof props.absolutePath === 'string' ? props.absolutePath : fromTab !== undefined ? fromTab.path : ''
       const label = props && typeof props.label === 'string' ? props.label : 'IDE'
       const providedSession = props && typeof props.sessionId === 'string' ? props.sessionId : ''
+      const scope = providedSession !== '' ? providedSession : fromTab !== undefined ? fromTab.sessionId : ''
+      const [openTabId, setOpenTabId] = React.useState('')
+      const tabOpen = openTabId !== ''
+
+      // The IDE lives in the sidebar and can be closed from there, so the button
+      // has to follow the tab inventory instead of guessing from a click. The
+      // inventory holds saved and adopted tabs even while the sidebar is closed.
+      React.useEffect(() => {
+        const sidebar = services.sidebarRight
+        const inventory = sidebar && sidebar.openTabs
+        if (scope === '' || !inventory || typeof inventory.getSnapshot !== 'function' || typeof inventory.subscribe !== 'function') {
+          return undefined
+        }
+        const read = () => {
+          let tabs
+          try {
+            tabs = inventory.getSnapshot()
+          } catch (cause) {
+            return
+          }
+          if (!Array.isArray(tabs)) return
+          const match = tabs.find((entry) => entry && entry.sessionId === scope && entry.kind === TAB_KIND)
+          setOpenTabId(match && typeof match.tabId === 'string' ? match.tabId : '')
+        }
+        read()
+        const stop = inventory.subscribe(read)
+        return typeof stop === 'function' ? stop : undefined
+      }, [scope])
 
       const open = React.useCallback(
         async (event) => {
@@ -1976,6 +3122,23 @@ window.__ModuleLoader__.load({
               setError('Правая панель недоступна')
               return
             }
+            if (openTabId !== '') {
+              // A second press closes only the IDE that is actually on screen.
+              // An open but background or collapsed tab is revealed instead, so
+              // the press never closes something the user cannot see.
+              const active = typeof sidebar.active === 'function' ? sidebar.active() : undefined
+              const expanded = typeof sidebar.isExpanded !== 'function' || sidebar.isExpanded()
+              const showing = typeof sidebar.active !== 'function' || (expanded && active !== undefined && active.id === openTabId)
+              if (showing) {
+                if (typeof sidebar.closeIn === 'function') sidebar.closeIn(sessionId, openTabId)
+                else if (typeof sidebar.close === 'function') sidebar.close(openTabId)
+                else {
+                  setError('Не удалось закрыть IDE')
+                  return
+                }
+                return
+              }
+            }
             requestOpen(sessionId, absolutePath)
             // One IDE tab per session: `multiple: false` makes every open land
             // on the same page address, so the tab is revealed instead of stacked.
@@ -1994,7 +3157,7 @@ window.__ModuleLoader__.load({
             setBusy(false)
           }
         },
-        [absolutePath, fromTab, providedSession],
+        [absolutePath, fromTab, openTabId, providedSession],
       )
 
       return h(
@@ -2005,11 +3168,30 @@ window.__ModuleLoader__.load({
           {
             type: 'button',
             className: 'dsh-ide-action-button',
+            'data-open': tabOpen ? 'true' : 'false',
+            'aria-pressed': tabOpen,
             onClick: open,
             disabled: busy,
-            title: error === '' ? 'Открыть рабочую область в IDE' : error,
+            title: error !== '' ? error : tabOpen ? 'IDE открыта — переключиться или закрыть' : 'Открыть рабочую область в IDE',
           },
-          label,
+          h(
+            'svg',
+            {
+              className: 'dsh-ide-action-icon',
+              viewBox: '0 0 24 24',
+              fill: 'none',
+              stroke: 'currentColor',
+              strokeWidth: 1.6,
+              strokeLinecap: 'round',
+              strokeLinejoin: 'round',
+              'aria-hidden': 'true',
+            },
+            h('rect', { x: 2.5, y: 4, width: 19, height: 16, rx: 2.5 }),
+            h('path', { d: 'M8.5 9.5 6 12l2.5 2.5' }),
+            h('path', { d: 'M15.5 9.5 18 12l-2.5 2.5' }),
+            h('path', { d: 'M13 8.5 11 15.5' }),
+          ),
+          h('span', { className: 'dsh-ide-action-label' }, label),
         ),
         error === '' ? null : h('span', { className: 'dsh-ide-action-error', title: error }, '!'),
       )
@@ -2019,12 +3201,295 @@ window.__ModuleLoader__.load({
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
-function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
-  const entry = trace.length === 0 ? undefined : trace[Math.min(panel.index, trace.length - 1)]
+/**
+ * Why this row shows the model it shows.
+ *
+ * An empty `completionModel` preference means "the session's model", so the
+ * trajectory naming the session model looked like the settings were ignored.
+ * The row now says where the model came from, and the tooltip spells it out.
+ */
+function traceModelHint(row) {
+  if (row === undefined || row === null) return ''
+  const parts = []
+  if (row.modelSource === 'session') parts.push('Своя модель подсказок не выбрана — взята модель сессии.')
+  if (row.modelSource === 'auto') parts.push('Модель подсказок не выбрана — взята быстрая модель провайдера.')
+  if (row.modelSource === 'settings') parts.push('Модель выбрана в настройках подсказок.')
+  if (row.modelSource === 'request') parts.push('Модель передана запросом.')
+  if (row.fellBack === true) parts.push('Первая модель не ответила — сработала запасная.')
+  if (typeof row.effort === 'string' && row.effort !== '') parts.push(`Рассуждения: ${row.effort}.`)
+  return parts.join(' ')
+}
+
+// The editor bundle cannot import the Host modules, so the two primitives the
+// Tab controller needs are duplicated here. Keep them identical to the ones in
+// `tab.js`; `tests/tab.test.mjs` guards the Host side.
+function commonPrefixLengthLocal(left, right) {
+  const limit = Math.min(left.length, right.length)
+  let index = 0
+  while (index < limit && left.charCodeAt(index) === right.charCodeAt(index)) index += 1
+  return index
+}
+
+function nextWordEndLocal(text, start) {
+  if (typeof text !== 'string') return start
+  if (start >= text.length) return text.length
+  let index = start
+  while (index < text.length && /\s/.test(text[index])) index += 1
+  if (index >= text.length) return text.length
+  if (/\w/.test(text[index])) {
+    while (index < text.length && /\w/.test(text[index])) index += 1
+    return index
+  }
+  return index + 1
+}
+
+// One table drives both the settings rows and the patch sent to the Host, so a
+// new knob cannot be shown without also being saved. Bounds here are only for
+// the inputs: `prefs.js` clamps the stored value again on the Host.
+const TAB_PREFERENCES = [
+  {
+    key: 'completionEffort',
+    kind: 'text',
+    value: '',
+    choices: [
+      { value: '', label: 'по умолчанию у провайдера' },
+      { value: 'off', label: 'off — без рассуждений (быстро)' },
+      { value: 'low', label: 'low — минимум рассуждений' },
+      { value: 'medium', label: 'medium — средне' },
+      { value: 'high', label: 'high — подробные рассуждения' },
+    ],
+    title: 'Подсказки: уровень рассуждений',
+    hint: 'Пусто — как решит провайдер. off отключает «размышления» и ускоряет ответ, но не все модели его принимают: такой запрос отклоняется сразу и повторяется с low.',
+  },
+  { key: 'deadlineMs', kind: 'number', value: 6000, min: 1000, max: 60000, title: 'Подсказки: предел ожидания', hint: 'Сколько миллисекунд ждать ответ, прежде чем сдаться (1000–60000).' },
+  { key: 'flushAfterMs', kind: 'number', value: 250, min: 0, max: 5000, title: 'Подсказки: показывать начало ответа', hint: 'Сколько миллисекунд собирать текст после первого символа, прежде чем показать его.' },
+  { key: 'debounceMs', kind: 'number', value: 500, min: 50, max: 3000, title: 'Подсказки: задержка', hint: 'Пауза после последней правки перед запросом, мс (50–3000).' },
+  { key: 'aboveLines', kind: 'number', value: 60, min: 0, max: 400, title: 'Подсказки: строк до курсора', hint: 'Сколько строк перед курсором видит модель (0–400).' },
+  { key: 'belowLines', kind: 'number', value: 20, min: 0, max: 200, title: 'Подсказки: строк после курсора', hint: 'Сколько строк после курсора видит модель (0–200).' },
+  { key: 'answerLines', kind: 'number', value: 5, min: 1, max: 20, title: 'Подсказки: длина ответа', hint: 'Просить продолжение не длиннее N строк (1–20).' },
+  { key: 'rangeReplaceLines', kind: 'number', value: 2, min: 0, max: 8, title: 'Подсказки: строк для замены', hint: 'Сколько строк после курсора разрешено переписать (0 — только вставка).' },
+  { key: 'maxFileChars', kind: 'number', value: 1000000, min: 1000, max: 5000000, title: 'Подсказки: размер файла', hint: 'Файлы длиннее этого числа символов не получают подсказок.' },
+  { key: 'maxAddedLines', kind: 'number', value: 20, min: 1, max: 200, title: 'Проверка: рост ответа', hint: 'Отклонять ответ, добавляющий больше N строк.' },
+  { key: 'recentRejectThreshold', kind: 'number', value: 3, min: 0, max: 10, title: 'Проверка: порог повторов', hint: 'Не повторять отклонённое N раз; 0 — выключить проверку.' },
+  { key: 'recentRejectWindowMs', kind: 'number', value: 300000, min: 0, max: 600000, title: 'Проверка: память отказов', hint: 'Сколько миллисекунд помнить отклонённое.' },
+  { key: 'snoozeAfterRejectMs', kind: 'number', value: 800, min: 0, max: 5000, title: 'Подсказки: пауза после Escape', hint: 'Не спрашивать модель сразу после отклонения, мс.' },
+  { key: 'multiEdit', kind: 'boolean', value: true, title: 'Подсказки: правки по всему файлу', hint: 'В том же ответе просить правки в других местах файла (сигнатуры, ветки, импорты).' },
+  { key: 'multiEditAuto', kind: 'boolean', value: false, title: 'Подсказки: правки при наборе', hint: 'Просить правки по всему файлу и на обычной паузе, а не только по Ctrl+Space. Такие ответы идут на 2–3 секунды дольше.' },
+  { key: 'maxEdits', kind: 'number', value: 3, min: 0, max: 5, title: 'Подсказки: сколько правок', hint: 'Больше этого числа правок из одного ответа не принимается; 0 — выключить.' },
+  { key: 'maxTokens', kind: 'number', value: 0, min: 0, max: 8000, title: 'Подсказки: лимит токенов ответа', hint: '0 — без ограничения: запрос уходит без maxTokens, и модель останавливается сама. Лимит ниже возможностей модели обрезает ответ посреди правки.' },
+  { key: 'wholeFileContext', kind: 'boolean', value: true, title: 'Подсказки: весь файл в запросе', hint: 'Отправлять файл целиком с отметкой курсора, а не окна вокруг него.' },
+  { key: 'autoModel', kind: 'boolean', value: true, title: 'Подсказки: автопереключение модели', hint: 'Если модель подсказок не выбрана, брать быструю из каталога провайдера, а не модель сессии. Выключите, чтобы подсказки шли на текущей модели.' },
+  { key: 'noReasoningHint', kind: 'boolean', value: true, title: 'Подсказки: сразу кодом', hint: 'Добавлять в инструкцию «не рассуждай вслух: сразу пиши код». Скрытые рассуждения модели это не отключает — их задаёт маршрут.' },
+  { key: 'rangeReplace', kind: 'boolean', value: true, title: 'Подсказки: заменять хвост строки', hint: 'Разрешать замену текста после курсора, а не только вставку.' },
+  { key: 'partialAccept', kind: 'boolean', value: true, title: 'Подсказки: приём по слову', hint: 'Ctrl+→ принимает следующее слово подсказки.' },
+  { key: 'refetchAfterAccept', kind: 'boolean', value: false, title: 'Подсказки: запрос после приёма', hint: 'Сразу спрашивать продолжение после Tab.' },
+  { key: 'triggerInComments', kind: 'boolean', value: true, title: 'Подсказки: в комментариях', hint: 'Подсказывать код сразу после комментария-просьбы.' },
+  { key: 'showWhitespaceOnlyChanges', kind: 'boolean', value: false, title: 'Проверка: пробельные правки', hint: 'Показывать подсказки, меняющие только пробелы.' },
+  {
+    key: 'showRemovedDecorations',
+    kind: 'boolean',
+    value: false,
+    title: 'Подсказки: подсветка замены',
+    hint: 'Красить текст, который перепишет подсказка. По умолчанию выключено: подсветка легко выглядит как чужое выделение.',
+  },
+  { key: 'fullTrace', kind: 'boolean', value: false, title: 'Полная диагностика подсказок', hint: 'Хранить в панели запрос, исходный код и ответ модели. Выключение очищает эти тексты в текущей панели.' },
+  { key: 'showChat', kind: 'boolean', value: true, title: 'Показывать чат в панели', hint: 'Открывать панель вывода на вкладке «Чат» при запуске IDE. Выключите, чтобы панель не занимала место, пока вы её не откроете.' },
+  { key: 'explainSuppressed', kind: 'boolean', value: true, title: 'Подсказки: причины отказа', hint: 'Писать в «Траектории», почему подсказка скрыта.' },
+  { key: 'heuristicDuplicateLine', kind: 'boolean', value: true, title: 'Проверка: дубль строки', hint: 'Отклонять повтор следующей строки.' },
+  { key: 'heuristicExtendsRange', kind: 'boolean', value: true, title: 'Проверка: повтор диапазона', hint: 'Отклонять ответ, повторяющий исходные строки.' },
+  { key: 'heuristicRevertingChange', kind: 'boolean', value: true, title: 'Проверка: отмена правки', hint: 'Не предлагать текст, который пользователь только что удалил.' },
+]
+
+// Chords the IDE owns. A user override lives in `preferences.keybindings` and is
+// applied at dispatch time instead of at registration: Monaco cannot change a
+// chord after `addCommand`, and a remapped chord must also stop working.
+const KEY_COMMANDS = [
+  { id: 'save', label: 'Сохранить файл', chord: 'Ctrl+S' },
+  { id: 'save-all', label: 'Сохранить всё', chord: 'Ctrl+Shift+S' },
+  { id: 'quick-open', label: 'Открыть файл по имени', chord: 'Ctrl+P' },
+  { id: 'close-tab', label: 'Закрыть вкладку', chord: 'Ctrl+W' },
+  { id: 'next-tab', label: 'Следующая вкладка', chord: 'Ctrl+Tab' },
+  { id: 'prev-tab', label: 'Предыдущая вкладка', chord: 'Ctrl+Shift+Tab' },
+  { id: 'search', label: 'Поиск в файлах', chord: 'Ctrl+Shift+F' },
+  { id: 'command-palette', label: 'Палитра команд', chord: 'Ctrl+Shift+P' },
+  { id: 'quote', label: 'Строки в чат', chord: 'Ctrl+L' },
+  { id: 'add-to-chat', label: 'Файл в чат', chord: 'Ctrl+Alt+C' },
+  { id: 'inline-edit', label: 'Изменить выделение', chord: 'Ctrl+Shift+K' },
+  { id: 'settings', label: 'Параметры', chord: 'Ctrl+,' },
+  { id: 'output', label: 'Журнал подсказок', chord: 'Ctrl+`' },
+]
+
+const COMMAND_HANDLERS = {
+  save: 'saveActive',
+  'save-all': 'saveAll',
+  'quick-open': 'openQuick',
+  'close-tab': 'closeActive',
+  'next-tab': 'nextTab',
+  'prev-tab': 'prevTab',
+  search: 'openSearch',
+  'command-palette': 'openPalette',
+  quote: 'quoteSelection',
+  'add-to-chat': 'addToChat',
+  'inline-edit': 'openInlineEdit',
+  settings: 'openSettings',
+  output: 'toggleOutput',
+}
+
+// Chord name -> Monaco KeyCode name. `+` itself is not bindable: it is the
+// separator.
+const CHORD_KEYS = (() => {
+  const keys = {
+    space: 'Space',
+    tab: 'Tab',
+    enter: 'Enter',
+    escape: 'Escape',
+    esc: 'Escape',
+    up: 'UpArrow',
+    down: 'DownArrow',
+    left: 'LeftArrow',
+    right: 'RightArrow',
+    home: 'Home',
+    end: 'End',
+    pageup: 'PageUp',
+    pagedown: 'PageDown',
+    insert: 'Insert',
+    delete: 'Delete',
+    del: 'Delete',
+    backspace: 'Backspace',
+    ',': 'Comma',
+    '.': 'Period',
+    '/': 'Slash',
+    '\\': 'Backslash',
+    ';': 'Semicolon',
+    "'": 'Quote',
+    '[': 'BracketLeft',
+    ']': 'BracketRight',
+    '-': 'Minus',
+    '=': 'Equal',
+    '`': 'Backquote',
+  }
+  for (let code = 65; code <= 90; code += 1) {
+    const letter = String.fromCharCode(code)
+    keys[letter.toLowerCase()] = `Key${letter}`
+  }
+  for (let digit = 0; digit <= 9; digit += 1) keys[String(digit)] = `Digit${digit}`
+  for (let n = 1; n <= 12; n += 1) keys[`f${n}`] = `F${n}`
+  return keys
+})()
+
+/**
+ * `Ctrl+Shift+K` -> `{ctrl:true, alt:false, shift:true, meta:false, key:'KeyK'}`.
+ * Returns undefined when the text is not a chord the IDE can compare.
+ */
+function parseChord(text) {
+  if (typeof text !== 'string') return undefined
+  const parts = text
+    .toLowerCase()
+    .split('+')
+    .map((part) => part.trim())
+    .filter((part) => part !== '')
+  if (parts.length === 0) return undefined
+  const chord = { ctrl: false, alt: false, shift: false, meta: false, key: '' }
+  for (const part of parts) {
+    if (part === 'ctrl' || part === 'control' || part === 'cmd' || part === 'command') chord.ctrl = true
+    else if (part === 'alt' || part === 'option') chord.alt = true
+    else if (part === 'shift') chord.shift = true
+    else if (part === 'win' || part === 'meta' || part === 'super') chord.meta = true
+    else {
+      const key = CHORD_KEYS[part]
+      if (key === undefined || chord.key !== '') return undefined
+      chord.key = key
+    }
+  }
+  if (chord.key === '') return undefined
+  return chord
+}
+
+/** A parsed chord back to text, for the help window. */
+function chordText(chord) {
+  const parts = []
+  if (chord.ctrl) parts.push('Ctrl')
+  if (chord.alt) parts.push('Alt')
+  if (chord.shift) parts.push('Shift')
+  if (chord.meta) parts.push('Win')
+  const key = chord.key
+  if (/^Key[A-Z]$/.test(key)) parts.push(key.slice(3))
+  else if (/^Digit[0-9]$/.test(key)) parts.push(key.slice(5))
+  else if (/^F[0-9]{1,2}$/.test(key)) parts.push(key)
+  else if (key === 'Escape') parts.push('Esc')
+  else if (key === 'UpArrow') parts.push('↑')
+  else if (key === 'DownArrow') parts.push('↓')
+  else if (key === 'LeftArrow') parts.push('←')
+  else if (key === 'RightArrow') parts.push('→')
+  else parts.push(key)
+  return parts.join('+')
+}
+
+/** Stored overrides, or undefined before the first `state` reply arrives. */
+function keybindingsOf(preferences) {
+  return preferences !== undefined && preferences !== null && typeof preferences === 'object' ? preferences.keybindings : undefined
+}
+
+/** The effective map: a stored override when it parses, the default otherwise. */
+function resolveKeymap(overrides) {
+  const configured = overrides !== undefined && overrides !== null && typeof overrides === 'object' ? overrides : {}
+  const map = new Map()
+  for (const command of KEY_COMMANDS) {
+    const custom = typeof configured[command.id] === 'string' ? parseChord(configured[command.id]) : undefined
+    map.set(command.id, custom !== undefined ? custom : parseChord(command.chord))
+  }
+  return map
+}
+
+// `event.code` is the physical key, so a chord keeps working on a non-Latin
+// layout. Monaco's own `IKeyboardEvent` carries the same DOM-style code.
+const DOM_CODE_ALIASES = {
+  ArrowUp: 'UpArrow',
+  ArrowDown: 'DownArrow',
+  ArrowLeft: 'LeftArrow',
+  ArrowRight: 'RightArrow',
+  NumpadEnter: 'Enter',
+}
+
+function matchChord(keymap, event) {
+  if (keymap === undefined || keymap === null) return undefined
+  const code = typeof event.code === 'string' ? DOM_CODE_ALIASES[event.code] ?? event.code : ''
+  if (code === '') return undefined
+  for (const [id, chord] of keymap) {
+    if (chord === undefined || chord.key !== code) continue
+    if (chord.ctrl !== (event.ctrlKey === true) || chord.alt !== (event.altKey === true)) continue
+    if (chord.shift !== (event.shiftKey === true) || chord.meta !== (event.metaKey === true)) continue
+    return id
+  }
+  return undefined
+}
+
+function OutputPanel({ panel, height, trace, showChat, onTab, onSelect, onAccept, onClose }) {
+  const [menu, setMenu] = React.useState(undefined)
+  React.useEffect(() => {
+    if (menu === undefined) return undefined
+    const close = () => setMenu(undefined)
+    const onKey = (event) => {
+      if (event.key === 'Escape') close()
+    }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [menu])
+  const selected = trace.length === 0 ? undefined : trace[Math.min(panel.index, trace.length - 1)]
+  // Inline edits have no recorded conversation. Do not let their rows blank
+  // the Chat tab: fall back to the newest row that does carry one.
+  const entry = selected !== undefined && selected.conversation !== undefined
+    ? selected
+    : trace.find((row) => row.conversation !== undefined)
   const conversation = entry === undefined ? undefined : entry.conversation
   const system = conversation === undefined ? '' : conversation.system
   const message = conversation === undefined ? '' : conversation.message
   const answer = conversation === undefined ? '' : conversation.answer
+  const chatOpen = showChat !== false && panel.tab === 'chat'
   return h(
     'div',
     { className: 'dsh-ide-panel', style: { height: `${height}px` } },
@@ -2035,25 +3500,27 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
         'button',
         {
           type: 'button',
-          className: panel.tab === 'trajectory' ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
+          className: !chatOpen ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
           onClick: () => onTab('trajectory'),
         },
         'Траектория',
       ),
-      h(
+      showChat === false ? null : h(
         'button',
         {
           type: 'button',
-          className: panel.tab === 'chat' ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
+          className: chatOpen ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
           onClick: () => onTab('chat'),
         },
         'Чат',
       ),
       h('span', { className: 'dsh-ide-panel-spacer' }),
       h('span', { className: 'dsh-ide-panel-hint' }, trace.length === 0 ? 'пока пусто' : `запросов: ${trace.length}`),
-      h('button', { type: 'button', className: 'dsh-ide-panel-close', title: 'Закрыть панель', onClick: onClose }, '×'),
+      showChat === false
+        ? h('button', { type: 'button', className: 'dsh-ide-panel-close', title: 'Закрыть панель', onClick: onClose }, '×')
+        : null,
     ),
-    panel.tab === 'trajectory'
+    !chatOpen
       ? h(
           'div',
           { className: 'dsh-ide-panel-body' },
@@ -2069,17 +3536,47 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                   {
                     key: `${row.at}:${index}`,
                     className: index === panel.index ? 'dsh-ide-trace dsh-ide-trace-active' : 'dsh-ide-trace',
+                    title: row.hint === undefined ? undefined : 'Клик — показать подсказку, правый клик — принять',
                     onClick: () => onSelect(index),
+                    onContextMenu: (event) => {
+                      if (row.hint === undefined) return
+                      event.preventDefault()
+                      event.stopPropagation()
+                      const width = window.innerWidth
+                      const heightNow = window.innerHeight
+                      setMenu({
+                        x: Math.max(4, Math.min(event.clientX, width - 184)),
+                        y: Math.max(4, Math.min(event.clientY, heightNow - 42)),
+                        row,
+                      })
+                    },
                   },
                   h('span', { className: 'dsh-ide-trace-time' }, row.at),
                   h('span', { className: 'dsh-ide-trace-path' }, row.path),
-                  h('span', { className: 'dsh-ide-trace-model' }, `${row.provider} / ${row.model}`),
-                  h('span', { className: 'dsh-ide-trace-mode' }, row.explicit ? 'Ctrl+Space' : 'авто'),
+                  h(
+                    'span',
+                    {
+                      className: 'dsh-ide-trace-model',
+                      title: traceModelHint(row),
+                    },
+                    row.pending === true
+                      ? 'модель думает…'
+                      : `${row.provider} / ${row.model}${
+                          row.fellBack === true ? ' · запасная' : row.modelSource === 'session' ? ' · из сессии' : row.modelSource === 'auto' ? ' · быстрая' : ''
+                        }`,
+                  ),
+                  h(
+                    'span',
+                    { className: 'dsh-ide-trace-mode' },
+                    row.kind === 'inline-edit' ? 'правка' : row.explicit ? 'Ctrl+Space' : 'авто',
+                  ),
                   h('span', { className: 'dsh-ide-trace-meta' }, `${row.before}/${row.after} символов`),
-                  h('span', { className: 'dsh-ide-trace-meta' }, `${row.durationMs} мс`),
-                  row.ok
-                    ? h('span', { className: 'dsh-ide-trace-ok' }, `+${row.chars} символов`)
-                    : h('span', { className: 'dsh-ide-trace-error' }, row.reason || 'пустой ответ'),
+                  h('span', { className: 'dsh-ide-trace-meta' }, row.displayMs === undefined ? `${row.durationMs} мс` : `до показа: ${row.displayMs} мс · Host: ${row.durationMs} мс`),
+                  row.pending === true
+                    ? h('span', { className: 'dsh-ide-trace-pending' }, 'думает…')
+                    : row.ok
+                      ? h('span', { className: 'dsh-ide-trace-ok' }, `+${row.chars} символов`)
+                      : h('span', { className: 'dsh-ide-trace-error' }, row.reason || 'пустой ответ'),
                 ),
               ),
         )
@@ -2088,6 +3585,7 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
           { className: 'dsh-ide-panel-body dsh-ide-chat' },
           entry === undefined
             ? h('div', { className: 'dsh-ide-panel-empty' }, 'Запросов пока не было.')
+            : !conversation ? h('div', { className: 'dsh-ide-panel-empty' }, 'Для этой записи текст не сохранён. Для новых запросов включите «Полная диагностика подсказок» в настройках.')
             : h(
                 'div',
                 null,
@@ -2098,6 +3596,29 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                 h('div', { className: 'dsh-ide-chat-label' }, 'Ответ модели'),
                 h('pre', { className: 'dsh-ide-chat-text' }, answer === '' ? entry.reason || '(пусто)' : answer),
               ),
+        ),
+    menu === undefined
+      ? null
+      : h(
+          'div',
+          {
+            className: 'dsh-ide-context-menu',
+            style: { left: `${menu.x}px`, top: `${menu.y}px` },
+            onMouseDown: (event) => event.stopPropagation(),
+          },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-context-item',
+              onClick: () => {
+                const row = menu.row
+                setMenu(undefined)
+                onAccept(row)
+              },
+            },
+            'Принять правку',
+          ),
         ),
   )
 }
@@ -2113,6 +3634,7 @@ function IdeBody(props) {
       const initialPath = parsed !== undefined ? parsed.path : ''
 
       const hostRef = React.useRef(null)
+      const hintElapsedRef = React.useRef(null)
       const runtime = React.useRef({
         editor: undefined,
         monaco: undefined,
@@ -2122,12 +3644,40 @@ function IdeBody(props) {
         activeKey: '',
         autoSuggest: true,
         lastCompletion: '',
-        ghost: '',
         ghostPosition: undefined,
-        ghostNode: undefined,
-        ghostWidget: undefined,
+        ghostDecorations: [],
+        ghostZone: undefined,
         ghostTimer: 0,
         ghostKey: undefined,
+        // Inline Edit: one selection, one instruction, one reviewable
+        // replacement. The payload never contains Monaco objects.
+        inlineEdit: undefined,
+        inlineSeq: 0,
+        changeSeq: 0,
+        // Effective chord table (`Map` of command id -> parsed chord). Read by the
+        // editor's key dispatch, so a remap takes effect without re-registering.
+        keymap: undefined,
+        // Side-by-side comparison of an assistant turn: `{editor, original, modified}`.
+        diffEditor: undefined,
+        // One-shot caret target requested by a search hit, consumed once the tab
+        // owns the editor model.
+        pendingReveal: undefined,
+        // Controller state for the ported Tab mechanics: the plan the Host
+        // computed, how much of it was already accepted word by word, and the
+        // per-tab histories that feed the bad-case checks.
+        tab: {
+          controller: undefined,
+          plan: undefined,
+          accepted: 0,
+          snoozeUntil: 0,
+          removedDecorations: [],
+          edits: [],
+          editWidgets: [],
+          editDecorations: [],
+          rejections: new Map(),
+          revertions: new Map(),
+          internalEdit: false,
+        },
       })
       const pendingOpens = React.useRef(new Set())
       const handlersRef = React.useRef({})
@@ -2161,9 +3711,24 @@ function IdeBody(props) {
       const [status, setStatus] = React.useState({ kind: 'idle', message: '' })
       const [explorerWidth, setExplorerWidth] = React.useState(220)
       const [showTree, setShowTree] = React.useState(true)
+      const [searchOpen, setSearchOpen] = React.useState(false)
+      const [changes, setChanges] = React.useState([])
+      /** Host checkpoints of assistant turns: `{phase, available, turns, error}`. */
+      const [assistant, setAssistant] = React.useState({ phase: 'idle', available: true, turns: [], error: '' })
+      const [changesOpen, setChangesOpen] = React.useState(false)
+      /** Per-file decision on an assistant turn, keyed `seq:index`. */
+      const [assistantWork, setAssistantWork] = React.useState({})
+      /** Side-by-side comparison over the editor: `{phase, seq, index, path, display, before, after, language, error}`. */
+      const [diffView, setDiffView] = React.useState(undefined)
+      const diffContainerRef = React.useRef(undefined)
+      // Bumped after «Отменить правки» so the pane refetches the turn list
+      // instead of showing a snapshot the Host has already superseded.
+      const [changesReload, setChangesReload] = React.useState(0)
+      const [paletteOpen, setPaletteOpen] = React.useState(false)
       const [explorerSide, setExplorerSide] = React.useState('left')
       const [hidden, setHidden] = React.useState(false)
       const [preferences, setPreferences] = React.useState(undefined)
+      const [promptDefault, setPromptDefault] = React.useState('')
       const [settingsOpen, setSettingsOpen] = React.useState(false)
       const [modelDialog, setModelDialog] = React.useState(false)
       const [createRequest, setCreateRequest] = React.useState(undefined)
@@ -2174,6 +3739,8 @@ function IdeBody(props) {
   const [panel, setPanel] = React.useState(undefined)
   const [panelHeight, setPanelHeight] = React.useState(190)
   const [trace, setTrace] = React.useState([])
+  const [replayHint, setReplayHint] = React.useState(undefined)
+  const showChat = preferences === undefined || preferences.showChat !== false
       const [quick, setQuick] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
@@ -2185,6 +3752,10 @@ function IdeBody(props) {
       const [fontSize, setFontSize] = React.useState(compact || coarsePointer ? 16 : 13)
       const [wordWrap, setWordWrap] = React.useState(compact)
       const [booted, setBooted] = React.useState(false)
+      const [dragOver, setDragOver] = React.useState('')
+      const [quotePrompt, setQuotePrompt] = React.useState(undefined)
+      const [inlineView, setInlineView] = React.useState(undefined)
+      const inlineInputRef = React.useRef(undefined)
       const [selected, setSelected] = React.useState(undefined)
       const [menuSheetOpen, setMenuSheetOpen] = React.useState(false)
       // A deliberate wrap choice outlives an orientation change; the compact
@@ -2216,6 +3787,40 @@ function IdeBody(props) {
 
       const stateRef = React.useRef({})
       stateRef.current = { tabs, activeKey, sessionId, preferences }
+
+      // Settings are read through a ref as well: the editor effect installs the
+      // Tab commands once, so a closure over `preferences` would keep the
+      // values from the first render forever.
+      const prefsRef = React.useRef(undefined)
+      React.useEffect(() => {
+        prefsRef.current = preferences
+      }, [preferences])
+
+      // Turning the chat off must not leave the panel on a tab it no longer shows.
+      // While it is on, the panel is permanent: closed means the setting is off.
+      React.useEffect(() => {
+        if (!booted) return
+        if (showChat) {
+          setPanel((current) => (current === undefined ? { tab: 'chat', index: 0 } : current))
+          return
+        }
+        setPanel(undefined)
+      }, [showChat, booted])
+
+      // Same reason as `prefsRef`: the editor effect installs the key dispatch
+      // once, so the chord table has to be read through a ref.
+      const savedKeybindings = keybindingsOf(preferences)
+      const keymap = React.useMemo(() => resolveKeymap(savedKeybindings), [savedKeybindings])
+      React.useEffect(() => {
+        runtime.current.keymap = keymap
+      }, [keymap])
+
+      const tabPref = (key, fallback) => {
+        const saved = prefsRef.current
+        if (saved === undefined || saved === null) return fallback
+        const value = saved[key]
+        return value === undefined ? fallback : value
+      }
 
       const openFile = React.useCallback(async (filePath, options) => {
         const normalized = normalPath(filePath)
@@ -2255,6 +3860,419 @@ function IdeBody(props) {
         }
       }, [])
 
+      // ------------------------------------------------------------ "в чат"
+      //
+      // Inserts a quoted fragment into the current session's composer draft via
+      // the slot-provided `inputActions`. The full coordinates and the text both
+      // live in `text`; `summary` only controls how the draft displays it (see
+      // docs/dsh-code-editor.md, «Строки в чат»). Nothing is sent to the model:
+      // the user still has to press the ordinary send control.
+      const insertQuote = (text, summary) => {
+        const actions = props && props.inputActions
+        if (!actions || typeof actions.insertQuote !== 'function') {
+          setStatus({ kind: 'error', message: 'Чат недоступен в этой панели' })
+          return false
+        }
+        let accepted = false
+        try {
+          accepted = actions.insertQuote(text, summary) === true
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
+        setStatus(accepted ? { kind: 'ok', message: 'Добавлено в поле ввода' } : { kind: 'error', message: 'Поле ввода занято — очистите его и повторите' })
+        return accepted
+      }
+
+      // P6: «Объяснить» and «Подготовить план» only fill the chat composer with a
+      // ready request about the selection; the model call stays the user's own
+      // press of Enter in the standard composer. Sending from here would grant a
+      // new run nobody asked for.
+      const draftQuestion = (kind) => {
+        const editor = runtime.current.editor
+        const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (editor === undefined || active === undefined) {
+          setStatus({ kind: 'error', message: 'Откройте файл, о котором нужно спросить' })
+          return false
+        }
+        const model = editor.getModel()
+        if (model === null) return false
+        const selection = editor.getSelection()
+        const cursor = editor.getPosition()
+        const hasSelection = selection !== null && !selection.isEmpty()
+        const startLine = hasSelection ? selection.getStartPosition().lineNumber : cursor === null ? 0 : cursor.lineNumber
+        const endLine = hasSelection ? selection.getEndPosition().lineNumber : startLine
+        if (startLine === 0) {
+          setStatus({ kind: 'error', message: 'Курсор редактора недоступен' })
+          return false
+        }
+        const lineCount = model.getLineCount()
+        const from = Math.max(1, Math.min(startLine, endLine))
+        const to = Math.min(lineCount, Math.max(startLine, endLine))
+        let selected
+        if (hasSelection) {
+          selected = model.getValueInRange(selection)
+        } else {
+          const lines = []
+          for (let line = from; line <= to; line += 1) lines.push(model.getLineContent(line))
+          selected = lines.join('\n')
+        }
+        if (selected.trim() === '') {
+          setStatus({ kind: 'error', message: hasSelection ? 'Выделение пустое' : 'Строка пустая' })
+          return false
+        }
+        const actions = props && props.inputActions
+        if (!actions || typeof actions.insertText !== 'function') {
+          setStatus({ kind: 'error', message: 'Чат недоступен в этой панели' })
+          return false
+        }
+        const path = active.path
+        const question = kind === 'plan' ? 'Подготовь план изменения этого кода. Что нужно изменить: ' : 'Объясни этот код. Что именно непонятно: '
+        const language = typeof active.language === 'string' ? active.language : ''
+        const draft = `${question}\n\n${path}:${from}–${to}\n\`\`\`${language}\n${selected}\n\`\`\`\n`
+        const span = typeof actions.captureInsertion === 'function' ? actions.captureInsertion() : undefined
+        try {
+          actions.insertText(draft, span)
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
+        setStatus({ kind: 'ok', message: 'Черновик запроса в поле ввода — проверьте и отправьте сами.' })
+        return true
+      }
+
+      // Quote the current selection (or the current line when nothing is
+      // selected) from the live Monaco model, marking unsaved text as "из
+      // буфера". `lineRange` optionally overrides the selection with an explicit
+      // inclusive 1-based range { start, end }.
+      const quoteEditorFragment = (lineRange) => {
+        const editor = runtime.current.editor
+        const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (editor === undefined || active === undefined) return false
+        const model = editor.getModel()
+        if (model === null) return false
+        const selection = editor.getSelection()
+        const explicit = lineRange !== undefined && typeof lineRange.start === 'number' && typeof lineRange.end === 'number'
+        const cursor = editor.getPosition()
+        const hasSelection = !explicit && selection !== null && !selection.isEmpty()
+        const startLine = explicit ? lineRange.start : hasSelection ? selection.getStartPosition().lineNumber : cursor === null ? 0 : cursor.lineNumber
+        const endLine = explicit ? lineRange.end : hasSelection ? selection.getEndPosition().lineNumber : startLine
+        if (startLine === 0) {
+          setStatus({ kind: 'error', message: 'Курсор редактора недоступен' })
+          return false
+        }
+        const lineCount = model.getLineCount()
+        const from = Math.max(1, Math.min(startLine, endLine))
+        const to = Math.min(lineCount, Math.max(startLine, endLine))
+        let selected
+        if (explicit || !hasSelection) {
+          const lines = []
+          for (let line = from; line <= to; line += 1) lines.push(model.getLineContent(line))
+          selected = lines.join('\n')
+        } else {
+          selected = model.getValueInRange(selection)
+        }
+        if (selected.trim() === '') {
+          setStatus({ kind: 'error', message: hasSelection ? 'Выделение пустое' : 'Строка пустая' })
+          return false
+        }
+        const relativePath = active.path
+        const label = `${relativePath}:${from}–${to}${explicit || hasSelection ? '' : ' · из буфера'}`
+        const text = `${label}\n${selected}`
+        const summary = { label, title: 'Фрагмент из редактора', detail: relativePath, body: selected }
+        return insertQuote(text, summary)
+      }
+
+      // Quote a whole file (or an explicit line range of it) straight from the
+      // explorer without opening it as a tab. Reads the current on-disk bytes
+      // through the Host `open` route so the quote matches what is saved.
+      const quoteFile = async (filePath, lineRange) => {
+        const scope = stateRef.current.sessionId
+        if (typeof scope !== 'string' || scope === '') return false
+        const normalized = normalPath(filePath)
+        const explicit = lineRange !== undefined && typeof lineRange.start === 'number' && typeof lineRange.end === 'number'
+        let payload
+        try {
+          payload = await call('open', { sessionId: scope, path: normalized })
+        } catch (cause) {
+          setStatus({ kind: 'error', message: describeError(cause) })
+          return false
+        }
+        const text = payload === undefined ? '' : payload.text
+        if (typeof text !== 'string' || text.trim() === '') {
+          setStatus({ kind: 'error', message: 'Файл пустой' })
+          return false
+        }
+        const relativePath = payload && typeof payload.relativePath === 'string' && payload.relativePath !== '' ? payload.relativePath : normalized
+        const lines = text.split('\n')
+        let body
+        let from
+        let to
+        if (explicit) {
+          from = Math.max(1, Math.min(lineRange.start, lineRange.end))
+          to = Math.min(lines.length, Math.max(lineRange.start, lineRange.end))
+          body = lines.slice(from - 1, to).join('\n')
+        } else {
+          from = 1
+          to = lines.length
+          body = text
+        }
+        const label = `${relativePath}:${from}–${to}`
+        const summary = { label, title: 'Файл из проводника', detail: relativePath, body }
+        return insertQuote(`${label}\n${body}`, summary)
+      }
+
+      // --------------------------------------------------- ссылка в поле ввода
+      //
+      // The token itself is built by `mentionText`. The lines ride in the chip
+      // caption (`state.js:13-19`), never in the token: a reference resolves as
+      // a path, so `@file:12-40` would be read as a path with a colon in it and
+      // would not open anything.
+      const lineRangeBounds = (lineRange) => {
+        const valid = lineRange !== undefined && typeof lineRange.start === 'number' && typeof lineRange.end === 'number'
+        if (!valid) return undefined
+        return {
+          from: Math.max(1, Math.min(lineRange.start, lineRange.end)),
+          to: Math.max(1, Math.max(lineRange.start, lineRange.end)),
+        }
+      }
+
+      const lineRangeSuffix = (lineRange) => {
+        const bounds = lineRangeBounds(lineRange)
+        if (bounds === undefined) return ''
+        return bounds.from === bounds.to ? ` (строка ${bounds.from})` : ` (строки ${bounds.from}-${bounds.to})`
+      }
+
+      // The chip caption names the file and the lines it points at, the way the
+      // editor's own title does (`state.js:13-19`). It is display only: a
+      // reference is a path, so the lines travel in the label, never in the ref.
+      const chipCaption = (token, lineRange) => {
+        const name = mentionLabel(token)
+        const bounds = lineRangeBounds(lineRange)
+        if (bounds === undefined) return name
+        return bounds.from === bounds.to ? `${name}:${bounds.from}` : `${name}:${bounds.from}-${bounds.to}`
+      }
+
+      // A chip, not a decorated token. The `@` source only answers a click when
+      // the reference arrives with an appearance (`openReference` in the shell
+      // returns false for everything but `file`), and a typed `@path` carries
+      // no appearance at all: the composer still draws it as a reference, but
+      // the click is inert. A chip lives in the session input machine, so ask
+      // that machine for one through the very event the `@` menu uses. When the
+      // hook is out of reach, the plain token below remains the fallback — it
+      // renders the same way, it just is not clickable.
+      const INSERT_REFERENCE = 'slash/input-insert-reference'
+
+      const insertChatChip = (token, appearance, caption, lineRange) => {
+        const actions = props && props.inputActions
+        const context =
+          typeof services.sessionContext === 'function' ? services.sessionContext(sessionId) : undefined
+        if (context === undefined || context === null || typeof context.bail !== 'function') return false
+        if (!actions || typeof actions.captureInsertion !== 'function') return false
+        let span
+        try {
+          span = actions.captureInsertion()
+        } catch (cause) {
+          return false
+        }
+        if (span === null || typeof span !== 'object' || typeof span.start !== 'number') return false
+        const fallback = mentionLabel(token)
+        const label =
+          typeof caption === 'string' && caption !== ''
+            ? caption
+            : appearance === 'folder'
+              ? `${fallback}/`
+              : fallback
+        // Ours when the shell lends the trigger service, the built-in source
+        // otherwise: only ours can turn the lines into message text.
+        const own = ensureChatSource()
+        const reference = {
+          source: own ? CHIP_SOURCE : 'reference',
+          ref: own ? chipRef(token, lineRange) : token,
+          label,
+          appearance,
+          clipboardText: token,
+        }
+        const request = { reference, span }
+        const attempt = (run) => {
+          try {
+            return run() === true
+          } catch (cause) {
+            return false
+          }
+        }
+        // The shell reaches this helper as `actx.bail(actx, name, request)`;
+        // Cordis also exposes it bound to the context. Try the shipped shape
+        // first, then the bound one, and treat a miss as "no chip here".
+        return (
+          attempt(() => context.bail(context, INSERT_REFERENCE, request)) ||
+          attempt(() => context.bail(INSERT_REFERENCE, request))
+        )
+      }
+
+      // Insert plain text at the live caret. This is the same channel the
+      // composer uses for a paste: the draft keeps everything already typed,
+      // and the lexical text-ref decoration turns the token into a reference.
+      const insertChatText = (text) => {
+        const actions = props && props.inputActions
+        if (typeof text !== 'string' || text === '') return false
+        if (!actions || typeof actions.insertText !== 'function' || typeof actions.captureInsertion !== 'function') {
+          return false
+        }
+        try {
+          const span = actions.captureInsertion()
+          if (span === null || typeof span !== 'object' || typeof span.start !== 'number') return false
+          return actions.insertText(` ${text} `, span) === true
+        } catch (cause) {
+          return false
+        }
+      }
+
+      const insertChatToken = (text) => {
+        const actions = props && props.inputActions
+        if (typeof text !== 'string' || text === '') return false
+        if (!actions || typeof actions.insertText !== 'function' || typeof actions.captureInsertion !== 'function') {
+          setStatus({ kind: 'error', message: 'Поле ввода чата недоступно' })
+          return false
+        }
+        const accepted = insertChatText(text)
+        setStatus(
+          accepted
+            ? { kind: 'ok', message: `В поле ввода: ${text}` }
+            : { kind: 'error', message: 'Поле ввода занято — очистите его и повторите' },
+        )
+        return accepted
+      }
+
+      // Link a file (or a directory) into the draft as a clickable reference.
+      const insertChatReference = (filePath, options) => {
+        const settings = options === undefined ? {} : options
+        const directory = settings.directory === true
+        const token = mentionText(filePath, directory)
+        if (token === '') return false
+        const caption = chipCaption(token, settings.lineRange)
+        if (insertChatChip(token, directory ? 'folder' : 'file', caption, settings.lineRange)) {
+          setStatus({ kind: 'ok', message: `В поле ввода: ${caption}` })
+          return true
+        }
+        return insertChatToken(`${token}${lineRangeSuffix(settings.lineRange)}`)
+      }
+
+      // Ask for an optional line range before sending a file to the chat, so the
+      // user can point at a few lines. The prompt is a small modal; Enter (and
+      // the primary button) links the file with the parsed range, the secondary
+      // button quotes the lines' text instead, Escape aborts.
+      const requestQuoteLines = (filePath, directory) => {
+        setQuotePrompt({ path: filePath, directory: directory === true, value: '' })
+      }
+
+      const applyQuoteLines = (mode) => {
+        const request = quotePrompt
+        setQuotePrompt(undefined)
+        if (request === undefined || typeof request.path !== 'string' || request.path === '') return
+        const range = parseLineRange(request.value)
+        if (request.directory === true) {
+          insertChatReference(request.path, { directory: true })
+          return
+        }
+        if (mode === 'text') void quoteFile(request.path, range)
+        else insertChatReference(request.path, { lineRange: range })
+      }
+
+      // Parse "3", "3-7", "3–7" or "3,7" into an inclusive 1-based { start, end }.
+      const parseLineRange = (value) => {
+        if (typeof value !== 'string') return undefined
+        const trimmed = value.trim()
+        if (trimmed === '') return undefined
+        const match = /^\s*(\d+)\s*(?:[-–,]\s*(\d+))?\s*$/.exec(trimmed)
+        if (match === null) return undefined
+        const start = Number(match[1])
+        const end = match[2] === undefined ? start : Number(match[2])
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < 1) return undefined
+        return { start, end }
+      }
+
+      // The lines highlighted in the editor belong to the tab that is active, so
+      // a mention of any other file carries the path alone. An empty selection
+      // is the line the caret sits on, which is what "this line" means in the
+      // status bar too.
+      const selectionPatchFor = (filePath) => {
+        if (activeTab === undefined) return undefined
+        if (normalPath(activeTab.path) !== normalPath(filePath)) return undefined
+        const editor = runtime.current.editor
+        if (editor === undefined) return undefined
+        const model = typeof editor.getModel === 'function' ? editor.getModel() : undefined
+        const selection = typeof editor.getSelection === 'function' ? editor.getSelection() : undefined
+        if (model === undefined || model === null || selection === undefined || selection === null) return undefined
+        const start = Math.max(1, Math.min(selection.startLineNumber, selection.endLineNumber))
+        const end = Math.min(model.getLineCount(), Math.max(selection.startLineNumber, selection.endLineNumber))
+        return { start, end }
+      }
+
+      // One click in the explorer: link the file, and the highlighted lines when
+      // the file is the one open in the editor. Directories always link whole.
+      const addFileToChat = (filePath, directory) => {
+        if (directory === true) return insertChatReference(filePath, { directory: true })
+        return insertChatReference(filePath, { lineRange: selectionPatchFor(filePath) })
+      }
+
+      // Panel-level chord, so the shortcut also works while the explorer holds
+      // focus (Monaco owns it once the editor does).
+      const onRootKeyDown = (event) => {
+        if (event.defaultPrevented === true) return
+        // A chord may be a bare key; inside a text field that would eat typing.
+        const target = event.target
+        if (target !== null && target !== undefined) {
+          const tag = typeof target.tagName === 'string' ? target.tagName : ''
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable === true) return
+        }
+        const id = matchChord(runtime.current.keymap, event)
+        if (id === undefined) return
+        const run = handlersRef.current[COMMAND_HANDLERS[id]]
+        if (typeof run !== 'function') return
+        event.preventDefault()
+        run()
+      }
+
+
+      // Drop target for a row dragged out of the explorer. The transfer already
+      // carries the mention token (`@file`, `@dir/`), so the panel just hands it
+      // to the composer; a drop that lands on the composer itself is handled by
+      // the composer, which reads the same token out of `text/plain`.
+      const mentionFromDrag = (event) => {
+        const transfer = event.dataTransfer
+        if (transfer === undefined || transfer === null) return undefined
+        const direct = transfer.getData('application/x-dsh-ide-file')
+        if (typeof direct === 'string' && direct !== '') return direct
+        const plain = transfer.getData('text/plain')
+        if (typeof plain === 'string' && plain !== '') return plain
+        return undefined
+      }
+
+      const onEditorDragOver = (event) => {
+        const token = mentionFromDrag(event)
+        if (token === undefined) return
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'copy'
+        if (dragOver !== token) setDragOver(token)
+      }
+
+      const onEditorDragLeave = (event) => {
+        if (event.currentTarget !== null && event.currentTarget.contains(event.relatedTarget)) return
+        setDragOver('')
+      }
+
+      const onEditorDrop = (event) => {
+        const token = mentionFromDrag(event)
+        setDragOver('')
+        if (token === undefined) return
+        event.preventDefault()
+        // A plain path from another drop source is upgraded to a mention.
+        const mention = token.startsWith('@') ? token : `@${token}`
+        const appearance = mention.endsWith('/') ? 'folder' : 'file'
+        if (!insertChatChip(mention, appearance)) insertChatToken(mention)
+      }
+
       const saveKey = async (key) => {
         const target = stateRef.current.tabs.find((candidate) => candidate.key === key)
         const model = runtime.current.models.get(key)
@@ -2264,6 +4282,11 @@ function IdeBody(props) {
           return false
         }
         setStatus({ kind: 'busy', message: 'Сохранение…' })
+        // A staged proposal lives in the buffer. Saving must write the file the
+        // user actually has, never the lines a hint is still offering.
+        if (runtime.current.tab.phantom !== undefined && runtime.current.editor !== undefined && runtime.current.editor.getModel() === model) {
+          clearGhost()
+        }
         try {
           const payload = await call('save', {
             id: target.hostId,
@@ -2272,12 +4295,147 @@ function IdeBody(props) {
             text: model.getValue(),
           })
           setTabs((previous) => previous.map((candidate) => (candidate.key === key ? { ...candidate, token: payload.token, dirty: false } : candidate)))
+          setChanges((previous) => previous.map((change) => (change.path === target.path ? { ...change, saved: true } : change)))
           setStatus({ kind: 'ok', message: `Сохранено: ${target.name}` })
           return true
         } catch (cause) {
           setStatus({ kind: 'error', message: describeError(cause) })
           return false
         }
+      }
+
+      const pathOfTab = (key) => {
+        const entry = stateRef.current.tabs.find((candidate) => candidate.key === key)
+        return entry === undefined ? '' : entry.path
+      }
+
+      // Session memory of accepted edits. Only the changed region is kept, so a
+      // big file does not cost its whole text per edit; the history dies with
+      // the session and is never presented as a disk checkpoint.
+      const recordChange = (key, path, beforeText, afterText) => {
+        const region = changedRegion(beforeText, afterText)
+        if (region === undefined) return
+        const end = region.start + region.after.length
+        setChanges((previous) =>
+          [
+            {
+              id: (runtime.current.changeSeq += 1),
+              key,
+              path,
+              start: region.start,
+              before: region.before,
+              after: region.after,
+              ctxBefore: afterText.slice(Math.max(0, region.start - 24), region.start),
+              ctxAfter: afterText.slice(end, end + 24),
+              at: new Date().toLocaleTimeString('ru-RU'),
+              saved: false,
+              reverted: false,
+            },
+            ...previous,
+          ].slice(0, 40),
+        )
+      }
+
+      const openChange = (change) => {
+        const entry = stateRef.current.tabs.find((candidate) => normalPath(candidate.path) === normalPath(change.path))
+        const model = entry === undefined ? undefined : runtime.current.models.get(entry.key)
+        if (model !== undefined) {
+          const position = model.getPositionAt(Math.min(change.start, model.getValueLength()))
+          runtime.current.pendingReveal = { path: normalPath(change.path), line: position.lineNumber }
+        } else {
+          runtime.current.pendingReveal = { path: normalPath(change.path), offset: change.start }
+        }
+        void openFile(change.path, { activate: true })
+      }
+
+      // Reverting works by file path, not by the model that happens to be focused:
+      // a preview, a closed tab or a switched tab must not turn the button into a
+      // silent no-op. Every refusal says why.
+      const revertChange = (change) => {
+        const path = normalPath(change.path === undefined ? '' : change.path)
+        const entry = path === '' ? undefined : stateRef.current.tabs.find((candidate) => normalPath(candidate.path) === path)
+        if (entry === undefined) {
+          setStatus({ kind: 'error', message: 'Файл закрыт — откройте его и нажмите «Вернуть» ещё раз.' })
+          if (path !== '') openChange(change)
+          return
+        }
+        const model = runtime.current.models.get(entry.key)
+        if (model === undefined) {
+          setStatus({ kind: 'error', message: 'Файл закрыт — откройте его и нажмите «Вернуть» ещё раз.' })
+          openChange(change)
+          return
+        }
+        if (stateRef.current.activeKey !== entry.key) {
+          openChange(change)
+          setStatus({ kind: 'ok', message: `Открыл ${path} — нажмите «Вернуть» ещё раз.` })
+          return
+        }
+        // The recorded offset is only a hint. Accepting a hint can move the rest
+        // of the buffer (staged phantom lines are rewritten in the same undo
+        // step), so the edited region is located again by its own text and the
+        // 24-character context on both sides. Exactly one match is required: two
+        // identical candidates are not a guess the button is allowed to make.
+        const text = model.getValue()
+        const locate = () => {
+          const before = change.ctxBefore
+          const after = change.ctxAfter
+          if (change.after !== '') {
+            const hits = []
+            let at = text.indexOf(change.after)
+            while (at !== -1) {
+              if (
+                text.slice(Math.max(0, at - before.length), at) === before &&
+                text.slice(at + change.after.length, at + change.after.length + after.length) === after
+              ) {
+                hits.push(at)
+              }
+              at = text.indexOf(change.after, at + 1)
+            }
+            return hits.length === 1 ? hits[0] : undefined
+          }
+          const anchor = `${before}${after}`
+          if (anchor === '') return undefined
+          const hits = []
+          let at = text.indexOf(anchor)
+          while (at !== -1) {
+            hits.push(at + before.length)
+            at = text.indexOf(anchor, at + 1)
+          }
+          return hits.length === 1 ? hits[0] : undefined
+        }
+        const start = locate()
+        if (start === undefined) {
+          setStatus({ kind: 'error', message: 'Файл изменился — вернуть правку нельзя, откройте сравнение.' })
+          setChanges((previous) => previous.map((candidate) => (candidate.id === change.id ? { ...candidate, error: 'текст изменился' } : candidate)))
+          return
+        }
+        const end = start + change.after.length
+        const monaco = runtime.current.monaco
+        const editor = runtime.current.editor
+        if (monaco === undefined || editor === undefined) {
+          setStatus({ kind: 'error', message: 'Редактор ещё не готов — попробуйте ещё раз.' })
+          return
+        }
+        const startPosition = model.getPositionAt(start)
+        const endPosition = model.getPositionAt(end)
+        const range = new monaco.Range(startPosition.lineNumber, startPosition.column, endPosition.lineNumber, endPosition.column)
+        runtime.current.tab.internalEdit = true
+        try {
+          if (editor.getModel() !== model) editor.setModel(model)
+          editor.pushUndoStop()
+          editor.executeEdits('dsh-ide-revert', [{ range, text: change.before }])
+          editor.pushUndoStop()
+        } catch (cause) {
+          setStatus({ kind: 'error', message: `Не удалось вернуть правку: ${messageOf(cause)}` })
+          return
+        } finally {
+          runtime.current.tab.internalEdit = false
+        }
+        setChanges((previous) =>
+          previous.map((candidate) => (candidate.id === change.id ? { ...candidate, reverted: true, saved: false, error: undefined } : candidate)),
+        )
+        setTabs((previous) => previous.map((candidate) => (candidate.key === entry.key ? { ...candidate, dirty: true } : candidate)))
+        setStatus({ kind: 'ok', message: `Правка возвращена: ${path} (Ctrl+Z отменит сам возврат)` })
       }
 
       const saveAll = async () => {
@@ -2347,41 +4505,398 @@ function IdeBody(props) {
         setTrace((current) => [record, ...current].slice(0, 60))
       }, [])
 
+      // A request that is still running keeps one row in the list and only
+      // refreshes its elapsed time; the row id survives other traces arriving
+      // above it, so a late answer cannot overwrite a newer request.
+      const updateTrace = React.useCallback((id, patch) => {
+        setTrace((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)))
+      }, [])
+
       const toggleOutput = React.useCallback(() => {
+        // The chat is a permanent part of the IDE while its setting is on:
+        // closing it is the setting's job, not a keystroke's.
+        if (prefsRef.current?.showChat !== false) {
+          setPanel({ tab: 'chat', index: 0 })
+          return
+        }
         setPanel((current) => (current === undefined ? { tab: 'trajectory', index: 0 } : undefined))
       }, [])
 
-      const complete = React.useCallback(async (model, position, context, cancelToken) => {
+      // ---------------------------------------------------------------------
+      // Tab suggestions
+      //
+      // The Host does the reasoning: it asks the model, plans a concrete edit
+      // (an insertion or a small replacement) and filters it through the
+      // bad-case checks ported from Cursor's `cppBadHeuristics`. The client only
+      // draws that plan, records whether it was accepted or rejected, and keeps
+      // the histories those checks need. See docs/cursor-tab-mechanics.md.
+      // ---------------------------------------------------------------------
+
+      const remember = (map, key, text) => {
+        if (typeof key !== 'string' || key === '' || typeof text !== 'string') return
+        if (text.trim() === '' || text.length > 2000) return
+        const list = map.get(key) || []
+        list.push({ text, at: Date.now() })
+        map.set(key, list.slice(-20))
+      }
+
+      const clearRemovedDecoration = () => {
+        const editor = runtime.current.editor
+        const decorations = runtime.current.tab.removedDecorations
+        runtime.current.tab.removedDecorations = []
+        if (editor !== undefined && decorations.length > 0) editor.deltaDecorations(decorations, [])
+      }
+
+      // A replacement hides text that the suggestion rewrites. Cursor paints
+      // the part it drops; the same marker keeps the edit honest here.
+      const decorateRemoved = (plan, model) => {
+        clearRemovedDecoration()
+        const editor = runtime.current.editor
+        const monacoInstance = runtime.current.monaco
+        if (editor === undefined || monacoInstance === undefined) return
+        if (plan.kind !== 'replace' || plan.range.end <= plan.range.start) return
+        if (tabPref('showRemovedDecorations', true) !== true) return
+        const start = model.getPositionAt(plan.range.start)
+        const end = model.getPositionAt(plan.range.end)
+        // One line only: a multi-line marker is indistinguishable from a stray
+        // selection, and the edits that matter (a rewritten empty assignment,
+        // an echo of the rest of the line) never span more than one line.
+        if (start.lineNumber !== end.lineNumber) return
+        runtime.current.tab.removedDecorations = editor.deltaDecorations(
+          [],
+          [
+            {
+              range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+              options: { className: 'dsh-ide-ghost-removed' },
+            },
+          ],
+        )
+      }
+
+      // ---------------------------------------------------------------------
+      // Phantom edits elsewhere in the file. The Host located every snippet in
+      // the buffer it sent, so both ends are exact offsets of the current text;
+      // the editor paints the old range and a ghost block with the replacement.
+      // ---------------------------------------------------------------------
+
+      const clearEdits = () => {
+        const state = runtime.current
+        const editor = state.editor
+        const decorations = state.tab.editDecorations
+        state.tab.editDecorations = []
+        if (editor !== undefined && Array.isArray(decorations) && decorations.length > 0) {
+          editor.deltaDecorations(decorations, [])
+        }
+        const widgets = state.tab.editWidgets
+        state.tab.editWidgets = []
+        if (editor !== undefined && Array.isArray(widgets)) {
+          for (const widget of widgets) editor.removeContentWidget(widget)
+        }
+        state.tab.edits = []
+      }
+
+      // ---------------------------------------------------------------------
+      // A block proposal takes room in the buffer. Drawing it as an overlay
+      // printed the new text on top of the code underneath (the two lines merged
+      // in the user's screenshot), so the proposed lines are inserted into the
+      // model for real and the replaced lines are painted pink. Tab deletes the
+      // pink lines and keeps the inserted ones, Esc deletes the inserted ones.
+      // Nothing reaches the file until Tab: the buffer is only staged, and any
+      // other edit reverts the staging first.
+      // ---------------------------------------------------------------------
+      // A block proposal takes room in the buffer, but only where it differs:
+      // the unchanged lines stay exactly where they are, the lines that go away
+      // keep a pink strikethrough, and the lines that arrive are inserted above
+      // them in green. Inserting the whole new block duplicated every unchanged
+      // line, which is what made the preview unreadable. Tab replaces the whole
+      // staged region with the proposed text, Esc puts the original text back;
+      // nothing reaches the file until Tab.
+      // ---------------------------------------------------------------------
+
+      const eolOf = (model) => (model.getEOL() === '\r\n' ? '\r\n' : '\n')
+
+      // Runs a set of offset edits as one internal transaction, so the content
+      // listener does not mistake the staging for typing.
+      const runModelEdits = (operations) => {
+        const editor = runtime.current.editor
+        const monacoInstance = runtime.current.monaco
+        if (editor === undefined || monacoInstance === undefined) return false
+        const model = editor.getModel()
+        if (model === null || operations.length === 0) return false
+        const ranges = []
+        for (const operation of [...operations].sort((left, right) => left.start - right.start)) {
+          const start = model.getPositionAt(Math.max(0, operation.start))
+          const end = model.getPositionAt(Math.max(operation.start, operation.end))
+          ranges.push({
+            range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+            text: operation.text,
+            forceMoveMarkers: true,
+          })
+        }
+        runtime.current.tab.internalEdit = true
+        // Staging is not a user edit: the buffer only holds the proposal, so
+        // the tab must not look modified and cancelling must not count as a
+        // reverted edit.
+        runtime.current.tab.staging = true
+        try {
+          editor.pushUndoStop()
+          editor.executeEdits('dsh-ide', ranges)
+          editor.pushUndoStop()
+        } finally {
+          runtime.current.tab.internalEdit = false
+          runtime.current.tab.staging = false
+        }
+        return true
+      }
+
+      /** Line-level diff: the shortest list of keep/delete/insert operations. */
+      const diffLinesLocal = (before, after) => {
+        const left = before.split('\n')
+        const right = after.split('\n')
+        const rows = left.length
+        const columns = right.length
+        const table = Array.from({ length: rows + 1 }, () => new Array(columns + 1).fill(0))
+        for (let row = rows - 1; row >= 0; row -= 1) {
+          for (let column = columns - 1; column >= 0; column -= 1) {
+            table[row][column] =
+              left[row] === right[column]
+                ? table[row + 1][column + 1] + 1
+                : Math.max(table[row + 1][column], table[row][column + 1])
+          }
+        }
+        const ops = []
+        let row = 0
+        let column = 0
+        while (row < rows && column < columns) {
+          if (left[row] === right[column]) {
+            ops.push({ type: 'same', text: left[row] })
+            row += 1
+            column += 1
+            continue
+          }
+          // Adds come first when the two choices are equally good, so the new
+          // lines are inserted above the ones they replace: a block answer reads
+          // top-down instead of the new imports landing under the old `def`.
+          if (table[row + 1][column] > table[row][column + 1]) {
+            ops.push({ type: 'del', text: left[row] })
+            row += 1
+          } else {
+            ops.push({ type: 'add', text: right[column] })
+            column += 1
+          }
+        }
+        while (row < rows) {
+          ops.push({ type: 'del', text: left[row] })
+          row += 1
+        }
+        while (column < columns) {
+          ops.push({ type: 'add', text: right[column] })
+          column += 1
+        }
+        return ops
+      }
+
+      // Cancels the staging: each staged region gets its original text back, so
+      // the buffer is byte-identical to what the user had before the hint.
+      const clearPhantom = () => {
+        const state = runtime.current
+        const editor = state.editor
+        const phantom = state.tab.phantom
+        state.tab.phantom = undefined
+        if (editor !== undefined && phantom !== undefined && Array.isArray(phantom.decorations)) {
+          editor.deltaDecorations(phantom.decorations, [])
+        }
+        if (phantom === undefined || editor === undefined) return false
+        const model = editor.getModel()
+        if (model === null || model.getVersionId() !== phantom.version) return false
+        const operations = phantom.replaced.map((entry) => ({
+          start: entry.start,
+          end: entry.end,
+          text: entry.original,
+        }))
+        if (operations.length === 0) return false
+        return runModelEdits(operations)
+      }
+
+      const decorateEdits = (plan, model) => {
+        clearPhantom()
+        clearEdits()
+        const editor = runtime.current.editor
+        const monacoInstance = runtime.current.monaco
+        const edits = Array.isArray(plan.edits) ? plan.edits : []
+        if (editor === undefined || monacoInstance === undefined || edits.length === 0) return
+        const eol = eolOf(model)
+        const value = model.getValue()
+        const blocks = []
+        for (const edit of edits) {
+          // The hover carries the whole proposal, so the hint stays readable
+          // wherever the staged lines sit.
+          const hover =
+            (edit.why === '' ? 'Правка подсказки' : edit.why) + '\n\n```\n' + edit.newText + '\n```'
+          // Grow the change to whole lines. Inserting in the middle of a line
+          // pushes the rest of that line into a new row, and the result reads as
+          // text printed over its neighbour; a whole-line region keeps every
+          // row where the reader expects it.
+          const startPosition = model.getPositionAt(edit.start)
+          const endPosition = model.getPositionAt(edit.end)
+          const lineStart = model.getOffsetAt({ lineNumber: startPosition.lineNumber, column: 1 })
+          const lineEnd = model.getOffsetAt({
+            lineNumber: endPosition.lineNumber,
+            column: model.getLineMaxColumn(endPosition.lineNumber),
+          })
+          blocks.push({
+            edit,
+            hover,
+            start: lineStart,
+            end: lineEnd,
+            original: value.slice(lineStart, lineEnd),
+            replacement: value.slice(lineStart, edit.start) + edit.newText + value.slice(edit.end, lineEnd),
+          })
+        }
+        // Two edits that share a line would expand onto the same rows; the Host
+        // already refuses overlapping ranges, and this keeps the staging honest
+        // when a model repeats a snippet in two proposals.
+        const staged = []
+        for (const block of blocks) {
+          if (staged.some((entry) => block.start < entry.end && entry.start < block.end)) continue
+          staged.push(block)
+        }
+        if (staged.length === 0) return
+        const operations = []
+        const added = []
+        const removed = []
+        const replaced = []
+        let shift = 0
+        for (const block of staged) {
+          const ops = diffLinesLocal(block.original, block.replacement)
+          // Where every line of the replaced block starts, relative to its start.
+          const starts = [0]
+          for (let index = 0; index < block.original.length; index += 1) {
+            if (block.original[index] === '\n') starts.push(index + 1)
+          }
+          let line = 0
+          let localAdd = 0
+          let pending = []
+          const flush = (anchor) => {
+            if (pending.length === 0) return
+            const text = pending.join(eol) + eol
+            operations.push({ start: anchor, end: anchor, text })
+            added.push({ start: anchor + shift + localAdd, end: anchor + shift + localAdd + text.length, text })
+            localAdd += text.length
+            pending = []
+          }
+          for (const op of ops) {
+            const anchor = block.start + (line < starts.length ? starts[line] : block.original.length)
+            if (op.type === 'add') {
+              pending.push(op.text)
+              continue
+            }
+            if (pending.length > 0) flush(block.start + (line < starts.length ? starts[line] : block.original.length))
+            if (op.type === 'del') {
+              const next = line < starts.length - 1 ? starts[line + 1] : block.original.length
+              removed.push({
+                start: block.start + starts[line] + shift + localAdd,
+                end: block.start + next + shift + localAdd,
+                hover: block.hover,
+              })
+            }
+            line += 1
+          }
+          if (pending.length > 0) flush(block.start + block.original.length)
+          // Tab rewrites the whole staged region with the proposed text, so the
+          // inserted lines and the old ones are replaced in one operation.
+          replaced.push({
+            start: block.start + shift,
+            end: block.end + shift + localAdd,
+            text: block.replacement,
+            original: block.original,
+            edit: block.edit,
+          })
+          shift += localAdd
+        }
+        if (!runModelEdits(operations)) return
+        const stagedDecorations = []
+        for (const entry of added) {
+          const start = model.getPositionAt(entry.start)
+          const end = model.getPositionAt(entry.end)
+          stagedDecorations.push({
+            range: new monacoInstance.Range(start.lineNumber, 1, Math.max(start.lineNumber, end.lineNumber), 1),
+            options: { isWholeLine: true, className: 'dsh-ide-edit-added' },
+          })
+        }
+        for (const entry of removed) {
+          const start = model.getPositionAt(entry.start)
+          const end = model.getPositionAt(Math.max(entry.start, entry.end - 1))
+          stagedDecorations.push({
+            range: new monacoInstance.Range(start.lineNumber, 1, Math.max(start.lineNumber, end.lineNumber), 1),
+            options: { isWholeLine: true, className: 'dsh-ide-edit-old-line', hoverMessage: { value: entry.hover } },
+          })
+        }
+        runtime.current.tab.phantom = {
+          version: model.getVersionId(),
+          replaced,
+          decorations: editor.deltaDecorations([], stagedDecorations),
+        }
+        runtime.current.tab.edits = edits
+        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(true)
+      }
+
+      const cancelGhostRequest = () => {
+        window.clearTimeout(runtime.current.ghostTimer)
+        const controller = runtime.current.tab.controller
+        if (!controller) return
+        runtime.current.tab.controller = undefined
+        controller.abort()
+        runtime.current.setHintBusy?.(false)
+      }
+
+      const complete = async (model, position, kind, signal, isCurrent) => {
         const key = runtime.current.modelTabs.get(model.uri.toString())
         const entry = stateRef.current.tabs.find((candidate) => candidate.key === key)
-        const explicit = context !== undefined && context !== null && context.triggerKind === 1
+        const explicit = kind === 'explicit'
         if (entry === undefined || entry.readOnly) return { items: [] }
-        if (!explicit && runtime.current.autoSuggest !== true) return { items: [] }
+        if (kind === 'auto' && runtime.current.autoSuggest !== true) return { items: [] }
         const text = model.getValue()
-        if (text.length > 4 * 1024 * 1024) return { items: [] }
+        if (text.length > Number(tabPref('maxFileChars', 1000000))) return { items: [] }
         const offset = model.getOffsetAt(position)
-        const stamp = `${key}:${offset}:${model.getVersionId()}:${explicit ? 'x' : 'a'}`
+        const version = model.getVersionId()
+        const stamp = `${key}:${offset}:${version}:${kind}`
         // An explicit request is a fresh question even at an unchanged position:
         // only automatic suggestions are de-duplicated.
-        if (!explicit && runtime.current.lastCompletion === stamp) return { items: [] }
+        if (kind === 'auto' && runtime.current.lastCompletion === stamp) return { items: [] }
         runtime.current.lastCompletion = stamp
-        const controller = new AbortController()
-        if (cancelToken && typeof cancelToken.onCancellationRequested === 'function') {
-          cancelToken.onCancellationRequested(() => controller.abort())
-        }
+        const rejections = (runtime.current.tab.rejections.get(key) || []).slice(-20)
+        const revertions = (runtime.current.tab.revertions.get(key) || []).slice(-20)
         try {
           const payload = await call(
             'complete',
-            { id: entry.hostId, sessionId: stateRef.current.sessionId, token: entry.token, text, offset, explicit },
-            controller.signal,
+            {
+              id: entry.hostId,
+              sessionId: stateRef.current.sessionId,
+              token: entry.token,
+              text,
+              offset,
+              explicit,
+              kind,
+              modelVersion: version,
+              rejections,
+              revertions,
+            },
+            signal,
           )
+          if (!isCurrent()) return
           if (payload === undefined || typeof payload.text !== 'string') return { items: [] }
           const trajectory = payload.trajectory === undefined || payload.trajectory === null ? {} : payload.trajectory
-          pushTrace({
+          const planKind = typeof payload.planKind === 'string' ? payload.planKind : 'insert'
+          const suppressed = typeof payload.suppressed === 'string' ? payload.suppressed : ''
+          const trace = {
             at: new Date().toLocaleTimeString('ru-RU'),
             path: entry.path,
             provider: payload.provider,
             model: payload.model,
+            modelSource: typeof payload.modelSource === 'string' ? payload.modelSource : '',
+            fellBack: payload.fellBack === true,
+            effort: typeof payload.effort === 'string' ? payload.effort : '',
             explicit,
             before: asNumber(trajectory.before),
             after: asNumber(trajectory.after),
@@ -2389,18 +4904,51 @@ function IdeBody(props) {
             chars: payload.text.length,
             ok: payload.text !== '',
             reason: typeof payload.reason === 'string' ? payload.reason : '',
-            conversation: payload.conversation,
-          })
-          if (payload.text === '') {
+            conversation: tabPref('fullTrace', false) ? payload.conversation : undefined,
+            kind,
+            planKind,
+            removedChars: asNumber(trajectory.removedChars),
+            suppressed,
+          }
+          const edits = []
+          if (Array.isArray(payload.edits)) {
+            for (const candidate of payload.edits.slice(0, 5)) {
+              if (candidate === null || typeof candidate !== 'object') continue
+              const start = asNumber(candidate.start)
+              const end = asNumber(candidate.end)
+              const newText = typeof candidate.newText === 'string' ? candidate.newText : ''
+              if (newText === '' || end < start || end > text.length) continue
+              edits.push({
+                start,
+                end,
+                oldText: typeof candidate.oldText === 'string' ? candidate.oldText : '',
+                newText,
+                why: typeof candidate.why === 'string' ? candidate.why : '',
+              })
+            }
+          }
+          if (payload.text === '' && edits.length === 0) {
             // A silent empty answer is the worst failure mode: an explicit
             // request says why, an automatic one stays quiet like VS Code.
             if (explicit && typeof payload.reason === 'string' && payload.reason !== '') {
               setStatus({ kind: 'error', message: payload.reason })
             }
+            pushTrace(trace)
             return { items: [] }
           }
-          return { items: [{ insertText: payload.text }], text: payload.text }
+          const range = payload.range === undefined || payload.range === null ? {} : payload.range
+          const plan = {
+            kind: planKind === 'replace' ? 'replace' : 'insert',
+            range: { start: asNumber(range.start), end: asNumber(range.end) },
+            insertText: payload.text,
+            removedText: typeof payload.removedText === 'string' ? payload.removedText : '',
+            edits,
+            modelVersion: version,
+            requestId: typeof payload.requestId === 'string' ? payload.requestId : '',
+          }
+          return { plan, trace }
         } catch (cause) {
+          if (!isCurrent()) return
           if (cause instanceof Error && (cause.name === 'AbortError' || cause.code === 'cancelled')) return { items: [] }
           if (cause instanceof Error && cause.code === 'not-opted-in') {
             // The host only sends buffer context after the workspace opted in. The
@@ -2422,80 +4970,894 @@ function IdeBody(props) {
             chars: 0,
             ok: false,
             reason: describeError(cause),
+            kind,
           })
           return { items: [] }
         }
-      }, [pushTrace])
+      }
+
+      const clearGhostPreview = () => {
+        const state = runtime.current
+        if (state.ghostZone !== undefined) {
+          state.editor?.changeViewZones((zones) => zones.removeZone(state.ghostZone))
+          state.ghostZone = undefined
+        }
+        if (state.ghostDecorations.length > 0) {
+          state.editor?.deltaDecorations(state.ghostDecorations, [])
+          state.ghostDecorations = []
+        }
+        state.ghostPosition = undefined
+      }
 
       const clearGhost = React.useCallback(() => {
-        runtime.current.ghost = ''
-        runtime.current.ghostPosition = undefined
-        const node = runtime.current.ghostNode
-        if (node !== undefined) node.style.display = 'none'
-        const editor = runtime.current.editor
-        const widget = runtime.current.ghostWidget
-        if (editor !== undefined && widget !== undefined) editor.layoutContentWidget(widget)
-        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(false)
+        const state = runtime.current
+        // Avoid any editor work on ordinary keystrokes when no hint is drawn.
+        const visible =
+          state.ghostPosition !== undefined ||
+          state.tab.plan !== undefined ||
+          state.tab.phantom !== undefined ||
+          state.tab.removedDecorations.length > 0 ||
+          state.tab.editWidgets.length > 0
+        state.tab.plan = undefined
+        state.tab.accepted = 0
+        if (!visible) return
+        clearGhostPreview()
+        state.ghostKey?.set(false)
+        clearPhantom()
+        clearRemovedDecoration()
+        clearEdits()
       }, [])
 
-      const showGhost = React.useCallback((position, ghostText) => {
-        const node = runtime.current.ghostNode
-        const editor = runtime.current.editor
-        const widget = runtime.current.ghostWidget
-        if (node === undefined || editor === undefined || widget === undefined || ghostText === '') return
-        runtime.current.ghost = ghostText
-        runtime.current.ghostPosition = position
-        node.textContent = ghostText
-        node.style.display = 'block'
-        editor.layoutContentWidget(widget)
-        if (runtime.current.ghostKey !== undefined) runtime.current.ghostKey.set(true)
-      }, [])
+      const showGhost = (position, ghostText, end = position) => {
+        const state = runtime.current
+        const { editor, monaco } = state
+        const model = editor?.getModel()
+        if (!model || ghostText === '') return
+        clearGhostPreview()
+        const { lineNumber, column } = position
+        const lines = ghostText.split(/\r\n|\r|\n/)
+        const suffix = model.getLineContent(end.lineNumber).slice(end.column - 1)
+        const replacing = end.lineNumber !== lineNumber || end.column !== column
+        // Keep the original line readable when the proposal rewrites it or
+        // would move its suffix to a new line.
+        if (replacing || (lines.length > 1 && suffix !== '')) {
+          lines[0] = model.getLineContent(lineNumber).slice(0, column - 1) + lines[0]
+          lines[lines.length - 1] += suffix
+        } else {
+          const first = lines.shift()
+          if (first !== '') {
+            state.ghostDecorations = editor.deltaDecorations([], [{
+              range: new monaco.Range(lineNumber, column, lineNumber, column),
+              options: {
+                showIfCollapsed: true,
+                before: { content: first, inlineClassName: 'dsh-ide-ghost' },
+              },
+            }])
+          }
+        }
+        if (lines.length > 0) {
+          const node = document.createElement('div')
+          node.className = 'dsh-ide-ghost dsh-ide-ghost-lines'
+          node.textContent = lines.join('\n')
+          node.style.tabSize = String(model.getOptions().tabSize)
+          editor.applyFontInfo(node)
+          editor.changeViewZones((zones) => {
+            state.ghostZone = zones.addZone({
+              afterLineNumber: end.lineNumber,
+              heightInLines: lines.length,
+              domNode: node,
+              suppressMouseDown: true,
+            })
+          })
+        }
+        state.ghostPosition = position
+        state.ghostKey?.set(true)
+      }
 
-      const acceptGhost = React.useCallback(() => {
+      // Every ghost edit goes through one place: it brackets the Monaco edit with
+      // undo stops and marks it as ours, so the content listener does not treat
+      // it as typing and ask the model again. The cursor continuation and the
+      // phantom edits are applied as one operation, which is why the edit
+      // offsets from the Host never have to be recomputed after the insert.
+      const applyGhostEdits = (operations, caretOffset) => {
         const editor = runtime.current.editor
         const monacoInstance = runtime.current.monaco
-        const ghostText = runtime.current.ghost
-        const position = runtime.current.ghostPosition
-        if (editor === undefined || monacoInstance === undefined || ghostText === '' || position === undefined) return false
-        clearGhost()
-        editor.pushUndoStop()
-        editor.executeEdits('dsh-ide', [
-          {
-            range: new monacoInstance.Range(position.lineNumber, position.column, position.lineNumber, position.column),
-            text: ghostText,
+        if (editor === undefined || monacoInstance === undefined) return false
+        const model = editor.getModel()
+        if (model === null || operations.length === 0) return false
+        // Monaco refuses overlapping edits in one call. The Host already drops
+        // an edit that covers the cursor, but a replacement range can still meet
+        // an edit on the same line; the first operation wins there.
+        const ordered = [...operations].sort((left, right) => left.start - right.start)
+        const accepted = []
+        for (const operation of ordered) {
+          const last = accepted[accepted.length - 1]
+          if (last !== undefined && operation.start < last.end) continue
+          accepted.push(operation)
+        }
+        if (accepted.length === 0) return false
+        const ranges = accepted.map((operation) => {
+          const start = model.getPositionAt(operation.start)
+          const end = model.getPositionAt(operation.end)
+          return {
+            range: new monacoInstance.Range(start.lineNumber, start.column, end.lineNumber, end.column),
+            text: operation.text,
             forceMoveMarkers: true,
-          },
-        ])
-        editor.pushUndoStop()
+          }
+        })
+        runtime.current.tab.internalEdit = true
+        try {
+          editor.pushUndoStop()
+          editor.executeEdits('dsh-ide', ranges)
+          // `executeEdits` moves the caret but leaves any selection the editor
+          // had, so a hint applied while text was selected looked like the
+          // selection grew. Collapse it at the end of what we inserted.
+          editor.setPosition(model.getPositionAt(Math.max(0, caretOffset)))
+          editor.pushUndoStop()
+        } finally {
+          runtime.current.tab.internalEdit = false
+        }
         return true
-      }, [clearGhost])
+      }
 
-      const requestGhost = React.useCallback(async (explicit) => {
+      const applyGhostEdit = (startOffset, endOffset, text) =>
+        applyGhostEdits([{ start: startOffset, end: endOffset, text }], startOffset + text.length)
+
+      const acceptGhost = () => {
+        const plan = runtime.current.tab.plan
+        const editor = runtime.current.editor
+        if (plan === undefined || editor === undefined) return false
+        const model = editor.getModel()
+        if (model === null) return false
+        // A staged block was inserted into the buffer already, so the model
+        // version moved past the one the request was built on; the staged
+        // version is the one Tab has to trust.
+        const phantom = runtime.current.tab.phantom
+        const expectedVersion = phantom === undefined ? plan.modelVersion : phantom.version
+        if (model.getVersionId() !== expectedVersion) {
+          clearGhost()
+          return false
+        }
+        const accepted = runtime.current.tab.accepted
+        const text = plan.insertText.slice(accepted)
+        const edits = Array.isArray(plan.edits) ? plan.edits : []
+        if (text === '' && edits.length === 0 && phantom === undefined) {
+          clearGhost()
+          return false
+        }
+        // Everything that sits below a staged region moved by the difference the
+        // staging made, so an offset from the Host is shifted by it.
+        const shiftAt = (offset) =>
+          phantom === undefined
+            ? 0
+            : phantom.replaced.reduce(
+                (sum, entry) => (entry.end <= offset ? sum + entry.text.length - entry.original.length : sum),
+                0,
+              )
+        const staged = phantom === undefined ? new Set() : new Set(phantom.replaced.map((entry) => entry.edit))
+        const tabKey = runtime.current.modelTabs.get(model.uri.toString())
+        const entry = stateRef.current.tabs.find((candidate) => candidate.key === tabKey)
+        // One transaction: the continuation at the caret plus every phantom edit
+        // the Host located. Tab is one undo step, and the offsets stay valid
+        // because Monaco applies the whole set together.
+        const operations = []
+        if (text !== '') {
+          operations.push({
+            start: plan.range.start + accepted + shiftAt(plan.range.start + accepted),
+            end: plan.range.end + shiftAt(plan.range.end),
+            text,
+          })
+        }
+        for (const edit of edits) {
+          // A block that was staged is already in the buffer; Tab only has to
+          // delete the lines it replaces, which the staging recorded.
+          if (staged.has(edit)) continue
+          operations.push({
+            start: edit.start + shiftAt(edit.start),
+            end: edit.end + shiftAt(edit.end),
+            text: edit.newText,
+          })
+        }
+        if (phantom !== undefined) {
+          // The staged region already holds the inserted lines and the old ones;
+          // rewriting it with the proposed text leaves exactly the proposal.
+          for (const entry of phantom.replaced) {
+            operations.push({ start: entry.start, end: entry.end, text: entry.text })
+          }
+        }
+        const caret = plan.range.start + plan.insertText.length + shiftAt(plan.range.start)
+        const textBefore = model.getValue()
+        const edited = applyGhostEdits(operations, caret)
+        const textAfter = model.getValue()
+        runtime.current.tab.plan = undefined
+        runtime.current.tab.accepted = 0
+        // Tab keeps the staged lines: drop the record before clearGhost, which
+        // would otherwise treat them as a cancelled hint and delete them.
+        if (phantom !== undefined) {
+          runtime.current.tab.phantom = undefined
+          if (Array.isArray(phantom.decorations)) editor.deltaDecorations(phantom.decorations, [])
+        }
+        clearGhost()
+        if (!edited) return false
+        recordChange(tabKey, pathOfTab(tabKey), textBefore, textAfter)
+        pushTrace({
+          at: new Date().toLocaleTimeString('ru-RU'),
+          path: entry === undefined ? '' : entry.path,
+          provider: '—',
+          model: '—',
+          explicit: false,
+          before: 0,
+          after: 0,
+          durationMs: 0,
+          chars: text.length,
+          ok: true,
+          reason:
+            edits.length === 0
+              ? plan.kind === 'replace'
+                ? 'Принята замена (Tab)'
+                : 'Принята подсказка (Tab)'
+              : `Принято правок: ${edits.length} (Tab)`,
+          kind: 'accepted',
+          planKind: plan.kind,
+          removedChars: plan.kind === 'replace' ? plan.removedText.length : 0,
+          suppressed: '',
+        })
+        // Off by default: one suggestion, then the user decides. The setting is
+        // kept for anyone who wants the next hint predicted immediately.
+        if (tabPref('refetchAfterAccept', false) === true) {
+          window.clearTimeout(runtime.current.ghostTimer)
+          runtime.current.ghostTimer = window.setTimeout(() => {
+            void requestGhost('refetch')
+          }, 0)
+        }
+        return true
+      }
+
+      const acceptWord = () => {
+        const plan = runtime.current.tab.plan
+        const editor = runtime.current.editor
+        if (plan === undefined || editor === undefined) return false
+        if (tabPref('partialAccept', true) !== true) return acceptGhost()
+        // A staged block already moved the text under the caret, so a word-by-word
+        // insert would land at an offset that no longer exists: take it all.
+        if (runtime.current.tab.phantom !== undefined) return acceptGhost()
+        // A replacement is all or nothing: inserting only its first word would
+        // keep the tail it was supposed to rewrite.
+        if (plan.range.start !== plan.range.end) return acceptGhost()
+        const model = editor.getModel()
+        if (model === null) return false
+        if (model.getVersionId() !== plan.modelVersion) {
+          clearGhost()
+          return false
+        }
+        const accepted = runtime.current.tab.accepted
+        const next = nextWordEndLocal(plan.insertText, accepted)
+        if (next <= accepted) return false
+        const chunk = plan.insertText.slice(accepted, next)
+        if (!applyGhostEdit(plan.range.start + accepted, plan.range.start + accepted, chunk)) return false
+        runtime.current.tab.accepted = next
+        runtime.current.tab.plan = { ...plan, modelVersion: model.getVersionId() }
+        const rest = plan.insertText.slice(next)
+        if (rest === '') {
+          const tabKey = runtime.current.modelTabs.get(model.uri.toString())
+          const entry = stateRef.current.tabs.find((candidate) => candidate.key === tabKey)
+          pushTrace({
+            at: new Date().toLocaleTimeString('ru-RU'),
+            path: entry === undefined ? '' : entry.path,
+            provider: '—',
+            model: '—',
+            explicit: false,
+            before: 0,
+            after: 0,
+            durationMs: 0,
+            chars: chunk.length,
+            ok: true,
+            reason: 'Принято слово (Ctrl+→)',
+            kind: 'accepted-word',
+            planKind: plan.kind,
+            removedChars: 0,
+            suppressed: '',
+          })
+          runtime.current.tab.plan = undefined
+          runtime.current.tab.accepted = 0
+          clearGhost()
+          return true
+        }
+        showGhost(model.getPositionAt(plan.range.start + next), rest)
+        return true
+      }
+
+      const rejectGhost = () => {
+        const plan = runtime.current.tab.plan
+        if (plan === undefined) return false
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        const tabKey = model === null ? '' : runtime.current.modelTabs.get(model.uri.toString())
+        // Cursor remembers what the user threw away and refuses to offer it again
+        // for a while; the Host applies the threshold, the client keeps history.
+        remember(runtime.current.tab.rejections, tabKey, plan.insertText)
+        const ms = Number(tabPref('snoozeAfterRejectMs', 800))
+        runtime.current.tab.snoozeUntil = Date.now() + (Number.isFinite(ms) ? Math.max(0, ms) : 800)
+        const entry = stateRef.current.tabs.find((candidate) => candidate.key === tabKey)
+        pushTrace({
+          at: new Date().toLocaleTimeString('ru-RU'),
+          path: entry === undefined ? '' : entry.path,
+          provider: '—',
+          model: '—',
+          explicit: false,
+          before: 0,
+          after: 0,
+          durationMs: 0,
+          chars: plan.insertText.length,
+          ok: false,
+          reason: 'Отклонено (Escape)',
+          kind: 'rejected',
+          planKind: plan.kind,
+          removedChars: 0,
+          suppressed: '',
+        })
+        clearGhost()
+        return true
+      }
+
+      // ------------------------------------------------------- inline edit
+      // Inline Edit reviews one model replacement for one selection. The source
+      // model stays untouched: the selection is painted as "old" and the
+      // replacement lives in a read-only view zone until «Принять» writes it as
+      // a single undoable edit. Nothing here touches the disk — saving is a
+      // separate, explicit action.
+
+      const inlineState = () => runtime.current.inlineEdit
+
+      const clearInlineTraceTimer = (st) => {
+        if (st !== undefined && st.traceTimer !== undefined) {
+          clearInterval(st.traceTimer)
+          st.traceTimer = undefined
+        }
+      }
+
+      const settleInlineTrace = (st, patch) => {
+        clearInlineTraceTimer(st)
+        if (st === undefined || st.traceSettled === true || typeof st.traceId !== 'string') return
+        st.traceSettled = true
+        updateTrace(st.traceId, { pending: false, ...patch })
+      }
+
+      // Inline Edit is a model request too: it gets a live row in the same
+      // Trajectory list, with the clock ticking until the answer arrives.
+      const startInlineTrace = (st, requestId) => {
+        const startedAt = performance.now()
+        const traceId = `inline-${requestId}`
+        st.traceId = traceId
+        st.traceStartedAt = startedAt
+        pushTrace({
+          id: traceId,
+          at: new Date().toLocaleTimeString('ru-RU'),
+          path: st.path,
+          provider: '—',
+          model: '—',
+          explicit: true,
+          kind: 'inline-edit',
+          pending: true,
+          before: st.oldText.length,
+          after: 0,
+          durationMs: 0,
+          chars: 0,
+          ok: false,
+          reason: 'Модель думает…',
+        })
+        st.traceTimer = setInterval(() => {
+          if (runtime.current.inlineEdit !== st) {
+            clearInlineTraceTimer(st)
+            return
+          }
+          updateTrace(traceId, { durationMs: Math.round(performance.now() - startedAt) })
+        }, 100)
+      }
+
+      const publishInline = () => {
+        const st = inlineState()
+        setInlineView(
+          st === undefined
+            ? undefined
+            : {
+                phase: st.phase,
+                key: st.key,
+                instruction: st.instruction,
+                error: st.error,
+                proposal: st.proposal,
+                addedLines: st.proposal === undefined ? 0 : st.proposal.addedLines,
+                removedLines: st.proposal === undefined ? 0 : st.proposal.removedLines,
+              },
+        )
+      }
+
+      const clearInlineDecorations = () => {
+        const st = inlineState()
+        const editor = runtime.current.editor
+        if (st === undefined || editor === undefined) return
+        if (st.decorations !== undefined) {
+          const decorations = st.decorations
+          st.decorations = undefined
+          try {
+            editor.deltaDecorations(decorations, [])
+          } catch {
+            /* the model may be disposed already; decorations die with it */
+          }
+        }
+        if (st.zone !== undefined) {
+          const zone = st.zone
+          st.zone = undefined
+          try {
+            editor.changeViewZones((accessor) => accessor.removeZone(zone))
+          } catch {
+            /* same for an already detached view zone */
+          }
+        }
+      }
+
+      const dismissInlineEdit = (reason, focus) => {
+        const st = inlineState()
+        if (st === undefined) return false
+        if (st.phase === 'pending') {
+          settleInlineTrace(st, {
+            durationMs: Math.round(performance.now() - st.traceStartedAt),
+            reason: 'Отменено',
+          })
+        } else {
+          clearInlineTraceTimer(st)
+        }
+        clearInlineDecorations()
+        st.controller?.abort()
+        runtime.current.inlineEdit = undefined
+        setInlineView(undefined)
+        if (reason === 'typing') setStatus({ kind: 'idle', message: 'Правка отменена: файл изменился.' })
+        if (focus === true) runtime.current.editor?.focus()
+        return true
+      }
+
+      const openInlineEdit = () => {
+        const editor = runtime.current.editor
+        const monaco = runtime.current.monaco
+        if (editor === undefined || monaco === undefined) return false
+        const model = editor.getModel()
+        if (model === null) {
+          setStatus({ kind: 'error', message: 'Откройте файл, чтобы изменить выделение.' })
+          return false
+        }
+        const key = runtime.current.modelTabs.get(model.uri.toString())
+        const entry = key === undefined ? undefined : stateRef.current.tabs.find((candidate) => candidate.key === key)
+        if (entry === undefined) return false
+        if (entry.readOnly) {
+          setStatus({ kind: 'error', message: 'Файл открыт только для чтения — правка недоступна.' })
+          return false
+        }
+        const selection = editor.getSelection()
+        if (selection === null || selection.isEmpty()) {
+          setStatus({ kind: 'error', message: 'Выделите код, который нужно изменить.' })
+          return false
+        }
+        const start = model.getOffsetAt(selection.getStartPosition())
+        const end = model.getOffsetAt(selection.getEndPosition())
+        const text = model.getValue()
+        dismissInlineEdit('restart')
+        runtime.current.inlineEdit = {
+          phase: 'input',
+          key,
+          path: entry.path,
+          hostId: entry.hostId,
+          token: entry.token,
+          modelVersion: model.getVersionId(),
+          start,
+          end,
+          oldText: text.slice(start, end),
+          text,
+          instruction: '',
+          error: '',
+          controller: undefined,
+          decorations: undefined,
+          zone: undefined,
+          traceId: undefined,
+          traceTimer: undefined,
+          traceStartedAt: 0,
+          traceSettled: false,
+        }
+        publishInline()
+        window.setTimeout(() => inlineInputRef.current?.focus(), 0)
+        return true
+      }
+
+      const setInlineInstruction = (value) => {
+        const st = inlineState()
+        if (st === undefined || st.phase !== 'input') return
+        st.instruction = value
+        publishInline()
+      }
+
+      const paintInlinePreview = () => {
+        const st = inlineState()
+        const editor = runtime.current.editor
+        const monaco = runtime.current.monaco
+        if (st === undefined || st.proposal === undefined || editor === undefined || monaco === undefined) return
+        const model = editor.getModel()
+        if (model === null) return
+        clearInlineDecorations()
+        const change = st.proposal.changes[0]
+        const startPosition = model.getPositionAt(change.start)
+        const endPosition = model.getPositionAt(change.end)
+        const range = new monaco.Range(
+          startPosition.lineNumber,
+          startPosition.column,
+          endPosition.lineNumber,
+          endPosition.column,
+        )
+        st.decorations = editor.deltaDecorations(
+          [],
+          [{ range, options: { inlineClassName: 'dsh-ide-inline-old', hoverMessage: { value: 'Этот фрагмент будет заменён' } } }],
+        )
+        const replacement = change.newText
+        const node = document.createElement('div')
+        node.className = 'dsh-ide-inline-preview'
+        const head = document.createElement('div')
+        head.className = 'dsh-ide-inline-preview-head'
+        head.textContent =
+          replacement === '' ? 'Предложение · удалить фрагмент' : `Предложение · ${replacement.split('\n').length} стр.`
+        const body = document.createElement('pre')
+        body.className = 'dsh-ide-inline-preview-body'
+        body.textContent = replacement === '' ? 'Фрагмент будет удалён целиком.' : replacement
+        node.appendChild(head)
+        node.appendChild(body)
+        // editor.changeViewZones() returns nothing: the zone id has to be taken
+        // from the accessor, otherwise there is nothing to remove later and the
+        // accepted preview stays in the buffer view forever.
+        st.zone = undefined
+        editor.changeViewZones((accessor) => {
+          st.zone = accessor.addZone({
+            afterLineNumber: endPosition.lineNumber,
+            heightInLines: replacement === '' ? 2 : replacement.split('\n').length + 1,
+            domNode: node,
+          })
+        })
+      }
+
+      const submitInlineEdit = async () => {
+        const st = inlineState()
+        if (st === undefined || st.phase !== 'input') return
+        const instruction = st.instruction.trim()
+        if (instruction === '') {
+          st.error = 'Опишите, что изменить.'
+          publishInline()
+          inlineInputRef.current?.focus()
+          return
+        }
+        // Tab permission is not Edit permission: the model receives a selection
+        // plus an instruction only after this explicit, separate consent.
+        if (prefsRef.current?.inlineEditConsent !== true) {
+          st.error = 'Сначала разрешите отправку выделения модели.'
+          publishInline()
+          return
+        }
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        if (model === null) return
+        if (model.getVersionId() !== st.modelVersion) {
+          st.phase = 'stale'
+          st.error = 'Файл изменился, запросите новую правку.'
+          publishInline()
+          return
+        }
+        st.phase = 'pending'
+        st.error = ''
+        const requestId = ++runtime.current.inlineSeq
+        st.requestId = requestId
+        const controller = new AbortController()
+        st.controller = controller
+        startInlineTrace(st, requestId)
+        publishInline()
+        try {
+          const payload = await call(
+            'inlineEdit',
+            {
+              id: st.hostId,
+              sessionId: stateRef.current.sessionId,
+              token: st.token,
+              modelVersion: st.modelVersion,
+              start: st.start,
+              end: st.end,
+              text: st.text,
+              instruction,
+            },
+            controller.signal,
+          )
+          if (inlineState() !== st || st.requestId !== requestId) return
+          st.controller = undefined
+          st.proposal = payload.proposal
+          st.phase = 'preview'
+          const change = payload.proposal?.changes?.[0]
+          const replacement = change !== undefined && typeof change.newText === 'string' ? change.newText : ''
+          const removedText = change !== undefined && typeof change.oldText === 'string' ? change.oldText : st.oldText
+          const hint = change === undefined
+            ? undefined
+            : {
+                path: st.path,
+                kind: removedText === '' ? 'insert' : 'replace',
+                range: { start: change.start, end: change.end },
+                removedText,
+                insertText: replacement,
+                modelVersion: st.modelVersion,
+              }
+          // Older Host builds do not send the inline conversation; keep the
+          // Chat tab useful with the same instruction/fragment/replacement
+          // while the full transcript is unavailable.
+          const conversation = payload.conversation !== undefined
+            ? payload.conversation
+            : prefsRef.current?.fullTrace === true
+              ? {
+                  system: 'Правка выделения',
+                  message: `Задача: ${st.instruction}\n\n--- фрагмент ---\n${st.oldText}`,
+                  answer: replacement,
+                }
+              : undefined
+          settleInlineTrace(st, {
+            ok: true,
+            provider: typeof payload.provider === 'string' ? payload.provider : '—',
+            model: typeof payload.model === 'string' ? payload.model : '—',
+            durationMs: Number.isFinite(Number(payload.durationMs))
+              ? Number(payload.durationMs)
+              : Math.round(performance.now() - st.traceStartedAt),
+            before: st.oldText.length,
+            after: replacement.length,
+            chars: replacement.length,
+            reason: '',
+            hint,
+            conversation,
+          })
+          paintInlinePreview()
+          publishInline()
+        } catch (cause) {
+          if (inlineState() !== st || st.requestId !== requestId) return
+          st.controller = undefined
+          const cancelled = cause?.name === 'AbortError' || cause?.code === 'cancelled'
+          if (cancelled) st.phase = 'input'
+          else {
+            st.phase = 'failed'
+            st.error = describeError(cause)
+          }
+          settleInlineTrace(st, {
+            ok: false,
+            durationMs: Math.round(performance.now() - st.traceStartedAt),
+            reason: cancelled ? 'Отменено' : describeError(cause),
+          })
+          publishInline()
+        }
+      }
+
+      const refineInlineEdit = () => {
+        const st = inlineState()
+        if (st === undefined) return
+        if (st.phase === 'pending') {
+          settleInlineTrace(st, {
+            durationMs: Math.round(performance.now() - st.traceStartedAt),
+            reason: 'Отменено',
+          })
+        }
+        clearInlineDecorations()
+        st.controller?.abort()
+        st.controller = undefined
+        st.proposal = undefined
+        st.phase = 'input'
+        st.error = ''
+        publishInline()
+        window.setTimeout(() => inlineInputRef.current?.focus(), 0)
+      }
+
+      const allowInlineEdit = async () => {
+        const st = inlineState()
+        try {
+          await call('prefs', { patch: { inlineEditConsent: true } })
+        } catch (cause) {
+          if (inlineState() === st && st !== undefined) {
+            st.error = describeError(cause)
+            publishInline()
+          }
+          return
+        }
+        const next = { ...(prefsRef.current ?? {}), inlineEditConsent: true }
+        prefsRef.current = next
+        setPreferences(next)
+        if (inlineState() === st && st !== undefined) {
+          st.error = ''
+          publishInline()
+        }
+        inlineInputRef.current?.focus()
+      }
+
+      const acceptInlineEdit = () => {
+        const st = inlineState()
+        const editor = runtime.current.editor
+        const monaco = runtime.current.monaco
+        if (st === undefined || editor === undefined || monaco === undefined) return false
+        if (st.phase !== 'preview' || st.proposal === undefined) return false
+        const model = editor.getModel()
+        if (model === null) return false
+        if (runtime.current.modelTabs.get(model.uri.toString()) !== st.key) {
+          dismissInlineEdit('switch')
+          return false
+        }
+        const change = st.proposal.changes[0]
+        // Version alone is not enough: the range text must still be the text the
+        // model was shown. Otherwise the proposal is stale and nothing is written.
+        if (model.getVersionId() !== st.modelVersion || model.getValue().slice(change.start, change.end) !== change.oldText) {
+          st.phase = 'stale'
+          st.error = 'Файл изменился, запросите новую правку.'
+          clearInlineDecorations()
+          publishInline()
+          return false
+        }
+        const startPosition = model.getPositionAt(change.start)
+        const endPosition = model.getPositionAt(change.end)
+        const range = new monaco.Range(
+          startPosition.lineNumber,
+          startPosition.column,
+          endPosition.lineNumber,
+          endPosition.column,
+        )
+        dismissInlineEdit('accepted')
+        const textBefore = model.getValue()
+        runtime.current.tab.internalEdit = true
+        try {
+          editor.pushUndoStop()
+          editor.executeEdits('dsh-ide-inline', [{ range, text: change.newText }])
+          editor.pushUndoStop()
+        } finally {
+          runtime.current.tab.internalEdit = false
+        }
+        recordChange(st.key, pathOfTab(st.key), textBefore, model.getValue())
+        setStatus({ kind: 'ok', message: 'Правка применена. Ctrl+Z — отменить.' })
+        editor.focus()
+        return true
+      }
+
+      // Monaco reports replaced ranges in the old document, highest offset first.
+      // Keep the old lines of the active model; a normal keystroke updates one slot.
+      const trackRemovedText = (lines, model, event, key) => {
+        if (event.isFlush) return model.getLinesContent()
+        for (const { range, rangeLength, text } of event.changes) {
+          const first = range.startLineNumber - 1, last = range.endLineNumber - 1
+          const head = lines[first].slice(0, range.startColumn - 1)
+          const tail = lines[last].slice(range.endColumn - 1)
+          if (key && rangeLength > 0 && rangeLength <= 2000) {
+            const removed = first === last ? lines[first].slice(head.length, range.endColumn - 1) :
+              [lines[first].slice(head.length), ...lines.slice(first + 1, last), lines[last].slice(0, range.endColumn - 1)].join(event.eol)
+            const prefix = commonPrefixLengthLocal(removed, text)
+            let end = removed.length, other = text.length
+            while (end > prefix && other > prefix && removed[end - 1] === text[other - 1]) { end--; other-- }
+            remember(runtime.current.tab.revertions, key, removed.slice(prefix, end))
+          }
+          const added = text.split(/\r\n|[\r\n]/)
+          added[0] = head + added[0]
+          added[added.length - 1] += tail
+          if (first === last && added.length === 1) lines[first] = added[0]
+          else if (added.length < 8192) lines.splice(first, last - first + 1, ...added)
+          else lines = lines.slice(0, first).concat(added, lines.slice(last + 1))
+        }
+        return lines
+      }
+
+      const requestGhost = async (kind, triggerAt = performance.now()) => {
         const editor = runtime.current.editor
         if (editor === undefined) return
+        if (kind !== 'explicit' && kind !== 'refetch' && Date.now() < runtime.current.tab.snoozeUntil) return
+        if (kind === 'auto' && runtime.current.tab.plan !== undefined) return
+        // A staged block lives in the buffer; the request must describe the file
+        // the user actually has, not the proposal it is still deciding about.
+        if (runtime.current.tab.phantom !== undefined) clearGhost()
+        cancelGhostRequest()
         const model = editor.getModel()
         const position = editor.getPosition()
         if (model === null || position === null) return
-        const result = await complete(model, position, { triggerKind: explicit ? 1 : 0 }, undefined)
-        const ghostText = result !== undefined && typeof result.text === 'string' ? result.text : ''
-        if (ghostText === '') {
+        const controller = new AbortController()
+        runtime.current.tab.controller = controller
+        const version = model.getVersionId()
+        const isCurrent = () => {
+          if (controller.signal.aborted || editor.getModel() !== model || model.getVersionId() !== version) return false
+          const caret = editor.getPosition()
+          return caret?.lineNumber === position.lineNumber && caret.column === position.column
+        }
+        runtime.current.setHintBusy?.(true)
+        let result
+        try {
+          result = await complete(model, position, kind, controller.signal, isCurrent)
+        } finally {
+          // A superseded response must not turn off the newer request's spinner.
+          if (runtime.current.tab.controller === controller) {
+            runtime.current.tab.controller = undefined
+            runtime.current.setHintBusy?.(false)
+          }
+        }
+        if (!isCurrent()) return
+        if (result === undefined || result.plan === undefined) {
           clearGhost()
           return
         }
+        const plan = result.plan
+        if (model.getVersionId() !== plan.modelVersion) return
         const current = editor.getPosition()
-        if (current === null || current.lineNumber !== position.lineNumber || current.column !== position.column) return
-        showGhost(position, ghostText)
-      }, [complete, clearGhost, showGhost])
+        if (current === null) {
+          clearGhost()
+          return
+        }
+        const offset = model.getOffsetAt(current)
+        if (offset < plan.range.start || offset > plan.range.end) {
+          // The cursor moved while the model was answering.
+          clearGhost()
+          return
+        }
+        if (model.getValue().slice(plan.range.start, plan.range.end) !== plan.removedText) {
+          // The text under the plan changed, so the plan no longer describes it.
+          clearGhost()
+          return
+        }
+        runtime.current.tab.plan = plan
+        runtime.current.tab.accepted = 0
+        decorateRemoved(plan, model)
+        // The staging runs first: a block proposal inserts real lines, and the
+        // ghost then has to be positioned in the buffer those lines produced.
+        decorateEdits(plan, model)
+        if (plan.insertText !== '') {
+          const phantom = runtime.current.tab.phantom
+          const shift =
+            phantom === undefined
+              ? 0
+              : phantom.replaced.reduce(
+                  (sum, entry) =>
+                    entry.edit.start < plan.range.start ? sum + entry.text.length - entry.original.length : sum,
+                  0,
+                )
+          showGhost(model.getPositionAt(plan.range.start + shift), plan.insertText, model.getPositionAt(plan.range.end + shift))
+        } else {
+          clearGhostPreview()
+        }
+        // Keep the plan's own coordinates so a trajectory click can draw the
+        // same hint again without asking the model. Only the cursor block is
+        // replayed; other edits in the reply are not applied by a replay.
+        const hintKey = runtime.current.modelTabs.get(model.uri.toString())
+        const hintPath = stateRef.current.tabs.find((candidate) => candidate.key === hintKey)?.path || ''
+        pushTrace({
+          ...result.trace,
+          ok: true,
+          displayMs: Math.round(performance.now() - triggerAt),
+          hint: hintPath === ''
+            ? undefined
+            : {
+                path: hintPath,
+                kind: plan.kind,
+                range: plan.range,
+                removedText: plan.removedText,
+                insertText: plan.insertText,
+                modelVersion: plan.modelVersion,
+              },
+        })
+      }
 
-      const scheduleGhost = React.useCallback(() => {
-        window.clearTimeout(runtime.current.ghostTimer)
+      const scheduleGhost = (kind = 'auto') => {
+        cancelGhostRequest()
+        // One suggestion at a time: while one is on screen the user either
+        // accepts it or cancels it, so nothing asks the model again.
+        if (runtime.current.tab.plan !== undefined) return
         if (runtime.current.autoSuggest !== true) return
+        const editor = runtime.current.editor
+        if (editor === undefined || !editor.hasTextFocus()) return
+        const selection = editor.getSelection()
+        if (selection !== null && !selection.isEmpty()) return
+        const triggerAt = performance.now()
+        const delay = Number(tabPref('debounceMs', 500))
         runtime.current.ghostTimer = window.setTimeout(() => {
-          void requestGhost(false)
-        }, 320)
-      }, [requestGhost])
+          void requestGhost(kind, triggerAt)
+        }, Number.isFinite(delay) ? Math.max(0, delay) : 500)
+      }
 
-      const enableSuggestions = React.useCallback(async () => {
+      const enableSuggestions = async () => {
         const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
         if (active === undefined) {
           setConsent(undefined)
@@ -2505,12 +5867,12 @@ function IdeBody(props) {
           await call('settings', { id: active.hostId, sessionId: stateRef.current.sessionId, smartTab: true })
           setConsent(undefined)
           setStatus({ kind: 'ok', message: 'Подсказки включены для этой рабочей папки.' })
-          const instance = runtime.current.editor
-          if (instance !== undefined) instance.trigger('dsh-ide', 'editor.action.inlineSuggest.trigger', {})
+          runtime.current.tab.snoozeUntil = 0
+          void requestGhost('explicit')
         } catch (cause) {
           setStatus({ kind: 'error', message: describeError(cause) })
         }
-      }, [])
+      }
 
       // Pointer events cover the mouse, the pen and the finger; the handle also
       // needs `touch-action:none` in the stylesheet or the pane scrolls instead.
@@ -2585,30 +5947,31 @@ function IdeBody(props) {
         let editor
         try {
           editor = monaco.editor.create(hostRef.current, {
-          model: null,
-          automaticLayout: true,
-          theme: themeName() === 'dark' ? 'vs-dark' : 'vs',
-          fontSize,
-          // On a phone the line box grows with the glyphs, otherwise a big font
-          // would overlap the next line.
-          lineHeight: compactNow ? Math.round(fontSize * 1.5) : 20,
-          minimap: { enabled: false },
-          tabSize: 2,
-          insertSpaces: true,
-          scrollBeyondLastLine: false,
-          wordBasedSuggestions: 'off',
-          renderLineHighlight: 'line',
-          smoothScrolling: true,
-          wordWrap: wordWrap ? 'on' : 'off',
-          stickyScroll: { enabled: !compactNow },
-          scrollbar: {
-            verticalScrollbarSize: compactNow ? 14 : 10,
-            horizontalScrollbarSize: compactNow ? 14 : 10,
-            useShadows: false,
-          },
-          mouseWheelZoom: false,
-          padding: { top: compactNow ? 4 : 8, bottom: 24 },
-          inlineSuggest: { enabled: true },
+            model: null,
+            automaticLayout: true,
+            theme: themeName() === 'dark' ? 'vs-dark' : 'vs',
+            fontSize,
+            // On a phone the line box grows with the glyphs, otherwise a big font
+            // would overlap the next line.
+            lineHeight: compactNow ? Math.round(fontSize * 1.5) : 20,
+            minimap: { enabled: false },
+            tabSize: 2,
+            insertSpaces: true,
+            scrollBeyondLastLine: false,
+            wordBasedSuggestions: 'off',
+            renderLineHighlight: 'line',
+            smoothScrolling: true,
+            wordWrap: wordWrap ? 'on' : 'off',
+            stickyScroll: { enabled: !compactNow },
+            scrollbar: {
+              verticalScrollbarSize: compactNow ? 14 : 10,
+              horizontalScrollbarSize: compactNow ? 14 : 10,
+              useShadows: false,
+            },
+            mouseWheelZoom: false,
+            padding: { top: compactNow ? 4 : 8, bottom: 24 },
+            inlineSuggest: { enabled: true },
+            glyphMargin: true,
           })
         } catch (cause) {
           const message = messageOf(cause)
@@ -2620,64 +5983,225 @@ function IdeBody(props) {
         setEditorReady(true)
         runtime.current.monaco = monaco
 
-        const ghostNode = document.createElement('span')
-        ghostNode.className = 'dsh-ide-ghost'
-        ghostNode.style.display = 'none'
-        const ghostWidget = {
-          getId: () => 'dsh-ide.ghost',
-          getDomNode: () => ghostNode,
-          getPosition: () =>
-            runtime.current.ghostPosition === undefined
-              ? null
-              : { position: runtime.current.ghostPosition, preference: [monaco.editor.ContentWidgetPositionPreference.EXACT] },
+        const hintButton = document.createElement('button')
+        hintButton.type = 'button'
+        hintButton.className = 'dsh-ide-hint-button'
+        let hintStartedAt = 0
+        let hintTimerHandle = 0
+        const stopHintTimer = () => {
+          if (hintTimerHandle !== 0) clearInterval(hintTimerHandle)
+          hintTimerHandle = 0
         }
-        editor.addContentWidget(ghostWidget)
-        runtime.current.ghostNode = ghostNode
-        runtime.current.ghostWidget = ghostWidget
+        const showHintElapsed = (ms) => {
+          const element = hintElapsedRef.current
+          if (!element) return
+          element.hidden = false
+          element.textContent = `ИИ думает: ${ms} мс`
+        }
+        const hideHintElapsed = () => {
+          const element = hintElapsedRef.current
+          if (!element) return
+          element.hidden = true
+          element.textContent = ''
+        }
+        const setHintBusy = (busy) => {
+          stopHintTimer()
+          hintButton.textContent = busy ? '' : '💡'
+          if (busy) {
+            hintStartedAt = performance.now()
+            showHintElapsed(0)
+            const tick = () => {
+              showHintElapsed(Math.max(0, Math.round(performance.now() - hintStartedAt)))
+            }
+            tick()
+            hintTimerHandle = setInterval(tick, 100)
+          } else {
+            hideHintElapsed()
+          }
+          hintButton.title = busy ? 'ИИ готовит подсказку. Нажмите, чтобы отменить (Esc)' : 'Запросить подсказку ИИ (Ctrl+Space)'
+          hintButton.setAttribute('aria-label', hintButton.title)
+          hintButton.setAttribute('data-busy', String(busy))
+        }
+        setHintBusy(false)
+        runtime.current.setHintBusy = setHintBusy
+        // Keep the caret and editor focus: moving either invalidates a request.
+        hintButton.onmousedown = (event) => { event.preventDefault(); event.stopPropagation() }
+        hintButton.onclick = (event) => {
+          event.stopPropagation()
+          if (runtime.current.tab.controller) cancelGhostRequest()
+          else void requestGhost('explicit')
+          editor.focus()
+        }
+        let hintLine = 0
+        const hintWidget = {
+          getId: () => 'dsh-ide.ai-hint',
+          getDomNode: () => hintButton,
+          getPosition: () => ({ lane: monaco.editor.GlyphMarginLane.Right, range: new monaco.Range(hintLine, 1, hintLine, 1), zIndex: 1 }),
+        }
+        const syncHintLine = () => {
+          const model = editor.getModel()
+          const key = model && runtime.current.modelTabs.get(model.uri.toString())
+          const entry = key && stateRef.current.tabs.find(tab => tab.key === key)
+          const line = entry && !entry.readOnly ? editor.getPosition()?.lineNumber || 0 : 0
+          if (line === hintLine) return
+          const attached = hintLine !== 0
+          hintLine = line
+          if (!line) editor.removeGlyphMarginWidget(hintWidget)
+          else if (!attached) editor.addGlyphMarginWidget(hintWidget)
+          else editor.layoutGlyphMarginWidget(hintWidget)
+        }
+        syncHintLine()
+        let oldLines = editor.getModel()?.getLinesContent() || []
+        const modelChange = editor.onDidChangeModel(() => {
+          oldLines = editor.getModel()?.getLinesContent() || []
+          syncHintLine()
+        })
         runtime.current.ghostKey =
           typeof editor.createContextKey === 'function' ? editor.createContextKey('dshIdeGhostVisible', false) : undefined
 
-        const change = editor.onDidChangeModelContent(() => {
+        const change = editor.onDidChangeModelContent((event) => {
           const model = editor.getModel()
           if (model === null) return
-          clearGhost()
+          const internal = runtime.current.tab.internalEdit === true
+          const staging = runtime.current.tab.staging === true
           const key = runtime.current.modelTabs.get(model.uri.toString())
-          if (key === undefined) return
-          setTabs((previous) => previous.map((candidate) => (candidate.key === key && !candidate.dirty ? { ...candidate, dirty: true } : candidate)))
-          scheduleGhost()
+          oldLines = trackRemovedText(oldLines, model, event, !internal && !staging ? key : undefined)
+          if (key !== undefined && !staging) {
+            setTabs((previous) =>
+              previous.map((candidate) => (candidate.key === key && !candidate.dirty ? { ...candidate, dirty: true } : candidate)),
+            )
+          }
+          // An edit we made ourselves (Tab, Ctrl+→) must not cancel or re-ask.
+          if (internal || staging) return
+          if (runtime.current.inlineEdit !== undefined) dismissInlineEdit('typing')
+          const tab = runtime.current.tab, plan = tab.plan
+          const typed = event.changes.length === 1 ? event.changes[0] : undefined
+          if (plan?.kind === 'insert' && !tab.phantom && !plan.edits.length && plan.range.start === plan.range.end &&
+              !event.isFlush && !event.isUndoing && !event.isRedoing && !event.isEolChange &&
+              event.versionId === plan.modelVersion + 1 && typed?.rangeLength === 0 && typed.text.length > 0 &&
+              typed.rangeOffset === plan.range.start + tab.accepted && plan.insertText.startsWith(typed.text, tab.accepted) &&
+              editor.getSelections()?.length === 1) {
+            cancelGhostRequest()
+            const offset = typed.rangeOffset + typed.text.length
+            const rest = plan.insertText.slice(tab.accepted + typed.text.length)
+            if (!rest) clearGhost()
+            else {
+              tab.accepted = 0
+              tab.plan = { ...plan, range: { start: offset, end: offset }, insertText: rest, modelVersion: event.versionId }
+              showGhost(model.getPositionAt(offset), rest)
+            }
+            return
+          }
+          clearGhost()
+          scheduleGhost('auto')
         })
-        const blur = editor.onDidBlurEditorWidget(() => clearGhost())
+        const blur = editor.onDidBlurEditorWidget(() => {
+          cancelGhostRequest()
+          clearGhost()
+        })
+        let cursorTimer = 0
         const cursorChange = editor.onDidChangeCursorPosition((event) => {
-          setCursor({ line: event.position.lineNumber, column: event.position.column })
+          syncHintLine()
+          if (runtime.current.tab.internalEdit === true) return
+          if (runtime.current.tab.controller) cancelGhostRequest()
           const shown = runtime.current.ghostPosition
           if (shown !== undefined && (shown.lineNumber !== event.position.lineNumber || shown.column !== event.position.column)) clearGhost()
+          // The status bar needs the final position, not every intermediate one.
+          // A React update per mouse move re-renders the whole pane, which is
+          // what made placing the cursor feel heavy. Only a changed position is
+          // worth a render, and at most four times a second.
+          if (cursorTimer !== 0) return
+          cursorTimer = window.setTimeout(() => {
+            cursorTimer = 0
+            const position = editor.getPosition()
+            if (position === null) return
+            setCursor((current) =>
+              current.line === position.lineNumber && current.column === position.column
+                ? current
+                : { line: position.lineNumber, column: position.column },
+            )
+          }, 250)
         })
 
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-          void handlersRef.current.saveActive?.()
-        })
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW, () => handlersRef.current.closeActive?.())
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP, () => handlersRef.current.openQuick?.())
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS, () => {
-          void handlersRef.current.saveAll?.()
-        })
+        // Chords the user can remap are matched here rather than registered with
+        // addCommand: a registered chord cannot be changed afterwards, and a
+        // remapped one has to stop firing as well.
+        if (typeof editor.onKeyDown === 'function') {
+          editor.onKeyDown((event) => {
+            const id = matchChord(runtime.current.keymap, event)
+            if (id === undefined) return
+            const run = handlersRef.current[COMMAND_HANDLERS[id]]
+            if (typeof run !== 'function') return
+            event.preventDefault()
+            event.stopPropagation()
+            run()
+          })
+        }
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => {
           handlersRef.current.openOutput?.()
-          void handlersRef.current.requestGhost?.(true)
+          void handlersRef.current.requestGhost?.('explicit')
         })
         if (runtime.current.ghostKey !== undefined) {
-          editor.addCommand(monaco.KeyCode.Tab, () => acceptGhost(), 'editorTextFocus && dshIdeGhostVisible')
-          editor.addCommand(monaco.KeyCode.Escape, () => clearGhost(), 'editorTextFocus && dshIdeGhostVisible')
+          editor.addCommand(monaco.KeyCode.Tab, () => handlersRef.current.acceptGhost?.(), 'editorTextFocus && dshIdeGhostVisible')
+          // Escape drops the hint, and when there is no hint it collapses a
+          // selection. A selection that would not go away had no obvious way out
+          // once the pane stopped reacting to clicks.
+          editor.addCommand(
+            monaco.KeyCode.Escape,
+            () => {
+              if (handlersRef.current.cancelInline?.() === true) return
+              cancelGhostRequest()
+              if (handlersRef.current.rejectGhost?.() === true) return
+              const selection = editor.getSelection()
+              if (selection !== null && !selection.isEmpty()) editor.setPosition(selection.getPosition())
+            },
+            'editorTextFocus',
+          )
+          editor.addCommand(
+            monaco.KeyMod.CtrlCmd | monaco.KeyCode.RightArrow,
+            () => handlersRef.current.acceptWord?.(),
+            'editorTextFocus && dshIdeGhostVisible',
+          )
         }
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
+        // Settings, the trace panel and the quote command are dispatched above,
+        // from the same remappable keymap.
         // Same shortcuts a desktop editor uses for its own text size.
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Equal, () => bumpFont(1))
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Minus, () => bumpFont(-1))
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Digit0, () => resetFont())
+        // Inline Edit. The chord comes from the keymap (Ctrl+Shift+K by default,
+        // remappable in settings); the action only puts the command in Monaco's
+        // own context menu.
+        editor.addAction({
+          id: 'dsh-ide.inline-edit',
+          label: 'Изменить выделение…',
+          contextMenuGroupId: '1_modification',
+          contextMenuOrder: 1,
+          precondition: 'editorTextFocus',
+          run: () => handlersRef.current.openInlineEdit?.(),
+        })
+        // Link the active file and the lines highlighted in it into the chat.
+        // An action, not a bare command: the same declaration draws the entry in
+        // Monaco's own context menu; the chord is dispatched from the keymap.
+        editor.addAction({
+          id: 'dsh-ide.add-to-chat',
+          label: 'Добавить в чат',
+          contextMenuGroupId: '1_modification',
+          contextMenuOrder: 0.5,
+          precondition: 'editorTextFocus',
+          run: () => handlersRef.current.addToChat?.(),
+        })
 
         return () => {
-          window.clearTimeout(runtime.current.ghostTimer)
+          cancelGhostRequest()
+          clearInlineTraceTimer(runtime.current.inlineEdit)
+          runtime.current.inlineEdit?.controller?.abort()
+          window.clearTimeout(cursorTimer)
+          modelChange.dispose()
+          if (hintLine) editor.removeGlyphMarginWidget(hintWidget)
+          stopHintTimer()
+          hideHintElapsed()
+          runtime.current.setHintBusy = undefined
           blur.dispose()
           change.dispose()
           cursorChange.dispose()
@@ -2794,11 +6318,18 @@ function IdeBody(props) {
       }, [compact])
 
       // Keep the active tab bound to the editor, one model per tab.
+      //
+      // The dependency list is deliberately `[activeKey, monaco]`: marking a tab
+      // dirty rewrites `tabs` on every keystroke, and with `tabs` here this whole
+      // effect (clearGhost, updateOptions, focus) ran for every character typed,
+      // which is what made the editor feel like it was waiting for something.
       React.useEffect(() => {
+        cancelGhostRequest()
         clearGhost()
+        dismissInlineEdit('switch')
         const editor = runtime.current.editor
         if (!editor || !monaco || activeKey === '') return
-        const entry = tabs.find((candidate) => candidate.key === activeKey)
+        const entry = stateRef.current.tabs.find((candidate) => candidate.key === activeKey)
         if (entry === undefined) return
         let model = runtime.current.models.get(activeKey)
         if (model === undefined) {
@@ -2810,10 +6341,26 @@ function IdeBody(props) {
           if (editor.getModel() !== null) runtime.current.views.set(runtime.current.activeKey, editor.saveViewState())
           editor.setModel(model)
           const view = runtime.current.views.get(activeKey)
-          if (view !== undefined && view !== null) editor.restoreViewState(view)
+          if (view !== undefined && view !== null) {
+            editor.restoreViewState(view)
+            // A saved view state carries the selection as well as the scroll
+            // offset. A selection the user made once used to come back with the
+            // tab and looked like it could not be dismissed, so only the caret
+            // position is restored here.
+            const restored = editor.getPosition()
+            if (restored !== null) editor.setPosition(restored)
+          } else {
+            // A fresh tab has no view state, and Monaco keeps the selection of the
+            // model it replaced. Opening a second file after selecting text in the
+            // first one therefore started with the old selection over the new
+            // buffer, which looked like everything being highlighted.
+            editor.setSelection(new monaco.Selection(1, 1, 1, 1))
+            editor.setScrollTop(0)
+          }
           runtime.current.activeKey = activeKey
           const position = editor.getPosition()
           if (position !== null) setCursor({ line: position.lineNumber, column: position.column })
+          editor.focus()
         }
         editor.updateOptions({ readOnly: entry.readOnly === true })
         editor.focus()
@@ -2823,7 +6370,75 @@ function IdeBody(props) {
         if (model.getValue() === '' && entry.text !== '') {
           setEditorFailure('Редактор получил пустой текст файла.')
         }
-      }, [activeKey, tabs, monaco])
+      }, [activeKey, monaco])
+
+      // A trajectory row keeps the plan it described. Clicking it opens that
+      // file and draws the same block again; it never asks the model. The text
+      // must still match the recorded removed fragment, or the hint would sit
+      // over code it no longer describes.
+      React.useEffect(() => {
+        if (replayHint === undefined) return
+        const editor = runtime.current.editor
+        const model = editor?.getModel()
+        if (!editor || !model) return
+        if (runtime.current.modelTabs.get(model.uri.toString()) !== replayHint.key) return
+        const hint = replayHint
+        setReplayHint(undefined)
+        clearGhost()
+        if (model.getValue().slice(hint.range.start, hint.range.end) !== hint.removedText) {
+          setStatus({ kind: 'error', message: 'Файл изменился — подсказка из траектории больше не подходит.' })
+          return
+        }
+        const plan = {
+          // `decorateRemoved` only marks a real replacement; an empty removed
+          // fragment is a plain insertion.
+          kind: hint.removedText === '' ? 'insert' : 'replace',
+          range: hint.range,
+          removedText: hint.removedText,
+          insertText: hint.insertText,
+          edits: [],
+          modelVersion: model.getVersionId(),
+        }
+        runtime.current.tab.plan = plan
+        runtime.current.tab.accepted = 0
+        decorateRemoved(plan, model)
+        const start = model.getPositionAt(plan.range.start)
+        editor.setPosition(start)
+        editor.revealPositionInCenterIfOutsideViewport(start)
+        if (plan.insertText !== '') {
+          showGhost(start, plan.insertText, model.getPositionAt(plan.range.end))
+        } else {
+          clearGhostPreview()
+        }
+        // "Принять правку" from the trajectory menu opens the file and asks
+        // for the same plan to be applied immediately. The text check above
+        // still protects a stale record; Tab and this path share one code path.
+        if (hint.accept === true) acceptGhost()
+      }, [replayHint, activeKey])
+
+      // A hint belongs to the turn that was on screen when it was requested.
+      // As soon as that session starts a new turn, and again when the turn
+      // settles, the old ghost must go: otherwise it floats over a file while
+      // the model is already answering something else.
+      React.useEffect(() => {
+        const sessionService = services.uiSession
+          || (services.ctx && typeof services.ctx.get === 'function' ? services.ctx.get('uiSession') : undefined)
+        const status = sessionService && sessionService.sessionStatus
+        if (!status || typeof status.getSnapshot !== 'function' || typeof status.subscribe !== 'function') return undefined
+        let previous
+        const read = () => {
+          const current = status.getSnapshot().get(sessionId)
+          const running = current === undefined ? undefined : current.running
+          if (running === true || (previous === true && running === false)) {
+            cancelGhostRequest()
+            clearGhost()
+            runtime.current.setHintBusy?.(false)
+          }
+          previous = running
+        }
+        read()
+        return status.subscribe(read)
+      }, [sessionId, clearGhost])
 
       // A phone either paints the editor quickly or not at all. If the stage
       // stays empty for a few seconds while a file is open, show the text.
@@ -2842,6 +6457,191 @@ function IdeBody(props) {
         dirtyTabs.clear()
         for (const candidate of tabs) if (candidate.dirty) dirtyTabs.add(candidate.key)
       }, [tabs])
+
+      // The changes pane reads the Host's checkpoint index when it opens: a turn
+      // that happened while the pane was closed shows up on the next open, and a
+      // closed pane costs no reads at all.
+      React.useEffect(() => {
+        if (!changesOpen) return undefined
+        if (typeof sessionId !== 'string' || sessionId === '') return undefined
+        let cancelled = false
+        setAssistant((current) => ({ ...current, phase: 'pending', error: '' }))
+        call('agentChanges', { sessionId })
+          .then((payload) => {
+            if (cancelled) return
+            setAssistant({
+              phase: 'ready',
+              available: payload !== null && payload.available === true,
+              turns: Array.isArray(payload?.turns) ? payload.turns : [],
+              error: '',
+            })
+          })
+          .catch((cause) => {
+            if (cancelled || cause?.code === 'cancelled') return
+            setAssistant({ phase: 'failed', available: true, turns: [], error: describeError(cause) })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [changesOpen, changesReload, sessionId])
+
+      // Decisions on assistant turns live here rather than inside the explorer:
+      // the same two buttons also sit on the side-by-side comparison, and a
+      // second copy of that state would drift from this one.
+      const acceptAssistant = (turn, file) => {
+        const key = `${turn.seq}:${file.index}`
+        // The assistant already wrote the file. Accepting records that the user
+        // looked at the comparison and keeps the result; nothing is written.
+        setAssistantWork((current) => ({ ...current, [key]: { phase: 'accepted', error: '' } }))
+      }
+
+      // «Принять все» is the same decision for every file of the turn: the
+      // files are already on disk, so this only stops asking about them.
+      const acceptAssistantAll = (turn) => {
+        const files = Array.isArray(turn?.files) ? turn.files : []
+        setAssistantWork((current) => {
+          const next = { ...current }
+          for (const file of files) next[`${turn.seq}:${file.index}`] = { phase: 'accepted', error: '' }
+          return next
+        })
+      }
+
+      const revertAssistant = async (turn, file) => {
+        const key = `${turn.seq}:${file.index}`
+        setAssistantWork((current) => ({ ...current, [key]: { phase: 'saving', error: '' } }))
+        try {
+          await call('agentChangeRestore', { sessionId, seq: turn.seq, index: file.index })
+          setAssistantWork((current) => ({ ...current, [key]: { phase: 'reverted', error: '' } }))
+          setChangesReload((value) => value + 1)
+          // The comparison showed the text that was just replaced.
+          setDiffView((current) => (current !== undefined && `${current.seq}:${current.index}` === key ? undefined : current))
+          setStatus({ kind: 'ok', message: `Правки отменены: ${file.display || file.path}` })
+        } catch (cause) {
+          if (cause?.code === 'cancelled') return
+          setAssistantWork((current) => ({ ...current, [key]: { phase: 'failed', error: describeError(cause) } }))
+        }
+      }
+
+      // «Отменить все» reverts file by file: the Host writes one file per call,
+      // so a failure on the second file keeps the first one reverted and the
+      // pane shows both outcomes instead of pretending it was atomic.
+      const revertAssistantAll = async (turn) => {
+        const files = Array.isArray(turn?.files) ? turn.files : []
+        for (const file of files) await revertAssistant(turn, file)
+        setDiffView(undefined)
+      }
+
+      const openAssistantDiff = async (turn, file) => {
+        if (typeof sessionId !== 'string' || sessionId === '') return
+        // `files` keeps the whole turn in the footer list, so «Принять все» and
+        // «Отменить все» act on the same set the pane shows.
+        setDiffView({
+          phase: 'pending',
+          turn,
+          file,
+          files: Array.isArray(turn.files) ? turn.files : [],
+          seq: turn.seq,
+          index: file.index,
+          path: file.path,
+          display: file.display,
+          error: '',
+        })
+        try {
+          const payload = await call('agentChangeText', { sessionId, seq: turn.seq, index: file.index })
+          setDiffView((current) => {
+            if (current === undefined || current.seq !== turn.seq || current.index !== file.index) return current
+            return { ...current, ...payload, phase: 'ready', error: '' }
+          })
+        } catch (cause) {
+          if (cause?.code === 'cancelled') return
+          setDiffView((current) => {
+            if (current === undefined || current.seq !== turn.seq || current.index !== file.index) return current
+            return { ...current, phase: 'failed', error: describeError(cause) }
+          })
+        }
+      }
+
+      // The explorer pane is far too narrow for two columns, so the comparison
+      // opens over the editor the way Cursor shows a change before accepting it.
+      const diffKey = diffView === undefined ? '' : `${diffView.phase}:${diffView.seq}:${diffView.index}`
+      React.useEffect(() => {
+        const container = diffContainerRef.current
+        if (!monaco || diffView === undefined || diffView.phase !== 'ready' || container === undefined) return undefined
+        const language = typeof diffView.language === 'string' && diffView.language !== '' ? diffView.language : 'plaintext'
+        const uid = `${diffView.seq}-${diffView.index}`
+        const original = monaco.editor.createModel(
+          String(diffView.before ?? ''),
+          language,
+          monaco.Uri.parse(`inmemory://dsh-ide/diff-before/${uid}`),
+        )
+        const modified = monaco.editor.createModel(
+          String(diffView.after ?? ''),
+          language,
+          monaco.Uri.parse(`inmemory://dsh-ide/diff-after/${uid}`),
+        )
+        const editor = monaco.editor.createDiffEditor(container, {
+          readOnly: true,
+          // The two-column view is the desktop default, but on a phone each
+          // column would be half of an already narrow pane, so compact turns on
+          // the unified view instead.
+          renderSideBySide: !compact,
+          useInlineViewWhenSpaceIsLimited: compact,
+          renderSideBySideInlineBreakpoint: compact ? 900 : 0,
+          // Same wrapping as the request: long lines must not force a horizontal
+          // scroll in a pane that is shown side by side on every width.
+          wordWrap: 'on',
+          diffWordWrap: 'on',
+          // The overview ruler is what shows where the changes are on the
+          // scrollbar; without it the two columns give no map of the diff.
+          renderOverviewRuler: true,
+          overviewRulerBorder: false,
+          renderIndicators: true,
+          automaticLayout: true,
+          ignoreTrimWhitespace: false,
+          scrollBeyondLastLine: false,
+          // `themeName()` answers 'dark'/'light', which are not Monaco theme
+          // ids, so the diff fell back to the default light theme while the
+          // plain editor already used vs-dark.
+          theme: themeName() === 'dark' ? 'vs-dark' : 'vs',
+        })
+        editor.setModel({ original, modified })
+        runtime.current.diffEditor = { editor, original, modified }
+        return () => {
+          runtime.current.diffEditor = undefined
+          editor.dispose()
+          original.dispose()
+          modified.dispose()
+        }
+      }, [monaco, diffKey, compact])
+
+      // A search hit opens the file and then puts the caret on the matched line.
+      // The reveal waits until the tab really owns the editor model, otherwise the
+      // caret would land in the previous file while the new tab is still loading.
+      React.useEffect(() => {
+        const pending = runtime.current.pendingReveal
+        if (pending === undefined) return
+        const entry = tabs.find((candidate) => candidate.key === activeKey)
+        if (entry === undefined || normalPath(entry.path) !== pending.path) return
+        const editor = runtime.current.editor
+        if (editor === undefined) return
+        const model = editor.getModel()
+        if (model === null || runtime.current.modelTabs.get(model.uri.toString()) !== entry.key) return
+        runtime.current.pendingReveal = undefined
+        const line = pending.offset === undefined
+          ? Math.max(1, Math.min(pending.line, model.getLineCount()))
+          : model.getPositionAt(Math.min(pending.offset, model.getValueLength())).lineNumber
+        const end = pending.end === undefined ? line : Math.max(line, Math.min(pending.end, model.getLineCount()))
+        if (end === line) {
+          editor.setPosition({ lineNumber: line, column: 1 })
+        } else {
+          editor.setSelection({ startLineNumber: line, startColumn: 1, endLineNumber: end, endColumn: model.getLineMaxColumn(end) })
+        }
+        if (typeof editor.revealLineInCenterIfOutsideViewport === 'function') {
+          editor.revealLineInCenterIfOutsideViewport(line)
+        }
+        setCursor({ line, column: 1 })
+        editor.focus()
+      }, [activeKey, tabs])
 
       React.useEffect(() => {
         if (tab === undefined || typeof tab.id !== 'string') return
@@ -2866,6 +6666,7 @@ function IdeBody(props) {
             if (cancelled) return
             const loaded = prefsPayload.preferences || {}
             setPreferences(loaded)
+            if (typeof prefsPayload.promptDefault === 'string') setPromptDefault(prefsPayload.promptDefault)
             runtime.current.autoSuggest = loaded.autoSuggest !== false
             const saved = statePayload.state || {}
             if (typeof saved.treeWidth === 'number') setExplorerWidth(saved.treeWidth)
@@ -2880,6 +6681,7 @@ function IdeBody(props) {
             if (saved.explorerSide === 'right') setExplorerSide('right')
             setShowTree(saved.showTree !== false)
             setHidden(saved.hidden === true)
+            if (loaded.showChat !== false) setPanel({ tab: 'chat', index: 0 })
             const wanted = []
             if (initialPath !== '') wanted.push(initialPath)
             for (const candidate of Array.isArray(saved.tabs) ? saved.tabs : []) {
@@ -2922,6 +6724,15 @@ function IdeBody(props) {
         const apply = (request) => {
           if (request === undefined || request.path === '' || request.nonce <= consumedOpen.current) return
           consumedOpen.current = request.nonce
+          // A chip click names lines: the caret lands there once the tab owns
+          // the model, through the same one-shot reveal a search hit uses.
+          if (request.lineRange !== undefined) {
+            runtime.current.pendingReveal = {
+              path: normalPath(request.path),
+              line: request.lineRange.start,
+              end: request.lineRange.end,
+            }
+          }
           void openFile(request.path, { activate: true })
         }
         apply(latestOpen(sessionId))
@@ -2955,7 +6766,13 @@ function IdeBody(props) {
         try {
           const payload = await call('prefs', { patch })
           const loaded = payload.preferences || {}
+          if (prefsRef.current?.fullTrace && loaded.fullTrace !== true) {
+            cancelGhostRequest()
+            setTrace(rows => rows.map(({ conversation, ...metadata }) => metadata))
+          }
+          prefsRef.current = loaded
           setPreferences(loaded)
+          if (typeof payload.promptDefault === 'string') setPromptDefault(payload.promptDefault)
           runtime.current.autoSuggest = loaded.autoSuggest !== false
           setSettingsOpen(false)
           setStatus({ kind: 'ok', message: 'Настройки сохранены' })
@@ -3042,9 +6859,27 @@ function IdeBody(props) {
         openQuick,
         complete,
         toggleOutput,
-        openOutput: () => setPanel({ tab: 'trajectory', index: 0 }),
+        openOutput: () => setPanel({ tab: showChat ? 'chat' : 'trajectory', index: 0 }),
         openSettings,
-        requestGhost: (explicit) => void requestGhost(explicit === true),
+        openPalette: () => setPaletteOpen(true),
+        openSearch: () => {
+          setShowTree(true)
+          setChangesOpen(false)
+          setSearchOpen(true)
+        },
+        requestGhost: (kind) => void requestGhost(kind === 'explicit' ? 'explicit' : 'auto'),
+        acceptGhost,
+        acceptWord,
+        rejectGhost,
+        quoteSelection: () => quoteEditorFragment(),
+        addToChat: () => {
+          if (activeTab === undefined) return
+          addFileToChat(activeTab.path, false)
+        },
+        nextTab: () => cycleTab(1),
+        prevTab: () => cycleTab(-1),
+        openInlineEdit: () => openInlineEdit(),
+        cancelInline: () => dismissInlineEdit('esc', true),
       }
 
       const withEditor = (run) => {
@@ -3173,6 +7008,14 @@ function IdeBody(props) {
 
       // The same top-level arrangement as VS Code. Commands the IDE cannot honour
       // are disabled with the reason in their tooltip instead of being hidden.
+      // Menu labels follow the live keymap: a remapped chord must not keep the
+      // old default printed next to the command.
+      const menuChords = resolveKeymap(keybindingsOf(preferences))
+      const chordLabel = (commandId) => {
+        const chord = menuChords.get(commandId)
+        return chord === undefined ? undefined : chordText(chord)
+      }
+
       const menus = [
         {
           id: 'file',
@@ -3180,21 +7023,27 @@ function IdeBody(props) {
           items: [
             { id: 'new', label: 'Новый файл…', run: () => createFile() },
             { id: 'new-folder', label: 'Новая папка…', run: () => createDirectory() },
-            { id: 'open', label: 'Открыть файл…', key: 'Ctrl+P', run: openQuick },
+            { id: 'open', label: 'Открыть файл…', key: chordLabel('quick-open'), run: openQuick },
             { separator: true },
-            { id: 'save', label: 'Сохранить', key: 'Ctrl+S', run: () => void saveActive() },
-            { id: 'save-all', label: 'Сохранить всё', key: 'Ctrl+Shift+S', run: () => void saveAll() },
+            { id: 'save', label: 'Сохранить', key: chordLabel('save'), run: () => void saveActive() },
+            { id: 'save-all', label: 'Сохранить всё', key: chordLabel('save-all'), run: () => void saveAll() },
             { separator: true },
-            { id: 'close', label: 'Закрыть вкладку', key: 'Ctrl+W', run: closeActive },
+            { id: 'explain', label: 'Объяснить выделенное…', run: () => draftQuestion('explain') },
+            { id: 'prepare-plan', label: 'Подготовить план…', run: () => draftQuestion('plan') },
+            { id: 'add-to-chat', label: 'Файл в чат', key: chordLabel('add-to-chat'), run: () => handlersRef.current.addToChat?.() },
+            { separator: true },
+            { id: 'close', label: 'Закрыть вкладку', key: chordLabel('close-tab'), run: closeActive },
             { id: 'close-all', label: 'Закрыть все вкладки', run: closeAllTabs },
             { separator: true },
             { id: 'refresh', label: 'Обновить дерево', run: () => setReloadSignal((previous) => previous + 1) },
             { id: 'toggle-tree', label: showTree ? 'Скрыть проводник' : 'Показать проводник', run: () => setShowTree(!showTree) },
-        {
-          id: 'swap-explorer',
-          label: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
-          run: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
-        },
+            {
+              id: 'swap-explorer',
+              label: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
+              run: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
+            },
+            { separator: true },
+            { id: 'settings', label: 'Настройки IDE…', key: chordLabel('settings'), run: openSettings },
             { id: 'open-folder', label: 'Открыть папку…', disabled: true, hint: 'Рабочая папка задаётся сессией DSH; другая папка открывается только в новой сессии.' },
           ],
         },
@@ -3219,10 +7068,13 @@ function IdeBody(props) {
           label: 'Выделение',
           items: [
             { id: 'select-all', label: 'Выделить всё', key: 'Ctrl+A', run: () => runAction('editor.action.selectAll') },
-            { id: 'select-line', label: 'Выделить строку', key: 'Ctrl+L', run: () => runAction('expandLineSelection') },
+            { id: 'select-line', label: 'Выделить строку', run: () => runAction('expandLineSelection') },
             { separator: true },
             { id: 'expand', label: 'Расширить выделение', key: 'Shift+Alt+→', run: () => runAction('editor.action.smartSelect.expand') },
             { id: 'shrink', label: 'Сузить выделение', key: 'Shift+Alt+←', run: () => runAction('editor.action.smartSelect.shrink') },
+            { separator: true },
+            { id: 'quote', label: 'Строки в чат', key: chordLabel('quote'), run: () => handlersRef.current.quoteSelection?.() },
+            { id: 'inline-edit', label: 'Изменить выделение…', key: chordLabel('inline-edit'), run: () => handlersRef.current.openInlineEdit?.() },
           ],
         },
         {
@@ -3230,6 +7082,7 @@ function IdeBody(props) {
           label: 'Вид',
           items: [
             { id: 'word-wrap', label: wordWrap ? 'Отключить перенос по словам' : 'Включить перенос по словам', run: toggleWordWrap },
+            { id: 'palette', label: 'Палитра команд…', key: chordLabel('command-palette'), run: () => setPaletteOpen(true) },
             { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показывать скрытые файлы', run: () => setHidden(!hidden) },
             { separator: true },
             { id: 'zoom-in', label: 'Увеличить шрифт', key: 'Ctrl+=', run: () => zoom(1) },
@@ -3239,11 +7092,10 @@ function IdeBody(props) {
             {
               id: 'output',
               label: panel === undefined ? 'Показать панель вывода' : 'Скрыть панель вывода',
-              key: 'Ctrl+',
+              key: chordLabel('output'),
               run: toggleOutput,
             },
             { separator: true },
-            { id: 'settings', label: 'Настройки IDE…', key: 'Ctrl+,', run: () => setSettingsOpen(true) },
             { id: 'connect-model', label: 'Подключить модель…', run: () => setModelDialog(true) },
             { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
           ],
@@ -3252,7 +7104,7 @@ function IdeBody(props) {
           id: 'go',
           label: 'Переход',
           items: [
-            { id: 'goto-file', label: 'Перейти к файлу…', key: 'Ctrl+P', run: openQuick },
+            { id: 'goto-file', label: 'Перейти к файлу…', key: chordLabel('quick-open'), run: openQuick },
             { id: 'goto-line', label: 'Перейти к строке…', key: 'Ctrl+G', run: () => runAction('editor.action.gotoLine') },
             { separator: true },
             {
@@ -3327,21 +7179,41 @@ function IdeBody(props) {
             {
               id: 'shortcuts',
               label: 'Горячие клавиши',
-              run: () =>
-                setInfo({
-                  title: 'Горячие клавиши',
-                  lines: [
-                    'Ctrl+S — сохранить файл, Ctrl+Shift+S — сохранить всё',
-                    'Ctrl+W — закрыть вкладку, Ctrl+P — открыть файл по имени',
-                    'Ctrl+G — перейти к строке, Ctrl+Space — подсказка модели',
-                  ],
-                }),
+              run: () => {
+                // Built from the same table the editor dispatches, so the help
+                // cannot drift from the real map.
+                const keymapNow = resolveKeymap(keybindingsOf(preferences))
+                const lines = []
+                for (const command of KEY_COMMANDS) {
+                  const chord = keymapNow.get(command.id)
+                  const text = chord === undefined ? command.chord : chordText(chord)
+                  lines.push(`${text} — ${command.label.toLowerCase()}`)
+                }
+                lines.push('Tab — принять подсказку, Esc — отклонить, Ctrl+→ — принять слово')
+                lines.push('Все клавиши, кроме Tab и Esc, переназначаются: Параметры → Клавиши')
+                setInfo({ title: 'Горячие клавиши', lines })
+              },
             },
           ],
         },
       ]
 
+      const replayRow = (row, accept) => {
+        const index = Math.max(0, trace.indexOf(row))
+        // Keep the trajectory visible: a replay is something the user may want
+        // to compare across several rows, and switching to Chat hid the list.
+        setPanel((current) => ({ tab: current === undefined ? 'trajectory' : current.tab, index }))
+        if (row === undefined || row.hint === undefined) return
+        void openFile(row.hint.path, { activate: true }).then((entry) => {
+          if (entry !== undefined) setReplayHint({ ...row.hint, key: entry.key, accept })
+        })
+      }
+      const replayTrace = (index, accept = false) => replayRow(trace[index], accept)
+
       const activeTab = tabs.find((candidate) => candidate.key === activeKey)
+      // Buttons of the comparison show the same decision as the row in the pane.
+      const diffWork = diffView === undefined ? undefined : assistantWork[`${diffView.seq}:${diffView.index}`]
+      const diffDecided = diffWork !== undefined && (diffWork.phase === 'accepted' || diffWork.phase === 'reverted')
       const segments = activeTab === undefined ? [] : activeTab.path.split('/')
       const statusMessage = status.kind === 'error' || status.kind === 'ok' || status.kind === 'busy' ? status.message : ''
 
@@ -3367,6 +7239,7 @@ function IdeBody(props) {
           'data-theme': themeName(),
           'data-compact': compact ? '' : undefined,
           'data-touch': coarsePointer ? '' : undefined,
+          onKeyDown: onRootKeyDown,
         },
         menuId === ''
           ? null
@@ -3497,20 +7370,31 @@ function IdeBody(props) {
               'button',
               {
                 type: 'button',
-                className: 'dsh-ide-activity-button',
-                title: 'Быстрое открытие файла (Ctrl+P)',
-                onClick: openQuick,
+                className: `dsh-ide-activity-button${searchOpen ? ' dsh-ide-activity-button-active' : ''}`,
+                title: 'Поиск в файлах (Ctrl+Shift+F)',
+                'aria-label': 'Поиск в файлах',
+                onClick: () => {
+                  setShowTree(true)
+                  setChangesOpen(false)
+                  setSearchOpen(true)
+                },
               },
-              h(
-                'svg',
-                { width: '18', height: '18', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
-                h('path', {
-                  fill: 'none',
-                  stroke: 'currentColor',
-                  strokeWidth: '1.3',
-                  d: 'M7 2.6a4.4 4.4 0 1 0 0 8.8 4.4 4.4 0 0 0 0-8.8zM10.4 10.4 14 14',
-                }),
-              ),
+              h('span', { className: 'dsh-ide-activity-glyph' }, '🔍'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: `dsh-ide-activity-button${changesOpen ? ' dsh-ide-activity-button-active' : ''}`,
+                title: changes.length === 0 ? 'Изменения этой сессии' : `Изменения этой сессии: ${changes.length}`,
+                'aria-label': 'Изменения',
+                onClick: () => {
+                  setShowTree(true)
+                  setSearchOpen(false)
+                  setChangesOpen((open) => !open)
+                },
+              },
+              h('span', { className: 'dsh-ide-activity-glyph' }, '🕘'),
             ),
             h('span', { className: 'dsh-ide-activity-spacer' }),
             h(
@@ -3553,10 +7437,39 @@ function IdeBody(props) {
                   hidden,
                   reloadSignal,
                   activePath: activeTab === undefined ? '' : activeTab.path,
-                  onOpenFile: (path) => {
+                  onOpenFile: (path, line) => {
+                    if (typeof line === 'number') {
+                      runtime.current.pendingReveal = { path: normalPath(path), line }
+                    }
                     // The file has to be seen: get the drawer out of the way.
                     if (compactRef.current) setShowTree(false)
                     void openFile(path, { activate: true })
+                  },
+                  searchOpen,
+                  onCloseSearch: () => setSearchOpen(false),
+                  changesOpen,
+                  changes,
+                  assistant,
+                  assistantWork,
+                  onOpenDiff: (turn, file) => {
+                    void openAssistantDiff(turn, file)
+                  },
+                  onAcceptAssistant: acceptAssistant,
+                  onRevertAssistant: (turn, file) => {
+                    void revertAssistant(turn, file)
+                  },
+                  onReloadChanges: () => setChangesReload((value) => value + 1),
+                  onCloseChanges: () => setChangesOpen(false),
+                  onOpenChange: openChange,
+                  onRevertChange: revertChange,
+                  onInsertReference: (path, line) => {
+                    insertChatReference(path, { lineRange: { start: line, end: line } })
+                  },
+                  onQuoteFile: (path, directory) => {
+                    addFileToChat(path, directory)
+                  },
+                  onQuoteLines: (path) => {
+                    requestQuoteLines(path, false)
                   },
                   onToggleHidden: setHidden,
                   createRequest,
@@ -3581,7 +7494,14 @@ function IdeBody(props) {
             : null,
           h(
             'div',
-            { className: 'dsh-ide-editor', style: compact ? undefined : { order: explorerSide === 'left' ? 2 : 0 } },
+            {
+              className: 'dsh-ide-editor',
+              style: compact ? undefined : { order: explorerSide === 'left' ? 2 : 0 },
+              onDragOver: onEditorDragOver,
+              onDragLeave: onEditorDragLeave,
+              onDrop: onEditorDrop,
+            },
+            dragOver === '' ? null : h('div', { className: 'dsh-ide-drop-overlay' }, h('span', { className: 'dsh-ide-drop-overlay-text' }, `Сослаться в чате: ${mentionLabel(dragOver)}`)),
             h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab, onContextMenu: openTabMenu, compact }),
             consent === undefined
               ? null
@@ -3605,6 +7525,127 @@ function IdeBody(props) {
                       'button',
                       { type: 'button', className: 'dsh-ide-button', onClick: () => setConsent(undefined) },
                       'Не сейчас',
+                    ),
+                  ),
+                ),
+            inlineView === undefined
+              ? null
+              : h(
+                  'div',
+                  { className: 'dsh-ide-inline', 'data-phase': inlineView.phase },
+                  h(
+                    'span',
+                    { className: 'dsh-ide-inline-label' },
+                    inlineView.phase === 'preview' ? 'Предложение' : inlineView.phase === 'pending' ? 'Правка' : 'Изменить выделение',
+                  ),
+                  inlineView.phase === 'input' || inlineView.phase === 'pending'
+                    ? h('input', {
+                        ref: inlineInputRef,
+                        className: 'dsh-ide-inline-input',
+                        value: inlineView.instruction,
+                        placeholder: 'Что изменить в выделенном коде?',
+                        disabled: inlineView.phase === 'pending',
+                        onChange: (event) => setInlineInstruction(event.target.value),
+                        onKeyDown: (event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            void submitInlineEdit()
+                          } else if (event.key === 'Escape') {
+                            event.preventDefault()
+                            dismissInlineEdit('esc', true)
+                          }
+                        },
+                      })
+                    : null,
+                  inlineView.phase === 'pending' ? h('span', { className: 'dsh-ide-inline-text' }, 'Модель готовит правку…') : null,
+                  inlineView.phase === 'preview'
+                    ? h('span', { className: 'dsh-ide-inline-text' }, `+${inlineView.addedLines} / −${inlineView.removedLines} строк`)
+                    : null,
+                  inlineView.error === '' ? null : h('span', { className: 'dsh-ide-inline-error' }, inlineView.error),
+                  h(
+                    'span',
+                    { className: 'dsh-ide-inline-actions' },
+                    inlineView.phase === 'input' && (preferences === undefined || preferences.inlineEditConsent !== true)
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button dsh-ide-button-primary',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              void allowInlineEdit()
+                            },
+                          },
+                          'Разрешить',
+                        )
+                      : null,
+                    inlineView.phase === 'input'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button dsh-ide-button-primary',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              void submitInlineEdit()
+                            },
+                          },
+                          'Отправить',
+                        )
+                      : null,
+                    inlineView.phase === 'preview'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button dsh-ide-button-primary',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              acceptInlineEdit()
+                            },
+                          },
+                          'Принять',
+                        )
+                      : null,
+                    inlineView.phase === 'preview'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              refineInlineEdit()
+                            },
+                          },
+                          'Уточнить',
+                        )
+                      : null,
+                    inlineView.phase === 'stale' || inlineView.phase === 'failed'
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button',
+                            onClick: (event) => {
+                              event.preventDefault()
+                              dismissInlineEdit('close', true)
+                            },
+                          },
+                          'Закрыть',
+                        )
+                      : null,
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-ide-button',
+                        onClick: (event) => {
+                          event.preventDefault()
+                          dismissInlineEdit('esc', true)
+                        },
+                      },
+                      'Отмена',
                     ),
                   ),
                 ),
@@ -3699,6 +7740,27 @@ function IdeBody(props) {
                     h('pre', { className: 'dsh-ide-stage-fallback-code' }, activeTab.text),
                   )
                 : null,
+              // Side-by-side comparison of one assistant file, drawn over the
+              // editor: two panes need the width, the explorer pane has none.
+            diffView === undefined
+              ? null
+              : h(DiffReview, {
+                  view: diffView,
+                  work: assistantWork,
+                  onAccept: (file) => acceptAssistant(diffView.turn, file),
+                  onRevert: (file) => {
+                    void revertAssistant(diffView.turn, file)
+                  },
+                  onAcceptAll: () => acceptAssistantAll(diffView.turn),
+                  onRevertAll: () => {
+                    void revertAssistantAll(diffView.turn)
+                  },
+                  onOpenFile: (path) => {
+                    void openFile(path, { activate: true })
+                  },
+                  onClose: () => setDiffView(undefined),
+                  containerRef: diffContainerRef,
+                }),
             ),
             panel === undefined ? null : h('div', { className: 'dsh-ide-panel-resize', onPointerDown: beginPanelResize }),
             panel === undefined
@@ -3707,14 +7769,17 @@ function IdeBody(props) {
                   panel,
                   height: panelHeight,
                   trace,
+                  showChat,
                   onTab: (tab) => setPanel({ tab, index: panel.index }),
-                  onSelect: (index) => setPanel({ tab: 'chat', index }),
+                  onSelect: replayTrace,
+                  onAccept: (row) => replayRow(row, true),
                   onClose: () => setPanel(undefined),
                 }),
             h(
               'div',
               { className: 'dsh-ide-status' },
               h('span', { className: `dsh-ide-status-text${status.kind === 'error' ? ' dsh-ide-status-error' : ''}` }, statusMessage),
+              h('span', { className: 'dsh-ide-status-item dsh-ide-hint-elapsed', ref: hintElapsedRef, hidden: true }, ''),
               h('span', { className: 'dsh-ide-status-spacer' }),
               activeTab === undefined
                 ? null
@@ -3744,6 +7809,30 @@ function IdeBody(props) {
                     ),
                   )
                 : null,
+              activeTab === undefined
+                ? null
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action',
+                      title: `Добавить файл и выделенные строки в чат ссылкой (${ADD_TO_CHAT_KEY})`,
+                      onClick: () => handlersRef.current.addToChat?.(),
+                    },
+                    'В чат',
+                  ),
+              activeTab === undefined
+                ? null
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action',
+                      title: 'Вставить выделение или текущую строку в чат текстом (Ctrl+L)',
+                      onClick: () => void quoteEditorFragment(),
+                    },
+                    'Цитата',
+                  ),
             ),
           ),
         ),
@@ -3752,6 +7841,7 @@ function IdeBody(props) {
           ? h(SettingsPanel, {
               preferences,
               sessionModel: catalog === undefined ? undefined : catalog.default,
+              promptDefault,
               onClose: () => setSettingsOpen(false),
               onSave: saveSettings,
               onAddModel: () => setModelDialog(true),
@@ -3767,6 +7857,27 @@ function IdeBody(props) {
                 setModelDialog(false)
                 setSettingsOpen(false)
               },
+            })
+          : null,
+        paletteOpen
+          ? h(CommandPalette, {
+              commands: menus.flatMap((menu) =>
+                menu.items
+                  .filter((item) => item.separator !== true && typeof item.run === 'function')
+                  .map((item) => ({
+                    id: `${menu.id}:${item.id}`,
+                    label: item.label,
+                    group: menu.label,
+                    key: item.key,
+                    disabled: item.disabled === true,
+                    run: item.run,
+                  })),
+              ),
+              onPick: (entry) => {
+                setPaletteOpen(false)
+                entry.run()
+              },
+              onClose: () => setPaletteOpen(false),
             })
           : null,
         quick !== undefined
@@ -3800,6 +7911,50 @@ function IdeBody(props) {
           : h(TabContextMenu, { menu: tabMenu, items: tabMenuItems, onClose: () => setTabMenu(undefined) }),
         prompt === undefined ? null : h(PromptDialog, { prompt, onClose: () => setPrompt(undefined) }),
         info === undefined ? null : h(InfoDialog, { info, onClose: () => setInfo(undefined) }),
+        quotePrompt === undefined
+          ? null
+          : h(
+              'div',
+              { className: 'dsh-ide-modal', onClick: () => setQuotePrompt(undefined) },
+              h(
+                'div',
+                { className: 'dsh-ide-modal-card', onClick: (event) => event.stopPropagation() },
+                h('div', { className: 'dsh-ide-modal-title' }, 'Добавить в чат'),
+                h('div', { className: 'dsh-ide-modal-text' }, baseName(quotePrompt.path)),
+                quotePrompt.directory === true
+                  ? null
+                  : h('input', {
+                      className: 'dsh-ide-input dsh-ide-input-number',
+                      type: 'text',
+                      inputMode: 'numeric',
+                      autoFocus: true,
+                      placeholder: 'Например, 3 или 3-7 (пусто — весь файл)',
+                      value: quotePrompt.value,
+                      onChange: (event) => setQuotePrompt({ ...quotePrompt, value: event.target.value }),
+                      onKeyDown: (event) => {
+                        if (event.key === 'Enter') applyQuoteLines('reference')
+                        else if (event.key === 'Escape') setQuotePrompt(undefined)
+                      },
+                    }),
+                h(
+                  'div',
+                  { className: 'dsh-ide-modal-actions' },
+                  h('button', { type: 'button', className: 'dsh-ide-button', onClick: () => setQuotePrompt(undefined) }, 'Отмена'),
+                  quotePrompt.directory === true
+                    ? null
+                    : h(
+                        'button',
+                        { type: 'button', className: 'dsh-ide-button', onClick: () => applyQuoteLines('text') },
+                        'Текст строк',
+                      ),
+                  h(
+                    'button',
+                    { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: () => applyQuoteLines('reference') },
+                    'Ссылка @',
+                  ),
+                ),
+              ),
+            ),
       )
     }
 
@@ -3809,10 +7964,12 @@ function IdeBody(props) {
 .dsh-ide-root { display:flex; flex-direction:column; height:100%; min-height:0; position:relative;
   --ide-bg:#1e1e1e; --ide-panel:#252526; --ide-panel-2:#2d2d2d; --ide-border:#3c3c3c; --ide-text:#cccccc;
   --ide-muted:#8a8a8a; --ide-hover:#2a2d2e; --ide-active:#37373d; --ide-select:#094771; --ide-accent:#007acc; --ide-error:#f48771;
+  --ide-fg:#cccccc; --ide-fg-dim:#8a8a8a; --ide-mono:'Cascadia Code','Fira Code',Consolas,ui-monospace,monospace;
   background:var(--ide-bg); color:var(--ide-text);
   font:400 12px/1.45 var(--dsh-font-ui, system-ui, -apple-system, Segoe UI, sans-serif); }
 .dsh-ide-root[data-theme="light"] { --ide-bg:#ffffff; --ide-panel:#f3f3f3; --ide-panel-2:#ececec; --ide-border:#e2e2e2;
-  --ide-text:#2b2b2b; --ide-muted:#6b6b6b; --ide-hover:#e8e8e8; --ide-active:#e4e6f1; --ide-select:#cce4ff; --ide-accent:#0066bf; --ide-error:#b5200d; }
+  --ide-text:#2b2b2b; --ide-muted:#6b6b6b; --ide-hover:#e8e8e8; --ide-active:#e4e6f1; --ide-select:#cce4ff; --ide-accent:#0066bf; --ide-error:#b5200d;
+  --ide-fg:#2b2b2b; --ide-fg-dim:#6b6b6b; }
 .dsh-ide-root * { box-sizing:border-box; }
 .dsh-ide-top { display:flex; align-items:center; gap:6px; padding:3px 8px; background:var(--ide-panel);
   border-bottom:1px solid var(--ide-border); flex:0 0 auto; min-height:32px; }
@@ -3887,6 +8044,136 @@ function IdeBody(props) {
   border:1px solid var(--ide-border); font:400 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); outline:none; }
 .dsh-ide-search-input:focus { border-color:var(--ide-accent); }
 .dsh-ide-tree { flex:1 1 auto; overflow:auto; padding:2px 0 10px; }
+.dsh-ide-search-status { padding:0 8px 6px; color:var(--ide-fg-dim); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-search-file { border-bottom:1px solid var(--ide-border); padding-bottom:3px; }
+.dsh-ide-search-file:last-child { border-bottom:0; }
+.dsh-ide-search-file-head { display:flex; align-items:baseline; gap:6px; padding:6px 8px 3px; position:sticky; top:0;
+  background:var(--ide-panel); z-index:1; }
+.dsh-ide-search-file-name { font:600 11.5px/1.3 var(--dsh-font-ui, system-ui, sans-serif); color:var(--ide-fg); white-space:nowrap; }
+.dsh-ide-search-file-dir { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  color:var(--ide-fg-dim); font:400 10px/1.3 var(--ide-mono); }
+.dsh-ide-search-file-count { flex:0 0 auto; padding:0 5px; border-radius:7px; background:var(--ide-hover);
+  color:var(--ide-fg-dim); font:400 10px/1.5 var(--ide-mono); }
+.dsh-ide-search-row { display:flex; align-items:center; gap:2px; padding-left:8px; }
+.dsh-ide-search-row:hover { background:var(--ide-hover); }
+.dsh-ide-search-hit { flex:1 1 auto; min-width:0; display:flex; align-items:baseline; gap:6px; padding:2px 6px 2px 0;
+  border:0; background:transparent; color:inherit; text-align:left; cursor:pointer; font:inherit; }
+.dsh-ide-search-line { flex:0 0 auto; min-width:3ch; text-align:right; color:var(--ide-fg-dim);
+  font:400 10.5px/1.4 var(--ide-mono); }
+.dsh-ide-search-path { color:var(--ide-fg-dim); font:400 10px/1.3 var(--ide-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-search-preview { flex:1 1 auto; min-width:0; color:var(--ide-fg); font:400 11px/1.35 var(--ide-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-search-mark { background:rgba(255, 196, 0, .32); color:inherit; border-radius:2px; }
+.dsh-ide-change-hint { padding:6px 10px; color:var(--ide-fg-dim);
+  font:400 10.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-list { padding:0 0 10px; }
+.dsh-ide-change-section { padding:8px 10px 3px; font-size:10px; text-transform:uppercase;
+  letter-spacing:.4px; color:var(--ide-fg-dim); border-top:1px solid var(--ide-border); }
+.dsh-ide-change-section:first-of-type { border-top:none; }
+.dsh-ide-assist-list { padding:0 0 4px; }
+.dsh-ide-assist-turn { padding:5px 10px 6px; border-top:1px solid var(--ide-border); }
+.dsh-ide-assist-turn-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px;
+  font:400 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-turn-title { font-weight:600; }
+.dsh-ide-assist-turn-count { color:var(--ide-fg-dim); font:400 10.5px/1.5 var(--ide-mono); }
+/* A turn the recorder forgot: still visible, without actions, so the list never
+   rewrites itself behind the user's back. */
+.dsh-ide-assist-turn-stale { opacity:.55; }
+.dsh-ide-assist-turn-stale .dsh-ide-assist-turn-title { font-weight:500; color:var(--ide-fg-dim); }
+.dsh-ide-assist-file { padding-left:8px; }
+.dsh-ide-assist-file-head { display:flex; align-items:baseline; gap:6px; width:100%; padding:2px 0;
+  background:none; border:none; color:inherit; text-align:left; cursor:pointer;
+  font:400 12px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-file-head:hover { background:var(--ide-hover); }
+.dsh-ide-assist-flag { padding:0 4px; border:1px solid var(--ide-border); border-radius:3px;
+  color:var(--ide-fg-dim); font:400 9px/1.5 var(--ide-mono); }
+.dsh-ide-assist-diff { margin:2px 0 4px 6px; max-height:260px; overflow:auto;
+  background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; }
+.dsh-ide-assist-note { padding:3px 6px; color:var(--ide-fg-dim);
+  font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-hunk { border-top:1px solid var(--ide-border); }
+.dsh-ide-assist-hunk:first-child { border-top:none; }
+.dsh-ide-assist-hunk-head { padding:2px 6px; background:var(--ide-panel); color:var(--ide-fg-dim);
+  font:400 10px/1.5 var(--ide-mono); }
+.dsh-ide-assist-line { padding:0 6px; white-space:pre; font:400 11px/1.45 var(--ide-mono); }
+.dsh-ide-assist-add { background:rgba(137, 209, 133, .14); }
+.dsh-ide-assist-del { background:rgba(244, 135, 113, .14); }
+.dsh-ide-stage-wrap { position:relative; flex:1 1 auto; min-height:0; display:flex; }
+.dsh-ide-diffview { position:absolute; inset:0; z-index:5; display:flex; flex-direction:column;
+  background:var(--ide-bg); }
+.dsh-ide-diffview-head { display:flex; align-items:center; gap:8px; padding:4px 8px; flex:0 0 auto;
+  border-bottom:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-diffview-title { font:600 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); color:var(--ide-fg);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-diffview-sub, .dsh-ide-diffview-note { color:var(--ide-fg-dim);
+  font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-spacer { flex:1 1 auto; }
+.dsh-ide-diffview-error { color:#f48771; font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-action { padding:0 8px; border-radius:4px; cursor:pointer; border:1px solid var(--ide-border);
+  background:var(--ide-panel-2); color:var(--ide-fg);
+  font:400 10.5px/1.8 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-action:hover:not(:disabled) { border-color:rgba(204, 204, 204, .5); }
+.dsh-ide-diffview-action:disabled { opacity:.5; cursor:default; }
+.dsh-ide-diffview-danger:hover:not(:disabled) { border-color:rgba(244, 135, 113, .6); }
+.dsh-ide-diffview-body { flex:1 1 auto; min-height:0; }
+.dsh-ide-diffview-files { flex:0 0 auto; max-height:32%; overflow:auto;
+  border-top:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-diffview-files-head { padding:3px 10px; color:var(--ide-fg-dim); text-transform:uppercase;
+  letter-spacing:.3px; font:400 10px/1.6 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-diffview-file { display:flex; align-items:baseline; gap:8px; padding:2px 10px;
+  border-top:1px solid rgba(60, 60, 60, .45); }
+.dsh-ide-diffview-file:hover { background:var(--ide-hover); }
+.dsh-ide-assist-accept, .dsh-ide-assist-revert { padding:0 6px; border-radius:4px; cursor:pointer;
+  border:1px solid var(--ide-border); background:var(--ide-panel); color:var(--ide-fg);
+  font:400 10.5px/1.7 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-accept:hover:not(:disabled) { border-color:rgba(137, 209, 133, .6); }
+.dsh-ide-assist-revert:hover:not(:disabled) { border-color:rgba(244, 135, 113, .6); }
+.dsh-ide-assist-accept:disabled, .dsh-ide-assist-revert:disabled { opacity:.5; cursor:default; }
+.dsh-ide-assist-work { color:var(--ide-fg-dim); font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-assist-work-accepted { color:#89d185; }
+.dsh-ide-assist-work-reverted { color:#dcdcaa; }
+.dsh-ide-assist-work-failed { color:#f48771; }
+.dsh-ide-assist-error { padding:2px 0 3px 8px; color:#f48771;
+  font:400 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-row { padding:5px 10px; border-top:1px solid var(--ide-border); }
+.dsh-ide-change-row:first-child { border-top:none; }
+.dsh-ide-change-head { display:flex; align-items:baseline; gap:6px; width:100%; padding:0;
+  background:none; border:none; color:inherit; text-align:left; cursor:pointer;
+  font:400 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-change-dir { color:var(--ide-fg-dim); font-size:10.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-change-meta { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:2px;
+  font:400 10.5px/1.5 var(--ide-font-mono, ui-monospace, monospace); }
+.dsh-ide-change-added { color:#89d185; }
+.dsh-ide-change-removed { color:#f48771; }
+.dsh-ide-change-status { padding:0 5px; border-radius:8px; border:1px solid var(--ide-border);
+  font:400 10px/1.5 var(--dsh-font-ui, system-ui, sans-serif); color:var(--ide-fg-dim); }
+.dsh-ide-change-buffer { color:#dcdcaa; border-color:rgba(220, 220, 170, .45); }
+.dsh-ide-change-saved { color:#89d185; border-color:rgba(137, 209, 133, .45); }
+.dsh-ide-change-reverted { color:var(--ide-fg-dim); }
+.dsh-ide-change-revert { margin-left:auto; padding:0 6px; border-radius:4px; cursor:pointer;
+  border:1px solid var(--ide-border); background:var(--ide-panel); color:var(--ide-fg);
+  font:400 10.5px/1.7 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-change-revert:hover { border-color:var(--ide-accent); }
+.dsh-ide-change-error { color:#f48771; }
+.dsh-ide-palette-layer { position:absolute; inset:0; z-index:30; display:flex; justify-content:center;
+  align-items:flex-start; padding-top:8vh; background:rgba(0, 0, 0, .35); }
+.dsh-ide-palette { width:min(560px, 92%); max-height:70%; display:flex; flex-direction:column;
+  background:var(--ide-panel); border:1px solid var(--ide-border); border-radius:6px; overflow:hidden;
+  box-shadow:0 12px 32px rgba(0, 0, 0, .45); }
+.dsh-ide-palette-input { padding:8px 10px; border:none; border-bottom:1px solid var(--ide-border);
+  background:var(--ide-bg); color:var(--ide-fg); outline:none;
+  font:400 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-palette-list { overflow:auto; padding:4px 0; }
+.dsh-ide-palette-item { display:flex; align-items:baseline; gap:8px; width:100%; padding:4px 10px;
+  border:none; background:none; color:var(--ide-fg); text-align:left; cursor:pointer;
+  font:400 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-palette-item:hover { background:rgba(255, 255, 255, .06); }
+.dsh-ide-palette-item-off { opacity:.45; cursor:default; }
+.dsh-ide-palette-group { margin-left:auto; color:var(--ide-fg-dim); font-size:10.5px; }
+.dsh-ide-palette-key { color:var(--ide-fg-dim); font:400 10.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-palette-empty { padding:10px; color:var(--ide-fg-dim);
+  font:400 12px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-activity-glyph { font:400 13px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-row { display:flex; align-items:center; gap:4px; width:100%; border:0; background:transparent; color:inherit;
   text-align:left; cursor:pointer; padding:2px 6px 2px 6px; font:inherit; line-height:18px; white-space:nowrap; }
 .dsh-ide-row:hover { background:var(--ide-hover); }
@@ -3908,8 +8195,23 @@ function IdeBody(props) {
   letter-spacing:-.02em; }
 .dsh-ide-tree-error { padding:3px 10px; color:var(--ide-error); font-size:11px; }
 .dsh-ide-tree-empty { padding:3px 10px; color:var(--ide-muted); font-size:11px; }
-.dsh-ide-ghost { display:none; pointer-events:none; white-space:pre; opacity:.5; color:var(--ide-fg);
-  font-family:var(--ide-font-mono, Consolas, 'Courier New', monospace); font-size:13px; line-height:20px; }
+.dsh-ide-hint-button { cursor:pointer; pointer-events:auto; border:0; border-radius:4px; padding:0; background:transparent; color:var(--ide-text); font:14px/1 system-ui; text-align:center; }
+.dsh-ide-hint-elapsed { font-variant-numeric:tabular-nums; }
+.dsh-ide-hint-elapsed[hidden] { display:none; }
+.dsh-ide-hint-button:hover, .dsh-ide-hint-button:focus-visible { background:var(--ide-hover); outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-hint-button[data-busy="true"]::after { content:''; display:inline-block; vertical-align:middle; width:11px; height:11px; border-radius:50%; border:2px solid var(--ide-muted); border-top-color:transparent; animation:dsh-ide-hint-spin .8s linear infinite; }
+@keyframes dsh-ide-hint-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce) { .dsh-ide-hint-button[data-busy="true"]::after { animation:none; } }
+.dsh-ide-ghost { pointer-events:none; opacity:.5; color:var(--ide-text); }
+.dsh-ide-ghost-lines { white-space:pre; }
+.dsh-ide-ghost-removed { background:rgba(224, 108, 117, .18); border-bottom:1px solid rgba(224, 108, 117, .55); }
+.dsh-ide-edit-old { background:rgba(224, 108, 117, .22); border-bottom:1px solid rgba(224, 108, 117, .5); }
+.dsh-ide-edit-inline { color:rgba(150, 225, 165, .95); margin-left:6px; opacity:.95;
+  font-family:var(--ide-font-mono, ui-monospace, monospace); }
+.dsh-ide-edit-added { background:rgba(106, 190, 120, .14); }
+.dsh-ide-edit-old-line { background:rgba(224, 108, 117, .16); text-decoration:line-through;
+  text-decoration-color:rgba(224, 108, 117, .5); }
+.dsh-ide-edit-code { white-space:pre; }
 .dsh-ide-icon-button { border:0; background:transparent; color:inherit; cursor:pointer; border-radius:4px;
   padding:2px 5px; font:400 12px/1 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-icon-button:hover { background:var(--ide-hover); }
@@ -3934,7 +8236,6 @@ function IdeBody(props) {
 .dsh-ide-crumb { overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-crumb-last { color:var(--ide-text); }
 .dsh-ide-crumb-sep { padding:0 3px; opacity:.6; }
-.dsh-ide-stage-wrap { position:relative; display:flex; flex:1 1 auto; min-height:0; }
 .dsh-ide-stage { flex:1 1 auto; min-height:0; }
 .dsh-ide-stage-fallback { position:absolute; inset:0; z-index:2; display:flex; flex-direction:column; overflow:auto; background:var(--ide-bg); }
 .dsh-ide-stage-fallback-head { display:flex; flex-direction:column; gap:6px; padding:12px 14px; border-bottom:1px solid var(--ide-border); }
@@ -3959,6 +8260,9 @@ function IdeBody(props) {
 .dsh-ide-panel-close:hover { color:var(--ide-fg); }
 .dsh-ide-panel-body { flex:1 1 auto; min-height:0; overflow:auto; padding:4px 0; font:400 11.5px/1.55 var(--ide-font); }
 .dsh-ide-panel-empty { color:var(--ide-fg-dim); padding:8px 12px; }
+.dsh-ide-context-menu { position:fixed; z-index:1000; min-width:168px; padding:4px; border:1px solid var(--ide-border); border-radius:7px; background:var(--ide-panel-2); box-shadow:0 10px 28px rgba(0,0,0,.35); }
+.dsh-ide-context-item { display:block; width:100%; padding:5px 9px; border:0; border-radius:5px; background:transparent; color:var(--ide-text); font:12px/1.4 var(--dsw-font-family,inherit); text-align:left; cursor:pointer; }
+.dsh-ide-context-item:hover { background:var(--ide-active); }
 .dsh-ide-trace { display:flex; gap:10px; align-items:baseline; padding:2px 12px; cursor:pointer; white-space:nowrap; }
 .dsh-ide-trace:hover { background:var(--ide-hover); }
 .dsh-ide-trace-active { background:var(--ide-active); }
@@ -3969,6 +8273,7 @@ function IdeBody(props) {
 .dsh-ide-trace-meta { color:var(--ide-fg-dim); flex:0 0 auto; }
 .dsh-ide-trace-ok { color:#89d185; flex:0 0 auto; }
 .dsh-ide-trace-error { color:#f48771; flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-trace-pending { color:#d9a441; flex:0 0 auto; }
 .dsh-ide-chat { padding:6px 12px 10px; }
 .dsh-ide-chat-label { color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px; font-size:10px; margin:8px 0 3px; }
 .dsh-ide-chat-text { margin:0; white-space:pre-wrap; word-break:break-word; font:400 11.5px/1.5 var(--ide-mono); color:var(--ide-fg); max-height:120px; overflow:auto; background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; }
@@ -3987,11 +8292,31 @@ function IdeBody(props) {
 .dsh-ide-status-spacer { flex:1 1 auto; }
 .dsh-ide-status-item { flex:0 0 auto; }
 .dsh-ide-status-item:hover { background:rgba(255,255,255,.12); border-radius:3px; padding:0 3px; margin:0 -3px; }
+.dsh-ide-status-action { cursor:pointer; border:none; background:transparent; color:inherit; font:inherit; }
+.dsh-ide-status-action:hover { background:rgba(255,255,255,.12); border-radius:3px; }
+.dsh-ide-drop-overlay { position:absolute; inset:0; z-index:25; display:flex; align-items:center; justify-content:center;
+  background:rgba(0,0,0,.5); pointer-events:none; }
+.dsh-ide-drop-overlay-text { padding:10px 18px; border:2px dashed var(--ide-accent); border-radius:8px; background:var(--ide-panel);
+  color:var(--ide-text); font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-consent { display:flex; align-items:center; gap:8px; flex:0 0 auto; padding:6px 10px; background:#3a2d1f;
   border-bottom:1px solid var(--ide-border); color:#e8d6b8; font-size:11.5px; }
 .dsh-ide-root[data-theme="light"] .dsh-ide-consent { background:#fff4d6; color:#4d3a12; }
 .dsh-ide-consent-text { flex:1 1 auto; min-width:0; }
 .dsh-ide-consent-actions { display:flex; gap:6px; flex:0 0 auto; }
+.dsh-ide-inline { display:flex; align-items:center; gap:8px; flex:0 0 auto; padding:6px 10px;
+  border-bottom:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-inline-label { text-transform:uppercase; letter-spacing:.4px; font-size:10px; color:var(--ide-fg-dim); flex:0 0 auto; }
+.dsh-ide-inline-input { flex:1 1 auto; min-width:0; background:var(--ide-bg); color:var(--ide-fg);
+  border:1px solid var(--ide-border); border-radius:4px; padding:3px 6px; font:inherit; outline:none; }
+.dsh-ide-inline-input:focus { border-color:var(--ide-accent); }
+.dsh-ide-inline-text { flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; font-size:11.5px; }
+.dsh-ide-inline-error { flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; font-size:11.5px; color:#f48771; }
+.dsh-ide-inline-actions { display:flex; gap:6px; flex:0 0 auto; }
+.dsh-ide-inline-old { background:rgba(244,135,113,.18); text-decoration:line-through; }
+.dsh-ide-inline-preview { background:rgba(137,209,133,.12); border-left:2px solid #89d185;
+  font:400 12px/1.45 var(--ide-mono); white-space:pre; overflow:auto; padding:2px 8px; color:var(--ide-fg); }
+.dsh-ide-inline-preview-head { font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:var(--ide-fg-dim); }
+.dsh-ide-inline-preview-body { margin:0; font:inherit; white-space:pre; }
 .dsh-ide-settings { position:absolute; inset:0; z-index:20; display:flex; flex-direction:column;
   background:var(--ide-bg); color:var(--ide-text); }
 .dsh-ide-settings-head { display:flex; align-items:center; gap:10px; padding:8px 14px;
@@ -4024,11 +8349,30 @@ function IdeBody(props) {
 .dsh-ide-setting-desc { margin-top:2px; max-width:720px; color:var(--ide-muted);
   font:400 12px/1.55 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-setting-control { margin-top:8px; display:flex; align-items:center; gap:6px; }
+.dsh-ide-keys { display:flex; flex-direction:column; border:1px solid var(--ide-border);
+  border-radius:4px; overflow:hidden; background:var(--ide-panel-2); max-width:720px; }
+.dsh-ide-keys-row { display:grid; grid-template-columns:minmax(150px, 1fr) 210px 26px; gap:10px;
+  align-items:center; padding:5px 10px; border-top:1px solid var(--ide-border); }
+.dsh-ide-keys-row:first-child { border-top:none; }
+.dsh-ide-keys-head { padding:4px 10px; background:var(--ide-panel); font-size:10px;
+  text-transform:uppercase; letter-spacing:.4px; color:var(--ide-fg-dim); }
+.dsh-ide-keys-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font:400 12.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-keys-default { margin-left:6px; font-size:10.5px; color:var(--ide-fg-dim); }
+.dsh-ide-keys-chord { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.dsh-ide-keys-row[data-invalid="true"] .dsh-ide-key-input { border-color:#f48771; }
+.dsh-ide-keys-reset { justify-self:end; }
+.dsh-ide-key-input { width:100%; padding:2px 7px; border-radius:4px; border:1px solid var(--ide-border);
+  background:var(--ide-bg); color:var(--ide-fg); font:500 12px/1.5 var(--dsh-font-mono, ui-monospace, monospace); outline:none; }
+.dsh-ide-key-input:focus { border-color:var(--ide-accent); }
+.dsh-ide-key-error { color:#f48771; font:400 10.5px/1.35 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-setting-input { width:230px; max-width:100%; }
+.dsh-ide-setting-textarea { width:100%; min-height:96px; resize:vertical; font:400 12.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); padding:6px 8px; }
 .dsh-ide-setting-control input[type="checkbox"] { width:14px; height:14px; accent-color:var(--ide-accent); }
 .dsh-ide-setting-check { display:inline-flex; align-items:center; gap:6px; color:var(--ide-text);
   font:400 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-settings-actions { display:flex; gap:6px; }
+.dsh-ide-setting-value { font:500 12px/1.4 var(--dsh-font-mono, ui-monospace, monospace); color:var(--ide-muted, #9aa4b2); }
 .dsh-ide-settings-foot { display:flex; align-items:center; gap:8px; padding:8px 14px;
   border-top:1px solid var(--ide-border); background:var(--ide-panel); }
 .dsh-ide-settings-foot-spacer { flex:1 1 auto; }
@@ -4061,13 +8405,26 @@ function IdeBody(props) {
   text-align:left; cursor:pointer; padding:3px 6px; border-radius:4px; font:inherit; }
 .dsh-ide-quick-row-active { background:var(--ide-active); }
 .dsh-ide-action { display:inline-flex; align-items:center; gap:4px; }
-.dsh-ide-action-button { font:600 10.5px/1.2 var(--dsh-font-ui, system-ui, sans-serif); color:inherit; background:transparent;
-  border:1px solid var(--dsh-border, rgba(127,127,127,.35)); border-radius:5px; padding:2px 7px; cursor:pointer; }
-.dsh-ide-action-button:hover:not(:disabled) { background:var(--dsh-hover, rgba(127,127,127,.14)); }
+.dsh-ide-action-button { display:inline-flex; align-items:center; gap:5px; font:600 10.5px/1.25 var(--dsw-font-family, var(--dsh-font-ui, system-ui, sans-serif));
+  color:var(--dsw-alias-label-secondary, inherit); background:var(--dsw-alias-bg-layer-1, transparent);
+  border:1px solid var(--dsw-alias-border-l2, var(--dsh-border, rgba(127,127,127,.35))); border-radius:7px;
+  padding:3px 8px 3px 6px; cursor:pointer;
+  transition:color .12s ease, background .12s ease, border-color .12s ease; }
+.dsh-ide-action-button:hover:not(:disabled) { color:var(--dsw-alias-label-primary, inherit);
+  background:var(--dsw-alias-bg-layer-2, var(--dsh-hover, rgba(127,127,127,.14))); }
+.dsh-ide-action-button:focus-visible { outline:2px solid var(--dsw-alias-brand-primary, #4c8dff); outline-offset:1px; }
+.dsh-ide-action-button[data-open="true"] { color:var(--dsw-alias-brand-primary, #4c8dff);
+  border-color:var(--dsw-alias-brand-primary, #4c8dff); background:var(--dsw-alias-bg-layer-2, rgba(127,127,127,.14)); }
+.dsh-ide-action-button[data-open="true"]::after { content:''; width:5px; height:5px; border-radius:50%;
+  background:currentColor; margin-left:1px; }
+.dsh-ide-action-icon { width:14px; height:14px; flex:none; opacity:.85; }
+.dsh-ide-action-button[data-open="true"] .dsh-ide-action-icon { opacity:1; }
+.dsh-ide-action-label { white-space:nowrap; }
 .dsh-ide-action-button:disabled { opacity:.5; cursor:default; }
 .dsh-ide-action-error { color:#d9534f; font-weight:700; cursor:help; }
-.dsh-ide-action-compact .dsh-ide-action-button { padding:1px 6px; font-size:10px; line-height:1.4;
-  letter-spacing:.4px; text-transform:uppercase; }
+.dsh-ide-action-compact .dsh-ide-action-button { padding:2px 7px 2px 5px; font-size:10.5px; line-height:1.3;
+  letter-spacing:.15px; text-transform:none; border-radius:6px; }
+.dsh-ide-action-compact .dsh-ide-action-icon { width:13px; height:13px; }
 
 /* ------------------------------------------------------------- phone layout */
 
@@ -4119,6 +8476,11 @@ function IdeBody(props) {
   display:inline-flex; align-items:center; justify-content:center; }
 .dsh-ide-root[data-compact] .dsh-ide-explorer-search { padding:0 10px 8px; }
 .dsh-ide-root[data-compact] .dsh-ide-search-input { padding:8px 9px; font-size:16px; }
+.dsh-ide-root[data-compact] .dsh-ide-search-file-head { padding:8px 10px 4px; }
+.dsh-ide-root[data-compact] .dsh-ide-search-file-name { font-size:12.5px; }
+.dsh-ide-root[data-compact] .dsh-ide-search-row { min-height:38px; }
+.dsh-ide-root[data-compact] .dsh-ide-search-hit { padding-top:7px; padding-bottom:7px; }
+.dsh-ide-root[data-compact] .dsh-ide-search-preview { font-size:12px; }
 .dsh-ide-root[data-compact] .dsh-ide-tree { padding:2px 0 16px; }
 .dsh-ide-root[data-compact] .dsh-ide-row { min-height:38px; padding:7px 8px; gap:6px; font-size:13px; }
 .dsh-ide-root[data-touch] .dsh-ide-row { min-height:36px; padding-top:6px; padding-bottom:6px; }
@@ -4132,9 +8494,12 @@ function IdeBody(props) {
 .dsh-ide-root[data-compact] .dsh-ide-breadcrumbs::-webkit-scrollbar { display:none; }
 .dsh-ide-root[data-compact] .dsh-ide-status { gap:8px; padding:4px 8px;
   padding-bottom:max(4px, env(safe-area-inset-bottom)); font-size:11px; min-height:40px; }
+.dsh-ide-root[data-compact] .dsh-ide-status-lang,
+.dsh-ide-root[data-compact] .dsh-ide-status-readonly,
 .dsh-ide-root[data-compact] .dsh-ide-status-enc,
-.dsh-ide-root[data-compact] .dsh-ide-status-eol { display:none; }
-.dsh-ide-root[data-compact] .dsh-ide-status-text { max-width:38%; overflow:hidden; text-overflow:ellipsis;
+.dsh-ide-root[data-compact] .dsh-ide-status-eol,
+.dsh-ide-root[data-compact] .dsh-ide-status-action { display:none; }
+.dsh-ide-root[data-compact] .dsh-ide-status-text { max-width:30%; overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; }
 /* Text size: two thumb-sized keys at the right edge of the status bar. */
 .dsh-ide-zoom { display:flex; align-items:center; margin-left:2px; margin-right:-4px; }
@@ -4216,6 +8581,28 @@ function IdeBody(props) {
 .dsh-ide-root[data-compact] .dsh-ide-quick-list { margin-top:8px; }
 .dsh-ide-root[data-compact] .dsh-ide-quick-row { min-height:44px; padding:9px 8px; gap:8px; font-size:13px; }
 
+/* The command palette is a sheet as well: a centred dialog would sit under the
+   on-screen keyboard and hide its own list. */
+.dsh-ide-root[data-compact] .dsh-ide-palette-layer { align-items:flex-start;
+  padding:max(8px, env(safe-area-inset-top)) 8px 8px; }
+.dsh-ide-root[data-compact] .dsh-ide-palette { width:100%; max-height:calc(100% - 16px); }
+.dsh-ide-root[data-compact] .dsh-ide-palette-input { padding:11px 12px; font-size:16px; }
+.dsh-ide-root[data-compact] .dsh-ide-palette-item { min-height:44px; padding:10px 12px; font-size:13px; }
+
+/* A diff review on a phone: the header wraps into two rows, and the file list
+   grows rows that a thumb can hit. Monaco itself switches to the unified view. */
+.dsh-ide-root[data-compact] .dsh-ide-diffview-head { flex-wrap:wrap; gap:6px; padding:6px 8px; }
+.dsh-ide-root[data-compact] .dsh-ide-diffview-title { flex:1 1 100%; font-size:12.5px; }
+.dsh-ide-root[data-compact] .dsh-ide-diffview-sub,
+.dsh-ide-root[data-compact] .dsh-ide-diffview-spacer { display:none; }
+.dsh-ide-root[data-compact] .dsh-ide-diffview-action { min-height:34px; padding:6px 9px; }
+.dsh-ide-root[data-compact] .dsh-ide-diffview-files { max-height:40%; }
+.dsh-ide-root[data-compact] .dsh-ide-diffview-file { flex-wrap:wrap; gap:4px; padding:6px 8px; }
+
+/* Chat transcript: bigger text and no inner scrollbar competing with the pane. */
+.dsh-ide-root[data-compact] .dsh-ide-chat { padding:8px 10px 12px; }
+.dsh-ide-root[data-compact] .dsh-ide-chat-text { max-height:none; font-size:12.5px; }
+
 /* Settings: the vertical nav turns into a scrollable row of chips. */
 .dsh-ide-root[data-compact] .dsh-ide-settings-head { flex-wrap:wrap; gap:6px; padding:8px 10px; }
 .dsh-ide-root[data-compact] .dsh-ide-settings-head-title { order:1; flex:1 1 auto; font-size:14px; }
@@ -4257,12 +8644,38 @@ function IdeBody(props) {
       inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'theme'],
       apply(ctx) {
         services = {
+          ctx,
           theme: ctx.theme,
           sidebarRight: ctx.sidebarRight,
           sidebarRightTabs: ctx.sidebarRightTabs,
+          // Session UI status (running / settled) lives in the shared core
+          // service; it is read defensively so the IDE still loads without it.
+          uiSession: typeof ctx.get === 'function' ? ctx.get('uiSession') : undefined,
+          // The session input machine — the owner of `slash/input-insert-reference`
+          // — lives on the session's own client context, which the sessions
+          // service hands out per retained binding. Absent for a tab that is not
+          // bound to a retained session.
+          sessionContext: (id) => {
+            if (typeof id !== 'string' || id === '') return undefined
+            try {
+              const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+              if (sessions === undefined || sessions === null || typeof sessions.binding !== 'function') return undefined
+              const binding = sessions.binding(id)
+              if (binding === undefined || binding === null) return undefined
+              return typeof binding.ctx === 'object' ? binding.ctx : undefined
+            } catch (cause) {
+              return undefined
+            }
+          },
         }
 
         ctx.effect(injectStyles, 'dsh-ide: styles')
+
+        // Chips link files the way `@` does, but carry their line range into
+        // the sent message. The source is registered eagerly when the shell's
+        // trigger service is already up; `ensureChatSource` retries on the
+        // first chip otherwise.
+        ensureChatSource()
 
         ctx.effect(() => {
           const dispose = ctx.sidebarRightTabs.register({

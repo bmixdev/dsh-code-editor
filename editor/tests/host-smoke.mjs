@@ -1,7 +1,17 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { apply } from '../index.js'
+
+// Without an isolated file the smoke test reads the real
+// `~/.dsh/code-editor.json`, so a completion model chosen on this machine
+// (glm-5.3-flash, provider opencode-go) overrides the fixture selection and the
+// provider assertion below fails for a reason that has nothing to do with code.
+const PREFS_DIR = mkdtempSync(path.join(os.tmpdir(), 'dsh-editor-prefs-'))
+writeFileSync(path.join(PREFS_DIR, 'prefs.json'), '{}\n')
+process.env.DSH_CODE_EDITOR_PREFS = path.join(PREFS_DIR, 'prefs.json')
 
 const ROOT = 'C:\\workspace'
 const SESSION_ID = 'session-1'

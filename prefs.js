@@ -11,6 +11,31 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+/**
+ * The instruction sent to the completion model when the settings field is empty.
+ *
+ * It is a template: `{{answerLines}}`, `{{language}}` and `{{file}}` are filled
+ * per request, so a user-edited instruction can keep using the same words.
+ */
+export const DEFAULT_SYSTEM_PROMPT =
+  'Ты — движок строчных подсказок в редакторе кода. Продолжи текст ровно с позиции курсора. ' +
+  'Ответь только вставляемым продолжением: без пояснений, без markdown-ограждений, без повторения ' +
+  'уже написанного кода. Продолжение должно быть коротким (1–{{answerLines}} строк) и синтаксически уместным. ' +
+  'Если строка перед курсором — комментарий, который просит написать код, начни ответ с перевода ' +
+  'строки и напиши код на следующей строке: не повторяй текст комментария и не ставь решётку. ' +
+  'Если уместного продолжения нет, ответь пустой строкой.'
+
+/** Placeholders the instruction may use; unknown ones stay as written. */
+export const PROMPT_PLACEHOLDERS = Object.freeze(['answerLines', 'language', 'file'])
+
+/** Fill `{{name}}` placeholders, leaving the unknown ones untouched. */
+export function fillPrompt(template, values = {}) {
+  return String(template ?? '').replace(/\{\{\s*([a-zA-Z]+)\s*\}\}/g, (match, key) => {
+    const value = Object.prototype.hasOwnProperty.call(values, key) ? values[key] : undefined
+    return value === undefined || value === null ? match : String(value)
+  })
+}
+
 /** Everything the drawer can change, with the value used before the first save. */
 export const DEFAULT_PREFERENCES = Object.freeze({
   /** Provider id for inline completions; empty means "the session default". */
@@ -31,15 +56,170 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   apiKeyRef: '',
   /** Workspace roots whose owner allowed sending buffer context to the model. */
   completionOptIn: [],
+  /**
+   * The owner allowed Inline Edit: sending one selection plus an instruction to
+   * the model. Deliberately separate from `completionOptIn` — allowing inline
+   * hints does not allow sending a selection with a request.
+   */
+  inlineEditConsent: false,
+  /** Command id -> chord text. Only ids the client knows are used; the Host
+   *  stores the strings and never interprets them. */
+  keybindings: Object.freeze({}),
+  /**
+   * The instruction sent before the buffer. Empty means "use the shipped one",
+   * which the settings drawer shows as the placeholder of the field.
+   */
+  systemPrompt: '',
+
+  // Tab mechanics. Every value below is a knob of the suggestion engine ported
+  // from the observed behaviour of Cursor's Tab (see tab.js and
+  // docs/cursor-tab-mechanics.md); the IDE settings drawer exposes all of them.
+  /** Quiet time after the last keystroke before an automatic request. */
+  debounceMs: 500,
+  /** Lines of the buffer before the cursor kept in the prompt. */
+  aboveLines: 60,
+  /** Lines of the buffer after the cursor kept in the prompt. */
+  belowLines: 20,
+  /** Longest answer asked for, in lines. */
+  answerLines: 5,
+  /**
+   * Reasoning level asked of the completion model; empty means "the level the
+   * provider uses by default". `off` disables hidden reasoning where the route
+   * accepts it, which is what makes a thinking model answer in about a second.
+   */
+  completionEffort: '',
+  /** How long one completion may take before the request is dropped. */
+  deadlineMs: 6000,
+  /** Once text has started, how long to keep collecting before showing it. */
+  flushAfterMs: 250,
+  /** Let an answer rewrite the rest of the cursor line instead of only inserting. */
+  rangeReplace: true,
+  /** How many lines from the cursor a rewrite may cover. 0 disables rewrites. */
+  rangeReplaceLines: 2,
+  /** Ctrl+Right inserts the next word of a pending suggestion. */
+  partialAccept: true,
+  /** Ask again immediately after accepting, like "next suggestion". */
+  refetchAfterAccept: false,
+  /** Ask for suggestions while the cursor is on a comment line. */
+  triggerInComments: true,
+  /** How long Esc suppresses automatic requests. */
+  snoozeAfterRejectMs: 800,
+  /** Show answers that only change whitespace. */
+  showWhitespaceOnlyChanges: false,
+  /**
+   * Mark the text a rewrite deletes. Off by default: the marker is a range
+   * decoration, and a range that ends up covering more text than the user
+   * expected reads as a selection they did not make.
+   */
+  showRemovedDecorations: false,
+  /** Buffers above this many characters get no suggestions at all. */
+  maxFileChars: 1000000,
+  /** Say in the output panel why a suggestion was dropped. */
+  explainSuppressed: true,
+  /** Include source-bearing request and answer details in the local UI trace. */
+  fullTrace: false,
+  /** Keep the output panel open on its Chat tab when the IDE starts. */
+  showChat: true,
+  /** Drop an answer that duplicates the line below the cursor. */
+  heuristicDuplicateLine: true,
+  /** Drop an answer that only retells the lines below the cursor. */
+  heuristicExtendsRange: true,
+  /** Drop an answer longer than the buffered request asked for. */
+  maxAddedLines: 20,
+  /** Rejections of the same answer before it is suppressed. 0 disables. */
+  recentRejectThreshold: 3,
+  /** How long a rejection is remembered. */
+  recentRejectWindowMs: 300000,
+  /** Drop an answer that restores text the user just deleted. */
+  heuristicRevertingChange: true,
+  /**
+   * Ask for edits elsewhere in the file in the same reply as the cursor
+   * continuation. This is what makes `main(f)` typed under a `def main():`
+   * propose a matching signature instead of only adding characters at the caret.
+   */
+  multiEdit: true,
+  /**
+   * Token ceiling for one answer; 0 means no ceiling at all. The request then
+   * carries no `maxTokens`, so the model stops when it is done instead of in
+   * the middle of the edit list.
+   */
+  maxTokens: 0,
+  /** Ask for edits on an ordinary typing pause too, not only on `Ctrl+Space`. */
+  multiEditAuto: false,
+  /** Most edits to accept from one answer. 0 turns the edit part off. */
+  maxEdits: 3,
+  /** Send the whole file instead of the windows around the cursor. */
+  wholeFileContext: true,
+  /**
+   * When no hint model is chosen, borrow a fast one from the provider's own
+   * catalog instead of the session model. Off means "use the session model", so
+   * a user who wants their chat model for hints keeps it.
+   */
+  autoModel: true,
+  /**
+   * Add «отвечай сразу кодом, без рассуждений» to the instruction. A reasoning
+   * model may still think before it writes, but the sentence keeps a chatty
+   * model from narrating the answer.
+   */
+  noReasoningHint: true,
 })
 
-const LIMITS = {
+/** Inclusive integer bounds, applied to both the file and the drawer. */
+export const PREFERENCE_LIMITS = Object.freeze({
   contextLeft: [200, 20000],
   contextRight: [0, 8000],
-}
+  debounceMs: [50, 3000],
+  aboveLines: [0, 400],
+  belowLines: [0, 200],
+  answerLines: [1, 20],
+  deadlineMs: [1000, 60000],
+  flushAfterMs: [0, 5000],
+  rangeReplaceLines: [0, 8],
+  snoozeAfterRejectMs: [0, 5000],
+  maxFileChars: [1000, 5000000],
+  maxAddedLines: [1, 200],
+  recentRejectThreshold: [0, 10],
+  recentRejectWindowMs: [0, 600000],
+  maxEdits: [0, 5],
+  maxTokens: [0, 8000],
+})
+
+const BOOLEAN_KEYS = [
+  'fileTree',
+  'hiddenFiles',
+  'autoSuggest',
+  'rangeReplace',
+  'partialAccept',
+  'refetchAfterAccept',
+  'triggerInComments',
+  'showWhitespaceOnlyChanges',
+  'showRemovedDecorations',
+  'explainSuppressed',
+  'fullTrace',
+  'showChat',
+  'heuristicDuplicateLine',
+  'heuristicExtendsRange',
+  'heuristicRevertingChange',
+  'multiEdit',
+  'multiEditAuto',
+  'wholeFileContext',
+  'autoModel',
+  'noReasoningHint',
+  'inlineEditConsent',
+]
 
 /** How many workspaces may stay opted in at once. */
 const MAX_OPT_IN = 20
+
+/** How many remapped chords are kept. */
+const MAX_KEYBINDINGS = 40
+
+/** Command ids and chord text the client may store. */
+const KEYBINDING_ID = /^[a-z0-9-]{1,40}$/
+const KEYBINDING_CHORD = /^[A-Za-z0-9+ ,`-]{1,40}$/
+
+/** Longest custom instruction accepted from the settings field. */
+const MAX_SYSTEM_PROMPT = 8000
 
 /** Absolute path of the preferences file, overridable for tests and portable profiles. */
 export function preferencesPath() {
@@ -58,19 +238,28 @@ function clampInteger(value, [min, max], fallback) {
 function sanitize(patch) {
   const result = {}
   if (typeof patch !== 'object' || patch === null) return result
-  for (const key of ['completionProvider', 'completionModel', 'apiKeyRef']) {
+  for (const key of ['completionProvider', 'completionModel', 'completionEffort', 'apiKeyRef']) {
     if (patch[key] === undefined) continue
     const value = String(patch[key] ?? '').trim()
     if (value.length > 200) throw Object.assign(new Error('Слишком длинное значение настройки.'), { code: 'bad-request' })
     result[key] = value
   }
-  for (const key of ['fileTree', 'hiddenFiles', 'autoSuggest']) {
+  for (const key of BOOLEAN_KEYS) {
     if (patch[key] !== undefined) result[key] = patch[key] === true
   }
-  for (const key of ['contextLeft', 'contextRight']) {
+  for (const key of Object.keys(PREFERENCE_LIMITS)) {
     if (patch[key] !== undefined) {
-      result[key] = clampInteger(patch[key], LIMITS[key], DEFAULT_PREFERENCES[key])
+      result[key] = clampInteger(patch[key], PREFERENCE_LIMITS[key], DEFAULT_PREFERENCES[key])
     }
+  }
+  // The instruction is free text with line breaks, so it does not go through the
+  // trimmed 200-character string keys above.
+  if (patch.systemPrompt !== undefined) {
+    const value = String(patch.systemPrompt ?? '').trim()
+    if (value.length > MAX_SYSTEM_PROMPT) {
+      throw Object.assign(new Error('Системная инструкция слишком длинная.'), { code: 'bad-request' })
+    }
+    result.systemPrompt = value
   }
   if (patch.completionOptIn !== undefined) {
     if (!Array.isArray(patch.completionOptIn)) {
@@ -84,6 +273,22 @@ function sanitize(patch) {
       if (roots.length >= MAX_OPT_IN) break
     }
     result.completionOptIn = roots
+  }
+  if (patch.keybindings !== undefined) {
+    if (typeof patch.keybindings !== 'object' || patch.keybindings === null || Array.isArray(patch.keybindings)) {
+      throw Object.assign(new Error('Раскладка клавиш должна быть объектом.'), { code: 'bad-request' })
+    }
+    const chords = {}
+    let count = 0
+    for (const [id, value] of Object.entries(patch.keybindings)) {
+      if (count >= MAX_KEYBINDINGS) break
+      if (!KEYBINDING_ID.test(id)) continue
+      const text = String(value ?? '').trim()
+      if (!KEYBINDING_CHORD.test(text)) continue
+      chords[id] = text
+      count += 1
+    }
+    result.keybindings = chords
   }
   return result
 }
