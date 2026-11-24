@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-24.10'
+    const UI_BUILD = '2026-11-24.11'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
