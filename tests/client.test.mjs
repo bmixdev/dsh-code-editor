@@ -329,7 +329,9 @@ test('a multiline continuation reserves editor rows until Escape or Tab', async 
   const inlineAction = actions.get('dsh-ide.inline-edit')
   assert.equal(inlineAction.label, 'Изменить выделение…')
   assert.equal(inlineAction.keybindings, undefined)
-  assert.equal(inlineAction.precondition, 'editorTextFocus')
+  // Deliberately no `editorTextFocus` condition: on touch the editor loses
+  // focus while the context menu is open, and openInlineEdit validates itself.
+  assert.equal(inlineAction.precondition, undefined)
   const request = async () => {
     commands.get(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space)()
     await new Promise(setImmediate)

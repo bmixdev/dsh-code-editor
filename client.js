@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-24.11'
+    const UI_BUILD = '2026-11-24.12'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -3654,6 +3654,11 @@ function IdeBody(props) {
         inlineEdit: undefined,
         inlineSeq: 0,
         changeSeq: 0,
+        // The last non-empty selection, kept because a touch on a menu (or a
+        // long-press context menu) can collapse Monaco's live selection before
+        // the inline-edit command runs. Offsets are only reused while the model
+        // version still matches, so a typed change cannot target stale text.
+        lastSelection: undefined,
         // Effective chord table (`Map` of command id -> parsed chord). Read by the
         // editor's key dispatch, so a remap takes effect without re-registering.
         keymap: undefined,
@@ -5432,7 +5437,28 @@ function IdeBody(props) {
           setStatus({ kind: 'error', message: 'Файл открыт только для чтения — правка недоступна.' })
           return false
         }
-        const selection = editor.getSelection()
+        let selection = editor.getSelection()
+        if (selection === null || selection.isEmpty()) {
+          // The menu click collapsed the live selection (common with touch
+          // selection handles). Restore the last one for this exact model state.
+          const remembered = runtime.current.lastSelection
+          if (
+            remembered !== undefined
+            && remembered.key === key
+            && remembered.modelVersion === model.getVersionId()
+            && remembered.end > remembered.start
+          ) {
+            const from = model.getPositionAt(remembered.start)
+            const to = model.getPositionAt(remembered.end)
+            editor.setSelection({
+              startLineNumber: from.lineNumber,
+              startColumn: from.column,
+              endLineNumber: to.lineNumber,
+              endColumn: to.column,
+            })
+            selection = editor.getSelection()
+          }
+        }
         if (selection === null || selection.isEmpty()) {
           setStatus({ kind: 'error', message: 'Выделите код, который нужно изменить.' })
           return false
@@ -6122,6 +6148,24 @@ function IdeBody(props) {
             )
           }, 250)
         })
+        // Remember every non-empty selection. On a touch device the selection
+        // handles live in the page, and opening a menu can collapse the model
+        // selection before the command fires.
+        const selectionChange = typeof editor.onDidChangeCursorSelection === 'function'
+          ? editor.onDidChangeCursorSelection(() => {
+              const selection = editor.getSelection()
+              const model = editor.getModel()
+              if (selection === null || model === null || selection.isEmpty()) return
+              const key = runtime.current.modelTabs.get(model.uri.toString())
+              if (key === undefined) return
+              runtime.current.lastSelection = {
+                key,
+                start: model.getOffsetAt(selection.getStartPosition()),
+                end: model.getOffsetAt(selection.getEndPosition()),
+                modelVersion: model.getVersionId(),
+              }
+            })
+          : undefined
 
         // Chords the user can remap are matched here rather than registered with
         // addCommand: a registered chord cannot be changed afterwards, and a
@@ -6177,7 +6221,8 @@ function IdeBody(props) {
           label: 'Изменить выделение…',
           contextMenuGroupId: '1_modification',
           contextMenuOrder: 1,
-          precondition: 'editorTextFocus',
+          // No `editorTextFocus` guard: on touch the editor loses focus while
+          // the context menu is open, and the command itself checks the target.
           run: () => handlersRef.current.openInlineEdit?.(),
         })
         // Link the active file and the lines highlighted in it into the chat.
@@ -6188,7 +6233,6 @@ function IdeBody(props) {
           label: 'Добавить в чат',
           contextMenuGroupId: '1_modification',
           contextMenuOrder: 0.5,
-          precondition: 'editorTextFocus',
           run: () => handlersRef.current.addToChat?.(),
         })
 
@@ -6205,6 +6249,7 @@ function IdeBody(props) {
           blur.dispose()
           change.dispose()
           cursorChange.dispose()
+          selectionChange?.dispose()
           editor.dispose()
           runtime.current.editor = undefined
         }
