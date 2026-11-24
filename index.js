@@ -21,6 +21,7 @@
  * Every operation is an exact Fetch route below `/api`, which the connection
  * layer serves only to the owner principal (this machine's GUI page).
  */
+import { spawn } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -326,6 +327,7 @@ export function apply(ctx, config) {
     mkdir: (body, signal) => mkdirRoute(body, signal),
     rename: (body, signal) => renameRoute(body, signal),
     remove: (body, signal) => removeRoute(body, signal),
+    reveal: (body, signal) => revealRoute(body, signal),
     state: (body) => stateRoute(body),
     catalog: () => buildCatalog(ctx),
     credentials: (body) => credentialsRoute(body),
@@ -1183,6 +1185,9 @@ export function apply(ctx, config) {
       provider,
       model,
       durationMs: Date.now() - startedAt,
+      conversation: preferences.fullTrace === true
+        ? { system: INLINE_EDIT_SYSTEM_PROMPT, message: requestText, answer: buffer }
+        : undefined,
       trace: {
         kind: 'inline-edit',
         explicit: true,
@@ -1531,6 +1536,42 @@ export function apply(ctx, config) {
     return { path: relative, removed: true }
   }
 
+  // ----------------------------------------------------------------- reveal
+
+  async function revealRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
+    const relative = typeof body.path === 'string' ? body.path.trim() : ''
+    const segments = relative.split(/[\\/]+/)
+    if (relative === '' || relative.length > 400 || segments.some((segment) => segment === '..' || segment === '')) {
+      return fail('bad-request', 'Укажите путь к файлу или папке внутри рабочей папки.')
+    }
+    const root = await ctx.fs.resolve(scope.cwd, { signal })
+    const target = await ctx.fs.resolve(path.resolve(scope.cwd, relative), { signal })
+    if (!ctx.fs.contains(root, target)) return fail('outside-workspace', 'Показать можно только путь внутри рабочей папки.')
+    const nativePath = ctx.fs.processPath(target)
+    const existing = await stat(nativePath).catch(() => undefined)
+    if (existing === undefined) return fail('not-found', 'Такого файла или папки больше нет — обновите дерево.')
+    try {
+      await launchDetached(revealInvocation(process.platform, nativePath))
+    } catch (error) {
+      return fail('reveal-failed', `Не удалось открыть проводник ОС: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return { path: relative, revealed: true }
+  }
+
+  /** Starts the file manager and lets go of it: the page must not wait for its exit. */
+  function launchDetached(invocation) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(invocation.command, invocation.args, { detached: true, stdio: 'ignore', ...invocation.options })
+      child.once('error', reject)
+      child.once('spawn', () => {
+        child.unref()
+        resolve()
+      })
+    })
+  }
+
   async function stateRoute(body) {
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
@@ -1578,6 +1619,20 @@ export function apply(ctx, config) {
 }
 
 // -------------------------------------------------------------------- pure
+
+/**
+ * Command line that opens the OS file manager with `absolutePath` selected.
+ * The path is an argument, never a shell word, so a file name cannot become a
+ * command. Windows and macOS can select the entry itself; a Linux file manager
+ * only opens a folder, which is the one containing the entry.
+ */
+export function revealInvocation(platform, absolutePath) {
+  if (platform === 'win32') {
+    return { command: 'explorer.exe', args: [`/select,"${absolutePath}"`], options: { windowsVerbatimArguments: true } }
+  }
+  if (platform === 'darwin') return { command: 'open', args: ['-R', absolutePath] }
+  return { command: 'xdg-open', args: [path.dirname(absolutePath)] }
+}
 
 function assetPathOf(pathname) {
   if (typeof pathname !== 'string' || !pathname.startsWith(`${ASSET_PREFIX}/`)) return undefined

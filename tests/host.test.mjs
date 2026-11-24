@@ -11,7 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 
-import { apply, rankModels, resetModelCatalog } from '../index.js'
+import { apply, rankModels, resetModelCatalog, revealInvocation } from '../index.js'
 
 const SESSION_ID = 'session-1'
 const ROUTES = [
@@ -32,6 +32,7 @@ const ROUTES = [
   'mkdir',
   'rename',
   'remove',
+  'reveal',
   'state',
   'catalog',
   'credentials',
@@ -284,6 +285,37 @@ test('rename and remove stay inside the workspace', async () => {
   }
 })
 
+test('the reveal command selects the entry without a shell', () => {
+  assert.deepEqual(revealInvocation('win32', 'C:\\ws\\src\\index.js'), {
+    command: 'explorer.exe',
+    args: ['/select,"C:\\ws\\src\\index.js"'],
+    options: { windowsVerbatimArguments: true },
+  })
+  assert.deepEqual(revealInvocation('darwin', '/ws/src/index.js'), { command: 'open', args: ['-R', '/ws/src/index.js'] })
+  assert.deepEqual(revealInvocation('linux', path.join('ws', 'src', 'index.js')), {
+    command: 'xdg-open',
+    args: [path.join('ws', 'src')],
+  })
+})
+
+test('reveal refuses to leave the workspace or show a missing entry', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+
+    const noSession = await app.call('reveal', { path: 'README.md' })
+    assert.equal(errorCode(noSession.body), 'no-session')
+
+    const outside = await app.call('reveal', { sessionId: SESSION_ID, path: '../escape.txt' })
+    assert.equal(errorCode(outside.body), 'bad-request')
+
+    const missing = await app.call('reveal', { sessionId: SESSION_ID, path: 'src/gone.js' })
+    assert.equal(errorCode(missing.body), 'not-found')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the open, save and state routes work together', async () => {
   const root = await makeWorkspace()
   try {
@@ -349,6 +381,7 @@ test('preferences are shared with the code-editor plugin', async () => {
       const initial = await app.call('prefs', {})
       assert.equal(initial.body.preferences.contextLeft, 4000)
       assert.equal(initial.body.preferences.autoSuggest, true)
+      assert.equal(initial.body.preferences.showChat, true)
 
       const saved = await app.call('prefs', {
         patch: { completionProvider: 'fixture', completionModel: 'pinned', contextLeft: 1234 },
@@ -356,6 +389,9 @@ test('preferences are shared with the code-editor plugin', async () => {
       assert.equal(saved.body.preferences.completionProvider, 'fixture')
       assert.equal(saved.body.preferences.completionModel, 'pinned')
       assert.equal(saved.body.preferences.contextLeft, 1234)
+
+      const chatOff = await app.call('prefs', { patch: { showChat: false } })
+      assert.equal(chatOff.body.preferences.showChat, false)
     })
   } finally {
     await rm(root, { recursive: true, force: true })

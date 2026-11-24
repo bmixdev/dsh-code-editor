@@ -118,6 +118,8 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   explainSuppressed: true,
   /** Include source-bearing request and answer details in the local UI trace. */
   fullTrace: false,
+  /** Keep the output panel open on its Chat tab when the IDE starts. */
+  showChat: true,
   /** Drop an answer that duplicates the line below the cursor. */
   heuristicDuplicateLine: true,
   /** Drop an answer that only retells the lines below the cursor. */
@@ -194,6 +196,7 @@ const BOOLEAN_KEYS = [
   'showRemovedDecorations',
   'explainSuppressed',
   'fullTrace',
+  'showChat',
   'heuristicDuplicateLine',
   'heuristicExtendsRange',
   'heuristicRevertingChange',

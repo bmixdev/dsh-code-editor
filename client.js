@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-23.10'
+    const UI_BUILD = '2026-11-24.10'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -790,12 +790,18 @@ window.__ModuleLoader__.load({
           run: () => copy(workspaceRoot === '' ? target.path : `${workspaceRoot.replace(/[\\/]+$/, '')}/${target.path}`),
         })
         items.push({ id: 'copy-relative', label: 'Копировать относительный путь', run: () => copy(target.path) })
+        items.push({
+          id: 'reveal',
+          label: 'Показать в проводнике ОС',
+          run: () => {
+            void call('reveal', { sessionId, path: target.path }).catch((cause) => setError(describeError(cause)))
+          },
+        })
         items.push({ separator: true })
         items.push({ id: 'rename', label: 'Переименовать…', key: 'F2', run: () => props.onRename(target.path, target.name, target.type) })
         items.push({ id: 'delete', label: 'Удалить', key: 'Delete', run: () => props.onDelete(target.path, target.name, target.type) })
         items.push({ separator: true })
         items.push({ id: 'terminal', label: 'Открыть во встроенном терминале', disabled: true, hint: 'Встроенного терминала в IDE нет: плагин не получает PTY.' })
-        items.push({ id: 'reveal', label: 'Показать в проводнике ОС', disabled: true, hint: 'Плагин не имеет доступа к оболочке рабочей машины.' })
         return items
       }
 
@@ -2336,8 +2342,15 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const autoModelOn = options.autoModel === undefined ? true : options.autoModel === true
+      const deadlineSetting = TAB_PREFERENCES.find((entry) => entry.key === 'deadlineMs')
+      const deadlineDefault = deadlineSetting === undefined ? 6000 : deadlineSetting.value
       const modelOptions = [
-        h('option', { key: '', value: '' }, sessionInfo !== undefined ? `Как у сессии (${sessionInfo.model})` : 'Как у сессии'),
+        h(
+          'option',
+          { key: '', value: '' },
+          sessionInfo !== undefined ? `Как у сессии (${sessionInfo.model})${autoModelOn ? ' · авто' : ''}` : 'Как у сессии',
+        ),
       ]
       const knownModels = new Set()
       for (const entry of models) {
@@ -2399,8 +2412,39 @@ window.__ModuleLoader__.load({
         setting(
           'model',
           'Автодополнение: модель',
-          'Пустое значение — модель сессии; для другого провайдера — его первая модель.',
+          autoModelOn
+            ? 'Пустое значение — модель сессии, но при включённом автопереключении (ниже) подсказка идёт на быстрой модели из каталога провайдера.'
+            : 'Пустое значение — модель сессии; для другого провайдера — его первая модель.',
           h('select', { className: 'dsh-ide-input dsh-ide-setting-input', value: model, onChange: (event) => setModel(event.target.value) }, modelOptions),
+        ),
+        setting(
+          'auto-model',
+          'Автодополнение: автопереключение модели',
+          'Включено — если модель не выбрана, брать быструю из каталога провайдера. Выключено — подсказки идут на модели сессии. Явно выбранная модель важнее этой настройки.',
+          h(
+            'label',
+            { className: 'dsh-ide-setting-check' },
+            h('input', {
+              type: 'checkbox',
+              checked: autoModelOn,
+              onChange: (event) => setOptions((previous) => ({ ...previous, autoModel: event.target.checked })),
+            }),
+            h('span', {}, 'Брать быструю автоматически'),
+          ),
+        ),
+        setting(
+          'deadline',
+          'Автодополнение: максимальное ожидание',
+          'Сколько миллисекунд ждать ответ, прежде чем показать «Истекло время ожидания подсказки». 1000–60000 (6000 = 6 с, 60000 = 60 с).',
+          h('input', {
+            className: 'dsh-ide-input dsh-ide-setting-input dsh-ide-input-number',
+            type: 'number',
+            min: 1000,
+            max: 60000,
+            step: 1000,
+            value: String(options.deadlineMs === undefined ? deadlineDefault : options.deadlineMs),
+            onChange: (event) => setOptions((previous) => ({ ...previous, deadlineMs: event.target.value })),
+          }),
         ),
         setting(
           'catalog',
@@ -2570,7 +2614,6 @@ window.__ModuleLoader__.load({
       const REQUEST_KEYS = [
         'completionEffort',
         'debounceMs',
-        'deadlineMs',
         'flushAfterMs',
         'aboveLines',
         'belowLines',
@@ -2583,7 +2626,6 @@ window.__ModuleLoader__.load({
         'maxEdits',
         'maxTokens',
         'wholeFileContext',
-        'autoModel',
         'noReasoningHint',
         'rangeReplace',
         'partialAccept',
@@ -2592,6 +2634,7 @@ window.__ModuleLoader__.load({
         'showRemovedDecorations',
         'explainSuppressed',
         'fullTrace',
+        'showChat',
       ]
       const CHECK_KEYS = [
         'showWhitespaceOnlyChanges',
@@ -2851,6 +2894,34 @@ window.__ModuleLoader__.load({
         props && typeof props.absolutePath === 'string' ? props.absolutePath : fromTab !== undefined ? fromTab.path : ''
       const label = props && typeof props.label === 'string' ? props.label : 'IDE'
       const providedSession = props && typeof props.sessionId === 'string' ? props.sessionId : ''
+      const scope = providedSession !== '' ? providedSession : fromTab !== undefined ? fromTab.sessionId : ''
+      const [openTabId, setOpenTabId] = React.useState('')
+      const tabOpen = openTabId !== ''
+
+      // The IDE lives in the sidebar and can be closed from there, so the button
+      // has to follow the tab inventory instead of guessing from a click. The
+      // inventory holds saved and adopted tabs even while the sidebar is closed.
+      React.useEffect(() => {
+        const sidebar = services.sidebarRight
+        const inventory = sidebar && sidebar.openTabs
+        if (scope === '' || !inventory || typeof inventory.getSnapshot !== 'function' || typeof inventory.subscribe !== 'function') {
+          return undefined
+        }
+        const read = () => {
+          let tabs
+          try {
+            tabs = inventory.getSnapshot()
+          } catch (cause) {
+            return
+          }
+          if (!Array.isArray(tabs)) return
+          const match = tabs.find((entry) => entry && entry.sessionId === scope && entry.kind === TAB_KIND)
+          setOpenTabId(match && typeof match.tabId === 'string' ? match.tabId : '')
+        }
+        read()
+        const stop = inventory.subscribe(read)
+        return typeof stop === 'function' ? stop : undefined
+      }, [scope])
 
       const open = React.useCallback(
         async (event) => {
@@ -2876,6 +2947,23 @@ window.__ModuleLoader__.load({
               setError('Правая панель недоступна')
               return
             }
+            if (openTabId !== '') {
+              // A second press closes only the IDE that is actually on screen.
+              // An open but background or collapsed tab is revealed instead, so
+              // the press never closes something the user cannot see.
+              const active = typeof sidebar.active === 'function' ? sidebar.active() : undefined
+              const expanded = typeof sidebar.isExpanded !== 'function' || sidebar.isExpanded()
+              const showing = typeof sidebar.active !== 'function' || (expanded && active !== undefined && active.id === openTabId)
+              if (showing) {
+                if (typeof sidebar.closeIn === 'function') sidebar.closeIn(sessionId, openTabId)
+                else if (typeof sidebar.close === 'function') sidebar.close(openTabId)
+                else {
+                  setError('Не удалось закрыть IDE')
+                  return
+                }
+                return
+              }
+            }
             requestOpen(sessionId, absolutePath)
             // One IDE tab per session: `multiple: false` makes every open land
             // on the same page address, so the tab is revealed instead of stacked.
@@ -2894,7 +2982,7 @@ window.__ModuleLoader__.load({
             setBusy(false)
           }
         },
-        [absolutePath, fromTab, providedSession],
+        [absolutePath, fromTab, openTabId, providedSession],
       )
 
       return h(
@@ -2905,11 +2993,30 @@ window.__ModuleLoader__.load({
           {
             type: 'button',
             className: 'dsh-ide-action-button',
+            'data-open': tabOpen ? 'true' : 'false',
+            'aria-pressed': tabOpen,
             onClick: open,
             disabled: busy,
-            title: error === '' ? 'Открыть рабочую область в IDE' : error,
+            title: error !== '' ? error : tabOpen ? 'IDE открыта — переключиться или закрыть' : 'Открыть рабочую область в IDE',
           },
-          label,
+          h(
+            'svg',
+            {
+              className: 'dsh-ide-action-icon',
+              viewBox: '0 0 24 24',
+              fill: 'none',
+              stroke: 'currentColor',
+              strokeWidth: 1.6,
+              strokeLinecap: 'round',
+              strokeLinejoin: 'round',
+              'aria-hidden': 'true',
+            },
+            h('rect', { x: 2.5, y: 4, width: 19, height: 16, rx: 2.5 }),
+            h('path', { d: 'M8.5 9.5 6 12l2.5 2.5' }),
+            h('path', { d: 'M15.5 9.5 18 12l-2.5 2.5' }),
+            h('path', { d: 'M13 8.5 11 15.5' }),
+          ),
+          h('span', { className: 'dsh-ide-action-label' }, label),
         ),
         error === '' ? null : h('span', { className: 'dsh-ide-action-error', title: error }, '!'),
       )
@@ -2996,7 +3103,7 @@ const TAB_PREFERENCES = [
   { key: 'maxEdits', kind: 'number', value: 3, min: 0, max: 5, title: 'Подсказки: сколько правок', hint: 'Больше этого числа правок из одного ответа не принимается; 0 — выключить.' },
   { key: 'maxTokens', kind: 'number', value: 0, min: 0, max: 8000, title: 'Подсказки: лимит токенов ответа', hint: '0 — без ограничения: запрос уходит без maxTokens, и модель останавливается сама. Лимит ниже возможностей модели обрезает ответ посреди правки.' },
   { key: 'wholeFileContext', kind: 'boolean', value: true, title: 'Подсказки: весь файл в запросе', hint: 'Отправлять файл целиком с отметкой курсора, а не окна вокруг него.' },
-  { key: 'autoModel', kind: 'boolean', value: true, title: 'Подсказки: быстрая модель сама', hint: 'Если модель подсказок не выбрана, брать быструю из каталога провайдера, а не модель сессии. Выключите, чтобы подсказки шли на текущей модели.' },
+  { key: 'autoModel', kind: 'boolean', value: true, title: 'Подсказки: автопереключение модели', hint: 'Если модель подсказок не выбрана, брать быструю из каталога провайдера, а не модель сессии. Выключите, чтобы подсказки шли на текущей модели.' },
   { key: 'noReasoningHint', kind: 'boolean', value: true, title: 'Подсказки: сразу кодом', hint: 'Добавлять в инструкцию «не рассуждай вслух: сразу пиши код». Скрытые рассуждения модели это не отключает — их задаёт маршрут.' },
   { key: 'rangeReplace', kind: 'boolean', value: true, title: 'Подсказки: заменять хвост строки', hint: 'Разрешать замену текста после курсора, а не только вставку.' },
   { key: 'partialAccept', kind: 'boolean', value: true, title: 'Подсказки: приём по слову', hint: 'Ctrl+→ принимает следующее слово подсказки.' },
@@ -3011,6 +3118,7 @@ const TAB_PREFERENCES = [
     hint: 'Красить текст, который перепишет подсказка. По умолчанию выключено: подсветка легко выглядит как чужое выделение.',
   },
   { key: 'fullTrace', kind: 'boolean', value: false, title: 'Полная диагностика подсказок', hint: 'Хранить в панели запрос, исходный код и ответ модели. Выключение очищает эти тексты в текущей панели.' },
+  { key: 'showChat', kind: 'boolean', value: true, title: 'Показывать чат в панели', hint: 'Открывать панель вывода на вкладке «Чат» при запуске IDE. Выключите, чтобы панель не занимала место, пока вы её не откроете.' },
   { key: 'explainSuppressed', kind: 'boolean', value: true, title: 'Подсказки: причины отказа', hint: 'Писать в «Траектории», почему подсказка скрыта.' },
   { key: 'heuristicDuplicateLine', kind: 'boolean', value: true, title: 'Проверка: дубль строки', hint: 'Отклонять повтор следующей строки.' },
   { key: 'heuristicExtendsRange', kind: 'boolean', value: true, title: 'Проверка: повтор диапазона', hint: 'Отклонять ответ, повторяющий исходные строки.' },
@@ -3181,12 +3289,32 @@ function matchChord(keymap, event) {
   return undefined
 }
 
-function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
-  const entry = trace.length === 0 ? undefined : trace[Math.min(panel.index, trace.length - 1)]
+function OutputPanel({ panel, height, trace, showChat, onTab, onSelect, onAccept, onClose }) {
+  const [menu, setMenu] = React.useState(undefined)
+  React.useEffect(() => {
+    if (menu === undefined) return undefined
+    const close = () => setMenu(undefined)
+    const onKey = (event) => {
+      if (event.key === 'Escape') close()
+    }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [menu])
+  const selected = trace.length === 0 ? undefined : trace[Math.min(panel.index, trace.length - 1)]
+  // Inline edits have no recorded conversation. Do not let their rows blank
+  // the Chat tab: fall back to the newest row that does carry one.
+  const entry = selected !== undefined && selected.conversation !== undefined
+    ? selected
+    : trace.find((row) => row.conversation !== undefined)
   const conversation = entry === undefined ? undefined : entry.conversation
   const system = conversation === undefined ? '' : conversation.system
   const message = conversation === undefined ? '' : conversation.message
   const answer = conversation === undefined ? '' : conversation.answer
+  const chatOpen = showChat !== false && panel.tab === 'chat'
   return h(
     'div',
     { className: 'dsh-ide-panel', style: { height: `${height}px` } },
@@ -3197,25 +3325,27 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
         'button',
         {
           type: 'button',
-          className: panel.tab === 'trajectory' ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
+          className: !chatOpen ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
           onClick: () => onTab('trajectory'),
         },
         'Траектория',
       ),
-      h(
+      showChat === false ? null : h(
         'button',
         {
           type: 'button',
-          className: panel.tab === 'chat' ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
+          className: chatOpen ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
           onClick: () => onTab('chat'),
         },
         'Чат',
       ),
       h('span', { className: 'dsh-ide-panel-spacer' }),
       h('span', { className: 'dsh-ide-panel-hint' }, trace.length === 0 ? 'пока пусто' : `запросов: ${trace.length}`),
-      h('button', { type: 'button', className: 'dsh-ide-panel-close', title: 'Закрыть панель', onClick: onClose }, '×'),
+      showChat === false
+        ? h('button', { type: 'button', className: 'dsh-ide-panel-close', title: 'Закрыть панель', onClick: onClose }, '×')
+        : null,
     ),
-    panel.tab === 'trajectory'
+    !chatOpen
       ? h(
           'div',
           { className: 'dsh-ide-panel-body' },
@@ -3231,7 +3361,20 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                   {
                     key: `${row.at}:${index}`,
                     className: index === panel.index ? 'dsh-ide-trace dsh-ide-trace-active' : 'dsh-ide-trace',
+                    title: row.hint === undefined ? undefined : 'Клик — показать подсказку, правый клик — принять',
                     onClick: () => onSelect(index),
+                    onContextMenu: (event) => {
+                      if (row.hint === undefined) return
+                      event.preventDefault()
+                      event.stopPropagation()
+                      const width = window.innerWidth
+                      const heightNow = window.innerHeight
+                      setMenu({
+                        x: Math.max(4, Math.min(event.clientX, width - 184)),
+                        y: Math.max(4, Math.min(event.clientY, heightNow - 42)),
+                        row,
+                      })
+                    },
                   },
                   h('span', { className: 'dsh-ide-trace-time' }, row.at),
                   h('span', { className: 'dsh-ide-trace-path' }, row.path),
@@ -3241,16 +3384,24 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                       className: 'dsh-ide-trace-model',
                       title: traceModelHint(row),
                     },
-                    `${row.provider} / ${row.model}${
-                      row.fellBack === true ? ' · запасная' : row.modelSource === 'session' ? ' · из сессии' : row.modelSource === 'auto' ? ' · быстрая' : ''
-                    }`,
+                    row.pending === true
+                      ? 'модель думает…'
+                      : `${row.provider} / ${row.model}${
+                          row.fellBack === true ? ' · запасная' : row.modelSource === 'session' ? ' · из сессии' : row.modelSource === 'auto' ? ' · быстрая' : ''
+                        }`,
                   ),
-                  h('span', { className: 'dsh-ide-trace-mode' }, row.explicit ? 'Ctrl+Space' : 'авто'),
+                  h(
+                    'span',
+                    { className: 'dsh-ide-trace-mode' },
+                    row.kind === 'inline-edit' ? 'правка' : row.explicit ? 'Ctrl+Space' : 'авто',
+                  ),
                   h('span', { className: 'dsh-ide-trace-meta' }, `${row.before}/${row.after} символов`),
                   h('span', { className: 'dsh-ide-trace-meta' }, row.displayMs === undefined ? `${row.durationMs} мс` : `до показа: ${row.displayMs} мс · Host: ${row.durationMs} мс`),
-                  row.ok
-                    ? h('span', { className: 'dsh-ide-trace-ok' }, `+${row.chars} символов`)
-                    : h('span', { className: 'dsh-ide-trace-error' }, row.reason || 'пустой ответ'),
+                  row.pending === true
+                    ? h('span', { className: 'dsh-ide-trace-pending' }, 'думает…')
+                    : row.ok
+                      ? h('span', { className: 'dsh-ide-trace-ok' }, `+${row.chars} символов`)
+                      : h('span', { className: 'dsh-ide-trace-error' }, row.reason || 'пустой ответ'),
                 ),
               ),
         )
@@ -3271,6 +3422,29 @@ function OutputPanel({ panel, height, trace, onTab, onSelect, onClose }) {
                 h('pre', { className: 'dsh-ide-chat-text' }, answer === '' ? entry.reason || '(пусто)' : answer),
               ),
         ),
+    menu === undefined
+      ? null
+      : h(
+          'div',
+          {
+            className: 'dsh-ide-context-menu',
+            style: { left: `${menu.x}px`, top: `${menu.y}px` },
+            onMouseDown: (event) => event.stopPropagation(),
+          },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-context-item',
+              onClick: () => {
+                const row = menu.row
+                setMenu(undefined)
+                onAccept(row)
+              },
+            },
+            'Принять правку',
+          ),
+        ),
   )
 }
 
@@ -3285,6 +3459,7 @@ function IdeBody(props) {
       const initialPath = parsed !== undefined ? parsed.path : ''
 
       const hostRef = React.useRef(null)
+      const hintElapsedRef = React.useRef(null)
       const runtime = React.useRef({
         editor: undefined,
         monaco: undefined,
@@ -3366,6 +3541,8 @@ function IdeBody(props) {
   const [panel, setPanel] = React.useState(undefined)
   const [panelHeight, setPanelHeight] = React.useState(190)
   const [trace, setTrace] = React.useState([])
+  const [replayHint, setReplayHint] = React.useState(undefined)
+  const showChat = preferences === undefined || preferences.showChat !== false
       const [quick, setQuick] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
@@ -3401,6 +3578,17 @@ function IdeBody(props) {
       React.useEffect(() => {
         prefsRef.current = preferences
       }, [preferences])
+
+      // Turning the chat off must not leave the panel on a tab it no longer shows.
+      // While it is on, the panel is permanent: closed means the setting is off.
+      React.useEffect(() => {
+        if (!booted) return
+        if (showChat) {
+          setPanel((current) => (current === undefined ? { tab: 'chat', index: 0 } : current))
+          return
+        }
+        setPanel(undefined)
+      }, [showChat, booted])
 
       // Same reason as `prefsRef`: the editor effect installs the key dispatch
       // once, so the chord table has to be read through a ref.
@@ -4100,7 +4288,20 @@ function IdeBody(props) {
         setTrace((current) => [record, ...current].slice(0, 60))
       }, [])
 
+      // A request that is still running keeps one row in the list and only
+      // refreshes its elapsed time; the row id survives other traces arriving
+      // above it, so a late answer cannot overwrite a newer request.
+      const updateTrace = React.useCallback((id, patch) => {
+        setTrace((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)))
+      }, [])
+
       const toggleOutput = React.useCallback(() => {
+        // The chat is a permanent part of the IDE while its setting is on:
+        // closing it is the setting's job, not a keystroke's.
+        if (prefsRef.current?.showChat !== false) {
+          setPanel({ tab: 'chat', index: 0 })
+          return
+        }
         setPanel((current) => (current === undefined ? { tab: 'trajectory', index: 0 } : undefined))
       }, [])
 
@@ -4891,6 +5092,52 @@ function IdeBody(props) {
 
       const inlineState = () => runtime.current.inlineEdit
 
+      const clearInlineTraceTimer = (st) => {
+        if (st !== undefined && st.traceTimer !== undefined) {
+          clearInterval(st.traceTimer)
+          st.traceTimer = undefined
+        }
+      }
+
+      const settleInlineTrace = (st, patch) => {
+        clearInlineTraceTimer(st)
+        if (st === undefined || st.traceSettled === true || typeof st.traceId !== 'string') return
+        st.traceSettled = true
+        updateTrace(st.traceId, { pending: false, ...patch })
+      }
+
+      // Inline Edit is a model request too: it gets a live row in the same
+      // Trajectory list, with the clock ticking until the answer arrives.
+      const startInlineTrace = (st, requestId) => {
+        const startedAt = performance.now()
+        const traceId = `inline-${requestId}`
+        st.traceId = traceId
+        st.traceStartedAt = startedAt
+        pushTrace({
+          id: traceId,
+          at: new Date().toLocaleTimeString('ru-RU'),
+          path: st.path,
+          provider: '—',
+          model: '—',
+          explicit: true,
+          kind: 'inline-edit',
+          pending: true,
+          before: st.oldText.length,
+          after: 0,
+          durationMs: 0,
+          chars: 0,
+          ok: false,
+          reason: 'Модель думает…',
+        })
+        st.traceTimer = setInterval(() => {
+          if (runtime.current.inlineEdit !== st) {
+            clearInlineTraceTimer(st)
+            return
+          }
+          updateTrace(traceId, { durationMs: Math.round(performance.now() - startedAt) })
+        }, 100)
+      }
+
       const publishInline = () => {
         const st = inlineState()
         setInlineView(
@@ -4935,6 +5182,14 @@ function IdeBody(props) {
       const dismissInlineEdit = (reason, focus) => {
         const st = inlineState()
         if (st === undefined) return false
+        if (st.phase === 'pending') {
+          settleInlineTrace(st, {
+            durationMs: Math.round(performance.now() - st.traceStartedAt),
+            reason: 'Отменено',
+          })
+        } else {
+          clearInlineTraceTimer(st)
+        }
         clearInlineDecorations()
         st.controller?.abort()
         runtime.current.inlineEdit = undefined
@@ -4972,6 +5227,7 @@ function IdeBody(props) {
         runtime.current.inlineEdit = {
           phase: 'input',
           key,
+          path: entry.path,
           hostId: entry.hostId,
           token: entry.token,
           modelVersion: model.getVersionId(),
@@ -4984,6 +5240,10 @@ function IdeBody(props) {
           controller: undefined,
           decorations: undefined,
           zone: undefined,
+          traceId: undefined,
+          traceTimer: undefined,
+          traceStartedAt: 0,
+          traceSettled: false,
         }
         publishInline()
         window.setTimeout(() => inlineInputRef.current?.focus(), 0)
@@ -5075,6 +5335,7 @@ function IdeBody(props) {
         st.requestId = requestId
         const controller = new AbortController()
         st.controller = controller
+        startInlineTrace(st, requestId)
         publishInline()
         try {
           const payload = await call(
@@ -5095,16 +5356,61 @@ function IdeBody(props) {
           st.controller = undefined
           st.proposal = payload.proposal
           st.phase = 'preview'
+          const change = payload.proposal?.changes?.[0]
+          const replacement = change !== undefined && typeof change.newText === 'string' ? change.newText : ''
+          const removedText = change !== undefined && typeof change.oldText === 'string' ? change.oldText : st.oldText
+          const hint = change === undefined
+            ? undefined
+            : {
+                path: st.path,
+                kind: removedText === '' ? 'insert' : 'replace',
+                range: { start: change.start, end: change.end },
+                removedText,
+                insertText: replacement,
+                modelVersion: st.modelVersion,
+              }
+          // Older Host builds do not send the inline conversation; keep the
+          // Chat tab useful with the same instruction/fragment/replacement
+          // while the full transcript is unavailable.
+          const conversation = payload.conversation !== undefined
+            ? payload.conversation
+            : prefsRef.current?.fullTrace === true
+              ? {
+                  system: 'Правка выделения',
+                  message: `Задача: ${st.instruction}\n\n--- фрагмент ---\n${st.oldText}`,
+                  answer: replacement,
+                }
+              : undefined
+          settleInlineTrace(st, {
+            ok: true,
+            provider: typeof payload.provider === 'string' ? payload.provider : '—',
+            model: typeof payload.model === 'string' ? payload.model : '—',
+            durationMs: Number.isFinite(Number(payload.durationMs))
+              ? Number(payload.durationMs)
+              : Math.round(performance.now() - st.traceStartedAt),
+            before: st.oldText.length,
+            after: replacement.length,
+            chars: replacement.length,
+            reason: '',
+            hint,
+            conversation,
+          })
           paintInlinePreview()
           publishInline()
         } catch (cause) {
           if (inlineState() !== st || st.requestId !== requestId) return
           st.controller = undefined
-          if (cause?.name === 'AbortError' || cause?.code === 'cancelled') st.phase = 'input'
+          const cancelled = cause?.name === 'AbortError' || cause?.code === 'cancelled'
+          if (cancelled) st.phase = 'input'
           else {
             st.phase = 'failed'
             st.error = describeError(cause)
           }
+          settleInlineTrace(st, {
+            ok: false,
+            durationMs: Math.round(performance.now() - st.traceStartedAt),
+            reason: cancelled ? 'Отменено' : describeError(cause),
+          })
           publishInline()
         }
       }
@@ -5112,6 +5418,12 @@ function IdeBody(props) {
       const refineInlineEdit = () => {
         const st = inlineState()
         if (st === undefined) return
+        if (st.phase === 'pending') {
+          settleInlineTrace(st, {
+            durationMs: Math.round(performance.now() - st.traceStartedAt),
+            reason: 'Отменено',
+          })
+        }
         clearInlineDecorations()
         st.controller?.abort()
         st.controller = undefined
@@ -5289,7 +5601,26 @@ function IdeBody(props) {
         } else {
           clearGhostPreview()
         }
-        pushTrace({ ...result.trace, ok: true, displayMs: Math.round(performance.now() - triggerAt) })
+        // Keep the plan's own coordinates so a trajectory click can draw the
+        // same hint again without asking the model. Only the cursor block is
+        // replayed; other edits in the reply are not applied by a replay.
+        const hintKey = runtime.current.modelTabs.get(model.uri.toString())
+        const hintPath = stateRef.current.tabs.find((candidate) => candidate.key === hintKey)?.path || ''
+        pushTrace({
+          ...result.trace,
+          ok: true,
+          displayMs: Math.round(performance.now() - triggerAt),
+          hint: hintPath === ''
+            ? undefined
+            : {
+                path: hintPath,
+                kind: plan.kind,
+                range: plan.range,
+                removedText: plan.removedText,
+                insertText: plan.insertText,
+                modelVersion: plan.modelVersion,
+              },
+        })
       }
 
       const scheduleGhost = (kind = 'auto') => {
@@ -5385,8 +5716,38 @@ function IdeBody(props) {
         const hintButton = document.createElement('button')
         hintButton.type = 'button'
         hintButton.className = 'dsh-ide-hint-button'
+        let hintStartedAt = 0
+        let hintTimerHandle = 0
+        const stopHintTimer = () => {
+          if (hintTimerHandle !== 0) clearInterval(hintTimerHandle)
+          hintTimerHandle = 0
+        }
+        const showHintElapsed = (ms) => {
+          const element = hintElapsedRef.current
+          if (!element) return
+          element.hidden = false
+          element.textContent = `ИИ думает: ${ms} мс`
+        }
+        const hideHintElapsed = () => {
+          const element = hintElapsedRef.current
+          if (!element) return
+          element.hidden = true
+          element.textContent = ''
+        }
         const setHintBusy = (busy) => {
+          stopHintTimer()
           hintButton.textContent = busy ? '' : '💡'
+          if (busy) {
+            hintStartedAt = performance.now()
+            showHintElapsed(0)
+            const tick = () => {
+              showHintElapsed(Math.max(0, Math.round(performance.now() - hintStartedAt)))
+            }
+            tick()
+            hintTimerHandle = setInterval(tick, 100)
+          } else {
+            hideHintElapsed()
+          }
           hintButton.title = busy ? 'ИИ готовит подсказку. Нажмите, чтобы отменить (Esc)' : 'Запросить подсказку ИИ (Ctrl+Space)'
           hintButton.setAttribute('aria-label', hintButton.title)
           hintButton.setAttribute('data-busy', String(busy))
@@ -5559,9 +5920,13 @@ function IdeBody(props) {
 
         return () => {
           cancelGhostRequest()
+          clearInlineTraceTimer(runtime.current.inlineEdit)
+          runtime.current.inlineEdit?.controller?.abort()
           window.clearTimeout(cursorTimer)
           modelChange.dispose()
           if (hintLine) editor.removeGlyphMarginWidget(hintWidget)
+          stopHintTimer()
+          hideHintElapsed()
           runtime.current.setHintBusy = undefined
           blur.dispose()
           change.dispose()
@@ -5618,6 +5983,74 @@ function IdeBody(props) {
         }
         editor.updateOptions({ readOnly: entry.readOnly === true })
       }, [activeKey, monaco])
+
+      // A trajectory row keeps the plan it described. Clicking it opens that
+      // file and draws the same block again; it never asks the model. The text
+      // must still match the recorded removed fragment, or the hint would sit
+      // over code it no longer describes.
+      React.useEffect(() => {
+        if (replayHint === undefined) return
+        const editor = runtime.current.editor
+        const model = editor?.getModel()
+        if (!editor || !model) return
+        if (runtime.current.modelTabs.get(model.uri.toString()) !== replayHint.key) return
+        const hint = replayHint
+        setReplayHint(undefined)
+        clearGhost()
+        if (model.getValue().slice(hint.range.start, hint.range.end) !== hint.removedText) {
+          setStatus({ kind: 'error', message: 'Файл изменился — подсказка из траектории больше не подходит.' })
+          return
+        }
+        const plan = {
+          // `decorateRemoved` only marks a real replacement; an empty removed
+          // fragment is a plain insertion.
+          kind: hint.removedText === '' ? 'insert' : 'replace',
+          range: hint.range,
+          removedText: hint.removedText,
+          insertText: hint.insertText,
+          edits: [],
+          modelVersion: model.getVersionId(),
+        }
+        runtime.current.tab.plan = plan
+        runtime.current.tab.accepted = 0
+        decorateRemoved(plan, model)
+        const start = model.getPositionAt(plan.range.start)
+        editor.setPosition(start)
+        editor.revealPositionInCenterIfOutsideViewport(start)
+        if (plan.insertText !== '') {
+          showGhost(start, plan.insertText, model.getPositionAt(plan.range.end))
+        } else {
+          clearGhostPreview()
+        }
+        // "Принять правку" from the trajectory menu opens the file and asks
+        // for the same plan to be applied immediately. The text check above
+        // still protects a stale record; Tab and this path share one code path.
+        if (hint.accept === true) acceptGhost()
+      }, [replayHint, activeKey])
+
+      // A hint belongs to the turn that was on screen when it was requested.
+      // As soon as that session starts a new turn, and again when the turn
+      // settles, the old ghost must go: otherwise it floats over a file while
+      // the model is already answering something else.
+      React.useEffect(() => {
+        const sessionService = services.uiSession
+          || (services.ctx && typeof services.ctx.get === 'function' ? services.ctx.get('uiSession') : undefined)
+        const status = sessionService && sessionService.sessionStatus
+        if (!status || typeof status.getSnapshot !== 'function' || typeof status.subscribe !== 'function') return undefined
+        let previous
+        const read = () => {
+          const current = status.getSnapshot().get(sessionId)
+          const running = current === undefined ? undefined : current.running
+          if (running === true || (previous === true && running === false)) {
+            cancelGhostRequest()
+            clearGhost()
+            runtime.current.setHintBusy?.(false)
+          }
+          previous = running
+        }
+        read()
+        return status.subscribe(read)
+      }, [sessionId, clearGhost])
 
       // The close guard reads this set synchronously; keep it in step with react.
       React.useEffect(() => {
@@ -5838,9 +6271,10 @@ function IdeBody(props) {
             const saved = statePayload.state || {}
             if (typeof saved.treeWidth === 'number') setExplorerWidth(saved.treeWidth)
             if (typeof saved.panelHeight === 'number') setPanelHeight(saved.panelHeight)
-        if (saved.explorerSide === 'right') setExplorerSide('right')
+            if (saved.explorerSide === 'right') setExplorerSide('right')
             setShowTree(saved.showTree !== false)
             setHidden(saved.hidden === true)
+            if (loaded.showChat !== false) setPanel({ tab: 'chat', index: 0 })
             const wanted = []
             if (initialPath !== '') wanted.push(initialPath)
             for (const candidate of Array.isArray(saved.tabs) ? saved.tabs : []) {
@@ -6012,7 +6446,7 @@ function IdeBody(props) {
         openQuick,
         complete,
         toggleOutput,
-        openOutput: () => setPanel({ tab: 'trajectory', index: 0 }),
+        openOutput: () => setPanel({ tab: showChat ? 'chat' : 'trajectory', index: 0 }),
         openSettings: () => setSettingsOpen(true),
         openPalette: () => setPaletteOpen(true),
         openSearch: () => {
@@ -6351,6 +6785,18 @@ function IdeBody(props) {
           ],
         },
       ]
+
+      const replayRow = (row, accept) => {
+        const index = Math.max(0, trace.indexOf(row))
+        // Keep the trajectory visible: a replay is something the user may want
+        // to compare across several rows, and switching to Chat hid the list.
+        setPanel((current) => ({ tab: current === undefined ? 'trajectory' : current.tab, index }))
+        if (row === undefined || row.hint === undefined) return
+        void openFile(row.hint.path, { activate: true }).then((entry) => {
+          if (entry !== undefined) setReplayHint({ ...row.hint, key: entry.key, accept })
+        })
+      }
+      const replayTrace = (index, accept = false) => replayRow(trace[index], accept)
 
       const activeTab = tabs.find((candidate) => candidate.key === activeKey)
       // Buttons of the comparison show the same decision as the row in the pane.
@@ -6751,14 +7197,17 @@ function IdeBody(props) {
                   panel,
                   height: panelHeight,
                   trace,
+                  showChat,
                   onTab: (tab) => setPanel({ tab, index: panel.index }),
-                  onSelect: (index) => setPanel({ tab: 'chat', index }),
+                  onSelect: replayTrace,
+                  onAccept: (row) => replayRow(row, true),
                   onClose: () => setPanel(undefined),
                 }),
             h(
               'div',
               { className: 'dsh-ide-status' },
               h('span', { className: `dsh-ide-status-text${status.kind === 'error' ? ' dsh-ide-status-error' : ''}` }, statusMessage),
+              h('span', { className: 'dsh-ide-status-item dsh-ide-hint-elapsed', ref: hintElapsedRef, hidden: true }, ''),
               h('span', { className: 'dsh-ide-status-spacer' }),
               activeTab === undefined
                 ? null
@@ -7152,6 +7601,8 @@ function IdeBody(props) {
 .dsh-ide-tree-error { padding:3px 10px; color:var(--ide-error); font-size:11px; }
 .dsh-ide-tree-empty { padding:3px 10px; color:var(--ide-muted); font-size:11px; }
 .dsh-ide-hint-button { cursor:pointer; pointer-events:auto; border:0; border-radius:4px; padding:0; background:transparent; color:var(--ide-text); font:14px/1 system-ui; text-align:center; }
+.dsh-ide-hint-elapsed { font-variant-numeric:tabular-nums; }
+.dsh-ide-hint-elapsed[hidden] { display:none; }
 .dsh-ide-hint-button:hover, .dsh-ide-hint-button:focus-visible { background:var(--ide-hover); outline:1px solid var(--ide-accent); outline-offset:-1px; }
 .dsh-ide-hint-button[data-busy="true"]::after { content:''; display:inline-block; vertical-align:middle; width:11px; height:11px; border-radius:50%; border:2px solid var(--ide-muted); border-top-color:transparent; animation:dsh-ide-hint-spin .8s linear infinite; }
 @keyframes dsh-ide-hint-spin { to { transform:rotate(360deg); } }
@@ -7204,6 +7655,9 @@ function IdeBody(props) {
 .dsh-ide-panel-close:hover { color:var(--ide-fg); }
 .dsh-ide-panel-body { flex:1 1 auto; min-height:0; overflow:auto; padding:4px 0; font:400 11.5px/1.55 var(--ide-font); }
 .dsh-ide-panel-empty { color:var(--ide-fg-dim); padding:8px 12px; }
+.dsh-ide-context-menu { position:fixed; z-index:1000; min-width:168px; padding:4px; border:1px solid var(--ide-border); border-radius:7px; background:var(--ide-panel-2); box-shadow:0 10px 28px rgba(0,0,0,.35); }
+.dsh-ide-context-item { display:block; width:100%; padding:5px 9px; border:0; border-radius:5px; background:transparent; color:var(--ide-text); font:12px/1.4 var(--dsw-font-family,inherit); text-align:left; cursor:pointer; }
+.dsh-ide-context-item:hover { background:var(--ide-active); }
 .dsh-ide-trace { display:flex; gap:10px; align-items:baseline; padding:2px 12px; cursor:pointer; white-space:nowrap; }
 .dsh-ide-trace:hover { background:var(--ide-hover); }
 .dsh-ide-trace-active { background:var(--ide-active); }
@@ -7214,6 +7668,7 @@ function IdeBody(props) {
 .dsh-ide-trace-meta { color:var(--ide-fg-dim); flex:0 0 auto; }
 .dsh-ide-trace-ok { color:#89d185; flex:0 0 auto; }
 .dsh-ide-trace-error { color:#f48771; flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-trace-pending { color:#d9a441; flex:0 0 auto; }
 .dsh-ide-chat { padding:6px 12px 10px; }
 .dsh-ide-chat-label { color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px; font-size:10px; margin:8px 0 3px; }
 .dsh-ide-chat-text { margin:0; white-space:pre-wrap; word-break:break-word; font:400 11.5px/1.5 var(--ide-mono); color:var(--ide-fg); max-height:120px; overflow:auto; background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; }
@@ -7343,13 +7798,26 @@ function IdeBody(props) {
   text-align:left; cursor:pointer; padding:3px 6px; border-radius:4px; font:inherit; }
 .dsh-ide-quick-row-active { background:var(--ide-active); }
 .dsh-ide-action { display:inline-flex; align-items:center; gap:4px; }
-.dsh-ide-action-button { font:600 10.5px/1.2 var(--dsh-font-ui, system-ui, sans-serif); color:inherit; background:transparent;
-  border:1px solid var(--dsh-border, rgba(127,127,127,.35)); border-radius:5px; padding:2px 7px; cursor:pointer; }
-.dsh-ide-action-button:hover:not(:disabled) { background:var(--dsh-hover, rgba(127,127,127,.14)); }
+.dsh-ide-action-button { display:inline-flex; align-items:center; gap:5px; font:600 10.5px/1.25 var(--dsw-font-family, var(--dsh-font-ui, system-ui, sans-serif));
+  color:var(--dsw-alias-label-secondary, inherit); background:var(--dsw-alias-bg-layer-1, transparent);
+  border:1px solid var(--dsw-alias-border-l2, var(--dsh-border, rgba(127,127,127,.35))); border-radius:7px;
+  padding:3px 8px 3px 6px; cursor:pointer;
+  transition:color .12s ease, background .12s ease, border-color .12s ease; }
+.dsh-ide-action-button:hover:not(:disabled) { color:var(--dsw-alias-label-primary, inherit);
+  background:var(--dsw-alias-bg-layer-2, var(--dsh-hover, rgba(127,127,127,.14))); }
+.dsh-ide-action-button:focus-visible { outline:2px solid var(--dsw-alias-brand-primary, #4c8dff); outline-offset:1px; }
+.dsh-ide-action-button[data-open="true"] { color:var(--dsw-alias-brand-primary, #4c8dff);
+  border-color:var(--dsw-alias-brand-primary, #4c8dff); background:var(--dsw-alias-bg-layer-2, rgba(127,127,127,.14)); }
+.dsh-ide-action-button[data-open="true"]::after { content:''; width:5px; height:5px; border-radius:50%;
+  background:currentColor; margin-left:1px; }
+.dsh-ide-action-icon { width:14px; height:14px; flex:none; opacity:.85; }
+.dsh-ide-action-button[data-open="true"] .dsh-ide-action-icon { opacity:1; }
+.dsh-ide-action-label { white-space:nowrap; }
 .dsh-ide-action-button:disabled { opacity:.5; cursor:default; }
 .dsh-ide-action-error { color:#d9534f; font-weight:700; cursor:help; }
-.dsh-ide-action-compact .dsh-ide-action-button { padding:1px 6px; font-size:10px; line-height:1.4;
-  letter-spacing:.4px; text-transform:uppercase; }
+.dsh-ide-action-compact .dsh-ide-action-button { padding:2px 7px 2px 5px; font-size:10.5px; line-height:1.3;
+  letter-spacing:.15px; text-transform:none; border-radius:6px; }
+.dsh-ide-action-compact .dsh-ide-action-icon { width:13px; height:13px; }
 `
 
     function injectStyles() {
@@ -7372,6 +7840,9 @@ function IdeBody(props) {
           theme: ctx.theme,
           sidebarRight: ctx.sidebarRight,
           sidebarRightTabs: ctx.sidebarRightTabs,
+          // Session UI status (running / settled) lives in the shared core
+          // service; it is read defensively so the IDE still loads without it.
+          uiSession: typeof ctx.get === 'function' ? ctx.get('uiSession') : undefined,
           // The session input machine — the owner of `slash/input-insert-reference`
           // — lives on the session's own client context, which the sessions
           // service hands out per retained binding. Absent for a tab that is not

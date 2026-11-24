@@ -2,8 +2,8 @@
  * Client-half smoke test for `@local/dsh-ide`.
  *
  * Evaluates the bundle through the module-loader seam and checks the
- * registrations the Host half and the sidebar expect. React is stubbed, so no
- * component is ever mounted.
+ * registrations the Host half and the sidebar expect. Most tests stub React and
+ * never mount a component; the action toggle test uses a minimal hook renderer.
  */
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
@@ -189,6 +189,9 @@ test('the styles element is tagged and removed on dispose', async () => {
   const style = document.created.find((element) => element.attributes['data-dsh-ide'] !== undefined)
   assert.ok(style, 'a style element is injected')
   assert.match(style.textContent, /\.dsh-ide-root/)
+  assert.match(style.textContent, /\.dsh-ide-action-button\[data-open="true"\]/, 'the action button has an open state')
+  assert.match(style.textContent, /\.dsh-ide-action-icon/, 'the action button carries the IDE icon')
+  assert.match(style.textContent, /\.dsh-ide-hint-elapsed/, 'the busy spinner carries an elapsed timer in the status bar')
 })
 
 /**
@@ -500,4 +503,131 @@ test('every registered component renders its first pass without throwing', async
   assert.match(text, /Файл/)
   assert.match(text, /Правка/)
   assert.match(text, /Справка/)
+})
+
+function createHookReact() {
+  let slots = []
+  let effects = []
+  let cursor = 0
+  let component
+  let props
+  let tree
+  let queued = false
+
+  const sameDeps = (left, right) =>
+    Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => Object.is(value, right[index]))
+  const runEffects = () => {
+    for (const effect of effects) {
+      if (!effect || (effect.prev !== undefined && sameDeps(effect.prev, effect.deps))) continue
+      if (typeof effect.cleanup === 'function') effect.cleanup()
+      const cleanup = effect.fn()
+      effect.cleanup = typeof cleanup === 'function' ? cleanup : undefined
+      effect.prev = effect.deps
+    }
+  }
+  const render = () => {
+    cursor = 0
+    tree = component(props)
+    runEffects()
+    return tree
+  }
+  const schedule = () => {
+    if (queued) return
+    queued = true
+    queueMicrotask(() => {
+      queued = false
+      render()
+    })
+  }
+  const React = {
+    Fragment: 'fragment',
+    createElement: (type, elementProps, ...children) => ({ type, props: elementProps ?? {}, children }),
+    useState(initial) {
+      const index = cursor++
+      if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial
+      return [
+        slots[index],
+        (value) => {
+          slots[index] = typeof value === 'function' ? value(slots[index]) : value
+          schedule()
+        },
+      ]
+    },
+    useEffect(fn, deps) {
+      const index = cursor++
+      const previous = effects[index]
+      effects[index] = { fn, deps, prev: previous?.prev, cleanup: previous?.cleanup }
+    },
+    useCallback: (fn) => fn,
+    useMemo: (factory) => factory(),
+    useRef: (value) => ({ current: value }),
+  }
+  return {
+    React,
+    mount(nextComponent, nextProps) {
+      component = nextComponent
+      props = nextProps
+      slots = []
+      effects = []
+      queued = false
+      render()
+      return { getTree: () => tree }
+    },
+  }
+}
+
+function findButton(element) {
+  if (element === null || element === undefined || typeof element !== 'object') return undefined
+  if (Array.isArray(element)) {
+    for (const child of element) {
+      const found = findButton(child)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  if (element.type === 'button') return element
+  for (const child of element.children ?? []) {
+    const found = findButton(child)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+test('the IDE action closes its visible tab on a second press', async () => {
+  let tabs = [{ sessionId: 'session-1', tabId: 'tab-1', kind: 'dsh-ide' }]
+  let notify = () => {}
+  const closed = []
+  const renderer = createHookReact()
+  const { plugin } = await loadPlugin({ react: renderer.React })
+  const host = createHost()
+  host.ctx.sidebarRight.openTabs = {
+    getSnapshot: () => tabs,
+    subscribe(listener) {
+      notify = listener
+      return () => {}
+    },
+  }
+  host.ctx.sidebarRight.active = () => ({ id: 'tab-1' })
+  host.ctx.sidebarRight.isExpanded = () => true
+  host.ctx.sidebarRight.closeIn = (sessionId, tabId) => {
+    closed.push([sessionId, tabId])
+    tabs = []
+    notify()
+  }
+  plugin.apply(host.ctx)
+
+  const action = host.registrations.find((entry) => entry.config.name === 'sidebar.right.tab.document.actions')
+  const view = renderer.mount(action.component, { sessionId: 'session-1' })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  let button = findButton(view.getTree())
+  assert.ok(button, 'the action renders a button')
+  assert.equal(button.props['data-open'], 'true', 'the open IDE tab lights the action')
+  assert.equal(button.props['aria-pressed'], true)
+
+  button.props.onClick({ currentTarget: {} })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(closed, [['session-1', 'tab-1']], 'the visible IDE tab is closed')
+  button = findButton(view.getTree())
+  assert.equal(button.props['data-open'], 'false', 'closing the tab clears the outline')
+  assert.equal(button.props['aria-pressed'], false)
 })
