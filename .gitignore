@@ -8,3 +8,7 @@ Thumbs.db
 
 tools/
 temp/
+
+# Compatibility shim for a host process started before the ide/ -> editor/ move:
+# it still serves /ide/vs from ide/vendor. Remove after the next DSH restart.
+ide/

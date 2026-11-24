@@ -47,6 +47,12 @@ window.__ModuleLoader__.load({
     const STATE_WRITE_DELAY_MS = 400
     const MAX_RESTORED_TABS = 12
     const QUICK_OPEN_LIMIT = 3000
+    // The phone layout is chosen by the width of the pane, not of the window:
+    // the IDE is a column inside the right sidebar, so a desktop window can hold
+    // a narrow pane while a phone fills the screen with it. Seven menus, a
+    // 220px explorer and 12px rows do not survive 400px, hence the breakpoints.
+    const COMPACT_PANE_WIDTH = 700
+    const COMPACT_PANE_HARD_WIDTH = 480
 
     let services = {}
     /** Sidebar tab ids whose IDE pane holds unsaved text; read by the close guard. */
@@ -61,6 +67,69 @@ window.__ModuleLoader__.load({
       if (cause.code === 'read-only') return 'Рабочая папка открыта только для чтения.'
       if (cause.code === 'cancelled') return ''
       return messageOf(cause)
+    }
+
+    // -------------------------------------------------------------- viewport
+
+    /** `matchMedia` as a plain question: unknown windows answer "no". */
+    function matchMediaSafe(query) {
+      try {
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false
+        return window.matchMedia(query).matches === true
+      } catch {
+        return false
+      }
+    }
+
+    /** A media query as reactive state; safe on the Host-rendered test stubs. */
+    function useMediaQuery(query) {
+      const [matches, setMatches] = React.useState(() => matchMediaSafe(query))
+      React.useEffect(() => {
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined
+        let media
+        try {
+          media = window.matchMedia(query)
+        } catch {
+          return undefined
+        }
+        if (media === undefined || media === null) return undefined
+        const listener = (event) => setMatches(event.matches === true)
+        if (typeof media.addEventListener === 'function') media.addEventListener('change', listener)
+        else if (typeof media.addListener === 'function') media.addListener(listener)
+        return () => {
+          if (typeof media.removeEventListener === 'function') media.removeEventListener('change', listener)
+          else if (typeof media.removeListener === 'function') media.removeListener(listener)
+        }
+      }, [query])
+      return matches
+    }
+
+    /**
+     * Width of the pane element itself. The initial guess uses the window, which
+     * is exact on a phone and close enough everywhere else for one frame.
+     */
+    function usePaneWidth(ref) {
+      const [width, setWidth] = React.useState(() =>
+        typeof window !== 'undefined' && typeof window.innerWidth === 'number' ? window.innerWidth : 1024,
+      )
+      React.useEffect(() => {
+        const node = ref.current
+        if (node === null || node === undefined) return undefined
+        const measure = () => {
+          const next = node.clientWidth
+          if (typeof next === 'number' && next > 0) setWidth(next)
+        }
+        measure()
+        if (typeof ResizeObserver === 'function') {
+          const observer = new ResizeObserver(measure)
+          observer.observe(node)
+          return () => observer.disconnect()
+        }
+        if (typeof window === 'undefined') return undefined
+        window.addEventListener('resize', measure)
+        return () => window.removeEventListener('resize', measure)
+      }, [ref])
+      return width
     }
 
     // ------------------------------------------------------------- addresses
@@ -423,6 +492,25 @@ window.__ModuleLoader__.load({
         { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показать скрытые файлы', run: () => onToggleHidden(!hidden) },
         workspaceRoot === '' ? null : { separator: true },
         workspaceRoot === '' ? null : { id: 'copy-root', label: 'Копировать путь рабочей папки', run: () => copy(workspaceRoot) },
+        // Touch devices have no reliable hover, so the actions that normally live
+        // in a row's context menu are repeated here for the selected row.
+        selected === undefined || typeof selected.path !== 'string' || selected.path === ''
+          ? null
+          : { separator: true },
+        selected === undefined || typeof selected.path !== 'string' || selected.path === ''
+          ? null
+          : {
+              id: 'rename-selected',
+              label: `Переименовать «${baseName(selected.path)}»…`,
+              run: () => props.onRename(selected.path, baseName(selected.path), selected.type),
+            },
+        selected === undefined || typeof selected.path !== 'string' || selected.path === ''
+          ? null
+          : {
+              id: 'delete-selected',
+              label: `Удалить «${baseName(selected.path)}»`,
+              run: () => props.onDelete(selected.path, baseName(selected.path), selected.type),
+            },
       ].filter(Boolean)
 
       const load = React.useCallback(
@@ -790,6 +878,10 @@ window.__ModuleLoader__.load({
             value: query,
             placeholder: 'Фильтр по имени файла',
             'aria-label': 'Фильтр файлов по имени',
+            autoCapitalize: 'off',
+            autoCorrect: 'off',
+            spellCheck: false,
+            enterKeyHint: 'search',
             onChange: (event) => setQuery(event.target.value),
             onKeyDown: (event) => {
               if (event.key === 'Escape') setQuery('')
@@ -881,6 +973,81 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * Compact stand-in for the menu bar. Seven menus with dropdowns do not fit
+     * a phone width, so the whole command set moves into one scrollable sheet.
+     * Commands the bundle cannot honour are already disabled on the desktop and
+     * stay out here: on a phone they would only be noise.
+     */
+    function MenuSheet({ menus, onClose }) {
+      // Escape closes the sheet; on a phone it sits over the whole pane, so a
+      // stray hardware key press must not leave the editor unreachable.
+      React.useEffect(() => {
+        if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
+        const onKeyDown = (event) => {
+          if (event.key !== 'Escape') return
+          event.preventDefault()
+          onClose()
+        }
+        document.addEventListener('keydown', onKeyDown)
+        return () => document.removeEventListener('keydown', onKeyDown)
+      }, [onClose])
+      const groups = menus
+        .map((menu) => ({
+          id: menu.id,
+          label: menu.label,
+          items: menu.items.filter((item) => item.separator !== true && item.disabled !== true),
+        }))
+        .filter((menu) => menu.items.length > 0)
+      return h(
+        'div',
+        { className: 'dsh-ide-sheet', onClick: onClose },
+        h(
+          'div',
+          {
+            className: 'dsh-ide-sheet-card',
+            role: 'dialog',
+            'aria-modal': 'true',
+            'aria-label': 'Меню IDE',
+            onClick: (event) => event.stopPropagation(),
+          },
+          h(
+            'div',
+            { className: 'dsh-ide-sheet-head' },
+            h('span', { className: 'dsh-ide-sheet-title' }, 'Меню'),
+            h('button', { type: 'button', className: 'dsh-ide-sheet-close', title: 'Закрыть', onClick: onClose }, '✕'),
+          ),
+          h(
+            'div',
+            { className: 'dsh-ide-sheet-body' },
+            groups.map((menu) =>
+              h(
+                'div',
+                { key: menu.id, className: 'dsh-ide-sheet-group' },
+                h('div', { className: 'dsh-ide-sheet-group-label' }, menu.label),
+                menu.items.map((item) =>
+                  h(
+                    'button',
+                    {
+                      key: item.id,
+                      type: 'button',
+                      className: 'dsh-ide-sheet-item',
+                      onClick: () => {
+                        onClose()
+                        if (typeof item.run === 'function') item.run()
+                      },
+                    },
+                    h('span', { className: 'dsh-ide-sheet-item-label' }, item.label),
+                    item.key === undefined ? null : h('span', { className: 'dsh-ide-sheet-item-key' }, item.key),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      )
+    }
+
     function PromptDialog({ prompt, onClose }) {
       const [value, setValue] = React.useState(prompt.value === undefined ? '' : prompt.value)
       const [busy, setBusy] = React.useState(false)
@@ -939,12 +1106,16 @@ window.__ModuleLoader__.load({
     }
 
     function TabStrip(props) {
-      const { tabs, activeKey, onActivate, onClose, onContextMenu } = props
+      const { tabs, activeKey, onActivate, onClose, onContextMenu, compact } = props
       return h(
         'div',
         { className: 'dsh-ide-tabs', role: 'tablist' },
         tabs.length === 0
-          ? h('span', { className: 'dsh-ide-tabs-empty' }, 'Выберите файл в дереве слева')
+          ? h(
+              'span',
+              { className: 'dsh-ide-tabs-empty' },
+              compact ? 'Нет открытых файлов' : 'Выберите файл в дереве слева',
+            )
           : tabs.map((tab) =>
               h(
                 'div',
@@ -1127,6 +1298,10 @@ window.__ModuleLoader__.load({
             value: query,
             placeholder: 'Имя файла в рабочей области…',
             'aria-label': 'Быстрое открытие файла',
+            autoCapitalize: 'off',
+            autoCorrect: 'off',
+            spellCheck: false,
+            enterKeyHint: 'go',
             onChange: (event) => setQuery(event.target.value),
             onKeyDown,
           }),
@@ -1661,7 +1836,7 @@ window.__ModuleLoader__.load({
             spellCheck: false,
             onChange: (event) => setQuery(event.target.value),
           }),
-          h('button', { type: 'button', className: 'dsh-ide-icon-button', title: 'Закрыть настройки', onClick: onClose }, '✕'),
+          h('button', { type: 'button', className: 'dsh-ide-icon-button dsh-ide-settings-close', title: 'Закрыть настройки', onClick: onClose }, '✕'),
         ),
         h(
           'div',
@@ -1957,7 +2132,30 @@ function IdeBody(props) {
       const pendingOpens = React.useRef(new Set())
       const handlersRef = React.useRef({})
 
+      // The pane itself is measured: the shell gives the right sidebar a column
+      // whose width has little to do with the window on a desktop, and phones in
+      // landscape are wider than the breakpoint while still being phones.
+      const rootRef = React.useRef(null)
+      const paneWidth = usePaneWidth(rootRef)
+      const coarsePointer = useMediaQuery('(pointer: coarse)')
+      const narrowWindow = useMediaQuery(`(max-width: ${COMPACT_PANE_WIDTH}px)`)
+      const compact =
+        paneWidth < COMPACT_PANE_HARD_WIDTH || (paneWidth < COMPACT_PANE_WIDTH && (coarsePointer || narrowWindow))
+      const compactRef = React.useRef(compact)
+      compactRef.current = compact
+      // Touch size defaults follow the input device, not the pane width: a phone
+      // held sideways has plenty of width but still wants readable text.
+      const coarseRef = React.useRef(coarsePointer)
+      coarseRef.current = coarsePointer
+
       const [monaco, setMonaco] = React.useState(undefined)
+      // Loading the editor is not guaranteed: a stalled bundle or a broken
+      // WebView must still show the file. Those four fields drive the plain
+      // text fallback below the stage.
+      const [editorAttempt, setEditorAttempt] = React.useState(0)
+      const [editorFailure, setEditorFailure] = React.useState(null)
+      const [editorReady, setEditorReady] = React.useState(false)
+      const [editorSlow, setEditorSlow] = React.useState(false)
       const [tabs, setTabs] = React.useState([])
       const [activeKey, setActiveKey] = React.useState('')
       const [status, setStatus] = React.useState({ kind: 'idle', message: '' })
@@ -1984,10 +2182,29 @@ function IdeBody(props) {
       const [prompt, setPrompt] = React.useState(undefined)
       const [info, setInfo] = React.useState(undefined)
       const [reloadSignal, setReloadSignal] = React.useState(0)
-      const [fontSize, setFontSize] = React.useState(13)
-      const [wordWrap, setWordWrap] = React.useState(false)
+      const [fontSize, setFontSize] = React.useState(compact || coarsePointer ? 16 : 13)
+      const [wordWrap, setWordWrap] = React.useState(compact)
       const [booted, setBooted] = React.useState(false)
       const [selected, setSelected] = React.useState(undefined)
+      const [menuSheetOpen, setMenuSheetOpen] = React.useState(false)
+      // A deliberate wrap choice outlives an orientation change; the compact
+      // default only applies while the user has not picked one.
+      const wrapTouched = React.useRef(false)
+      // The same rule for the text size: a phone starts at 16px, but a size the
+      // user picked by hand survives an orientation change.
+      const zoomTouched = React.useRef(false)
+      const fontSizeRef = React.useRef(fontSize)
+      fontSizeRef.current = fontSize
+      // One place that moves the text size: the View menu, the status-bar
+      // stepper, a two-finger pinch and the keyboard commands all end up here.
+      const bumpFont = (delta) => {
+        zoomTouched.current = true
+        setFontSize((current) => Math.min(28, Math.max(9, Math.round(current + delta))))
+      }
+      const resetFont = () => {
+        zoomTouched.current = false
+        setFontSize(compactRef.current || coarseRef.current ? 16 : 13)
+      }
       const selectedRef = React.useRef(undefined)
       selectedRef.current = selected
       // The explorer's selected folder decides where a new file or folder goes.
@@ -2295,23 +2512,41 @@ function IdeBody(props) {
         }
       }, [])
 
+      // Pointer events cover the mouse, the pen and the finger; the handle also
+      // needs `touch-action:none` in the stylesheet or the pane scrolls instead.
       const beginPanelResize = (event) => {
         event.preventDefault()
         const startY = event.clientY
         const startHeight = panelHeight
         const move = (moveEvent) => {
-          const next = Math.min(560, Math.max(90, startHeight - (moveEvent.clientY - startY)))
+          const ceiling = compactRef.current ? 420 : 560
+          const next = Math.min(ceiling, Math.max(90, startHeight - (moveEvent.clientY - startY)))
           setPanelHeight(next)
         }
         const finish = () => {
-          window.removeEventListener('mousemove', move)
-          window.removeEventListener('mouseup', finish)
+          window.removeEventListener('pointermove', move)
+          window.removeEventListener('pointerup', finish)
+          window.removeEventListener('pointercancel', finish)
+          document.body.style.cursor = ''
         }
-        window.addEventListener('mousemove', move)
-        window.addEventListener('mouseup', finish)
+        window.addEventListener('pointermove', move)
+        window.addEventListener('pointerup', finish)
+        window.addEventListener('pointercancel', finish)
+        document.body.style.cursor = 'row-resize'
+      }
+
+      const openSettings = () => {
+        if (compactRef.current) setShowTree(false)
+        setSettingsOpen(true)
       }
 
       const openQuick = () => {
+        // Both overlays make the drawer pointless: close it before the modal
+        // appears so the editor is visible again when the picker is dismissed.
+        if (compactRef.current) {
+          setShowTree(false)
+          setMenuSheetOpen(false)
+        }
         if (quick !== undefined && quick.loading !== true) {
           setQuick({ files: quick.files, loading: false, error: quick.error })
           return
@@ -2322,21 +2557,41 @@ function IdeBody(props) {
           .catch((cause) => setQuick({ files: [], loading: false, error: describeError(cause) }))
       }
 
-      // Monaco is loaded once per pane; a failure is shown instead of an editor.
+      // Monaco is loaded once per pane; a failure is reported to the fallback
+      // view, which keeps the file readable even when the editor is missing.
       React.useEffect(() => {
+        let cancelled = false
+        setEditorFailure(null)
         loadMonaco()
-          .then((instance) => setMonaco(instance))
-          .catch((cause) => setStatus({ kind: 'error', message: messageOf(cause) }))
-      }, [])
+          .then((instance) => {
+            if (!cancelled) setMonaco(instance)
+          })
+          .catch((cause) => {
+            if (cancelled) return
+            const message = messageOf(cause)
+            setEditorFailure(message)
+            setStatus({ kind: 'error', message })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [editorAttempt])
 
       React.useEffect(() => {
         if (!monaco || !hostRef.current || runtime.current.editor) return
-        const editor = monaco.editor.create(hostRef.current, {
+        // A phone editor is read more than it is scrolled: bigger glyphs, roomy
+        // lines, wrapped text and fat scrollbars that a thumb can actually hit.
+        const compactNow = compactRef.current
+        let editor
+        try {
+          editor = monaco.editor.create(hostRef.current, {
           model: null,
           automaticLayout: true,
           theme: themeName() === 'dark' ? 'vs-dark' : 'vs',
-          fontSize: 13,
-          lineHeight: 20,
+          fontSize,
+          // On a phone the line box grows with the glyphs, otherwise a big font
+          // would overlap the next line.
+          lineHeight: compactNow ? Math.round(fontSize * 1.5) : 20,
           minimap: { enabled: false },
           tabSize: 2,
           insertSpaces: true,
@@ -2344,10 +2599,25 @@ function IdeBody(props) {
           wordBasedSuggestions: 'off',
           renderLineHighlight: 'line',
           smoothScrolling: true,
-          padding: { top: 8, bottom: 24 },
+          wordWrap: wordWrap ? 'on' : 'off',
+          stickyScroll: { enabled: !compactNow },
+          scrollbar: {
+            verticalScrollbarSize: compactNow ? 14 : 10,
+            horizontalScrollbarSize: compactNow ? 14 : 10,
+            useShadows: false,
+          },
+          mouseWheelZoom: false,
+          padding: { top: compactNow ? 4 : 8, bottom: 24 },
           inlineSuggest: { enabled: true },
-        })
+          })
+        } catch (cause) {
+          const message = messageOf(cause)
+          setEditorFailure(message)
+          setStatus({ kind: 'error', message })
+          return undefined
+        }
         runtime.current.editor = editor
+        setEditorReady(true)
         runtime.current.monaco = monaco
 
         const ghostNode = document.createElement('span')
@@ -2401,6 +2671,10 @@ function IdeBody(props) {
         }
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Comma, () => handlersRef.current.openSettings?.())
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Backquote, () => handlersRef.current.toggleOutput?.())
+        // Same shortcuts a desktop editor uses for its own text size.
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Equal, () => bumpFont(1))
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Minus, () => bumpFont(-1))
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Digit0, () => resetFont())
 
         return () => {
           window.clearTimeout(runtime.current.ghostTimer)
@@ -2411,6 +2685,113 @@ function IdeBody(props) {
           runtime.current.editor = undefined
         }
       }, [monaco])
+
+      // Font size and word wrap live in state, so both the compact defaults and
+      // a manual zoom reach Monaco through the same update.
+      React.useEffect(() => {
+        const editor = runtime.current.editor
+        if (editor === undefined) return
+        editor.updateOptions({ fontSize, lineHeight: compact ? Math.round(fontSize * 1.5) : 20 })
+      }, [fontSize, compact])
+
+      React.useEffect(() => {
+        const editor = runtime.current.editor
+        if (editor !== undefined) editor.updateOptions({ wordWrap: wordWrap ? 'on' : 'off' })
+      }, [wordWrap])
+
+      React.useEffect(() => {
+        if (!wrapTouched.current) setWordWrap(compact)
+      }, [compact])
+
+      // Follow the layout default until the user picks a size by hand.
+      React.useEffect(() => {
+        if (!zoomTouched.current) setFontSize(compact || coarsePointer ? 16 : 13)
+      }, [compact, coarsePointer])
+
+      React.useEffect(() => {
+        const editor = runtime.current.editor
+        if (editor === undefined) return
+        editor.updateOptions({
+          lineHeight: compact ? Math.round(fontSize * 1.5) : 20,
+          stickyScroll: { enabled: !compact },
+          scrollbar: {
+            verticalScrollbarSize: compact ? 14 : 10,
+            horizontalScrollbarSize: compact ? 14 : 10,
+            useShadows: false,
+          },
+          padding: { top: compact ? 4 : 8, bottom: 24 },
+        })
+      }, [compact])
+
+      // The on-screen keyboard shrinks the visible area without resizing the
+      // pane. On a phone, lay the editor out again and keep the caret in view.
+      React.useEffect(() => {
+        if (!compact) return undefined
+        if (typeof window === 'undefined' || window.visualViewport === undefined || window.visualViewport === null) {
+          return undefined
+        }
+        const viewport = window.visualViewport
+        if (typeof viewport.addEventListener !== 'function') return undefined
+        const reflow = () => {
+          const editor = runtime.current.editor
+          if (editor === undefined) return
+          editor.layout()
+          const position = editor.getPosition()
+          if (position !== null) editor.revealPositionInCenterIfOutsideViewport(position)
+        }
+        viewport.addEventListener('resize', reflow)
+        return () => viewport.removeEventListener('resize', reflow)
+      }, [compact])
+
+      // Two fingers over the code resize the text, like every other mobile
+      // editor. The browser's own page zoom is suppressed while a pinch runs so
+      // the gesture changes the code, not the whole app.
+      React.useEffect(() => {
+        if (!compact && !coarsePointer) return undefined
+        const host = hostRef.current
+        if (host === null || typeof host.addEventListener !== 'function') return undefined
+        let startDistance = 0
+        let startSize = 0
+        const spread = (touches) =>
+          Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY)
+        const begin = (event) => {
+          if (event.touches.length !== 2) return
+          startDistance = spread(event.touches)
+          startSize = fontSizeRef.current
+        }
+        const move = (event) => {
+          if (event.touches.length !== 2 || startDistance <= 0) return
+          // Fingers that start a pixel apart would turn the smallest wobble into
+          // a huge jump; ignore such a pinch instead of guessing.
+          if (startDistance < 16) return
+          event.preventDefault()
+          const next = Math.min(28, Math.max(9, Math.round(startSize * (spread(event.touches) / startDistance))))
+          if (next !== fontSizeRef.current) bumpFont(next - fontSizeRef.current)
+        }
+        const end = () => {
+          startDistance = 0
+        }
+        host.addEventListener('touchstart', begin, { passive: true })
+        host.addEventListener('touchmove', move, { passive: false })
+        host.addEventListener('touchend', end)
+        host.addEventListener('touchcancel', end)
+        return () => {
+          host.removeEventListener('touchstart', begin)
+          host.removeEventListener('touchmove', move)
+          host.removeEventListener('touchend', end)
+          host.removeEventListener('touchcancel', end)
+        }
+      }, [compact, coarsePointer])
+
+      // Neither the dropdown menus nor the phone sheet survive a layout change:
+      // they were positioned for the width that just went away.
+      React.useEffect(() => {
+        if (compact) {
+          setMenuId('')
+        } else {
+          setMenuSheetOpen(false)
+        }
+      }, [compact])
 
       // Keep the active tab bound to the editor, one model per tab.
       React.useEffect(() => {
@@ -2436,7 +2817,25 @@ function IdeBody(props) {
         }
         editor.updateOptions({ readOnly: entry.readOnly === true })
         editor.focus()
+        setEditorReady(true)
+        // A model that lost the payload would paint an empty pane; surface it
+        // through the fallback instead of leaving the file unreadable.
+        if (model.getValue() === '' && entry.text !== '') {
+          setEditorFailure('Редактор получил пустой текст файла.')
+        }
       }, [activeKey, tabs, monaco])
+
+      // A phone either paints the editor quickly or not at all. If the stage
+      // stays empty for a few seconds while a file is open, show the text.
+      React.useEffect(() => {
+        const open = tabs.some((candidate) => candidate.key === activeKey)
+        if (!open || editorReady || editorFailure !== null) {
+          setEditorSlow(false)
+          return undefined
+        }
+        const timer = window.setTimeout(() => setEditorSlow(true), 4000)
+        return () => window.clearTimeout(timer)
+      }, [activeKey, tabs, editorReady, editorFailure])
 
       // The close guard reads this set synchronously; keep it in step with react.
       React.useEffect(() => {
@@ -2471,7 +2870,14 @@ function IdeBody(props) {
             const saved = statePayload.state || {}
             if (typeof saved.treeWidth === 'number') setExplorerWidth(saved.treeWidth)
             if (typeof saved.panelHeight === 'number') setPanelHeight(saved.panelHeight)
-        if (saved.explorerSide === 'right') setExplorerSide('right')
+            // Remember the text size the user picked; a size equal to the
+            // layout default stays adaptable to the next orientation change.
+            if (typeof saved.fontSize === 'number') {
+              const restored = Math.min(28, Math.max(9, Math.round(saved.fontSize)))
+              setFontSize(restored)
+              if (restored !== (compactRef.current || coarseRef.current ? 16 : 13)) zoomTouched.current = true
+            }
+            if (saved.explorerSide === 'right') setExplorerSide('right')
             setShowTree(saved.showTree !== false)
             setHidden(saved.hidden === true)
             const wanted = []
@@ -2487,6 +2893,9 @@ function IdeBody(props) {
                 activated = true
               }
             }
+            // On a phone a restored file should be visible straight away, not
+            // hidden behind the explorer drawer.
+            if (activated && compactRef.current) setShowTree(false)
             setBooted(true)
           } catch (cause) {
             if (!cancelled) setStatus({ kind: 'error', message: describeError(cause) })
@@ -2535,11 +2944,12 @@ function IdeBody(props) {
               panelHeight,
               showTree,
               hidden,
+              fontSize,
             },
           }).catch(() => {})
         }, STATE_WRITE_DELAY_MS)
         return () => window.clearTimeout(timer)
-      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, panelHeight, showTree, hidden, explorerSide])
+      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, panelHeight, showTree, hidden, explorerSide, fontSize])
 
       const saveSettings = async (patch) => {
         try {
@@ -2563,12 +2973,14 @@ function IdeBody(props) {
           setExplorerWidth(Math.min(640, Math.max(150, startWidth + delta)))
         }
         const stop = () => {
-          window.removeEventListener('mousemove', move)
-          window.removeEventListener('mouseup', stop)
+          window.removeEventListener('pointermove', move)
+          window.removeEventListener('pointerup', stop)
+          window.removeEventListener('pointercancel', stop)
           document.body.style.cursor = ''
         }
-        window.addEventListener('mousemove', move)
-        window.addEventListener('mouseup', stop)
+        window.addEventListener('pointermove', move)
+        window.addEventListener('pointerup', stop)
+        window.addEventListener('pointercancel', stop)
         document.body.style.cursor = 'col-resize'
       }
 
@@ -2631,7 +3043,7 @@ function IdeBody(props) {
         complete,
         toggleOutput,
         openOutput: () => setPanel({ tab: 'trajectory', index: 0 }),
-        openSettings: () => setSettingsOpen(true),
+        openSettings,
         requestGhost: (explicit) => void requestGhost(explicit === true),
       }
 
@@ -2692,15 +3104,13 @@ function IdeBody(props) {
       }
 
       const zoom = (delta) => {
-        const next = Math.min(28, Math.max(9, fontSize + delta))
-        setFontSize(next)
-        withEditor((editor) => editor.updateOptions({ fontSize: next }))
+        if (delta === 0) return
+        bumpFont(delta)
       }
 
       const toggleWordWrap = () => {
-        const next = !wordWrap
-        setWordWrap(next)
-        withEditor((editor) => editor.updateOptions({ wordWrap: next ? 'on' : 'off' }))
+        wrapTouched.current = true
+        setWordWrap(!wordWrap)
       }
 
       // Creating a file or a folder starts an inline row inside the explorer,
@@ -2822,9 +3232,9 @@ function IdeBody(props) {
             { id: 'word-wrap', label: wordWrap ? 'Отключить перенос по словам' : 'Включить перенос по словам', run: toggleWordWrap },
             { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показывать скрытые файлы', run: () => setHidden(!hidden) },
             { separator: true },
-            { id: 'zoom-in', label: 'Увеличить шрифт', run: () => zoom(1) },
-            { id: 'zoom-out', label: 'Уменьшить шрифт', run: () => zoom(-1) },
-            { id: 'zoom-reset', label: 'Сбросить размер шрифта', run: () => zoom(13 - fontSize) },
+            { id: 'zoom-in', label: 'Увеличить шрифт', key: 'Ctrl+=', run: () => zoom(1) },
+            { id: 'zoom-out', label: 'Уменьшить шрифт', key: 'Ctrl+-', run: () => zoom(-1) },
+            { id: 'zoom-reset', label: 'Сбросить размер шрифта', key: 'Ctrl+0', run: resetFont },
             { separator: true },
             {
               id: 'output',
@@ -2951,7 +3361,13 @@ function IdeBody(props) {
 
       return h(
         'div',
-        { className: 'dsh-ide-root', 'data-theme': themeName() },
+        {
+          ref: rootRef,
+          className: 'dsh-ide-root',
+          'data-theme': themeName(),
+          'data-compact': compact ? '' : undefined,
+          'data-touch': coarsePointer ? '' : undefined,
+        },
         menuId === ''
           ? null
           : h('div', {
@@ -2971,7 +3387,7 @@ function IdeBody(props) {
             'button',
             {
               type: 'button',
-              className: 'dsh-ide-icon-button',
+              className: 'dsh-ide-icon-button dsh-ide-top-swap',
               title: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
               'aria-label': 'Поменять местами проводник и редактор',
               onClick: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
@@ -2979,6 +3395,76 @@ function IdeBody(props) {
             h('span', { className: 'dsh-ide-activity-glyph' }, '⇄'),
           ),
           h('span', { className: 'dsh-ide-top-title', title: activeTab === undefined ? 'IDE' : activeTab.path }, activeTab === undefined ? 'IDE' : activeTab.name),
+          // Phone-only controls. They are always in the tree and shown by CSS so
+          // switching layouts never remounts anything; the desktop order (menu bar,
+          // spacer, ⇄, title) is untouched because these buttons stay `display:none`.
+          h(
+            'button',
+            {
+              type: 'button',
+              className: `dsh-ide-icon-button dsh-ide-compact-only dsh-ide-mobile-explorer${showTree ? ' dsh-ide-icon-button-active' : ''}`,
+              title: showTree ? 'Скрыть проводник' : 'Показать проводник',
+              'aria-label': 'Проводник',
+              'aria-expanded': showTree,
+              onClick: () => setShowTree(!showTree),
+            },
+            h(
+              'svg',
+              { width: '18', height: '18', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+              h('path', {
+                fill: 'none',
+                stroke: 'currentColor',
+                strokeWidth: '1.4',
+                strokeLinecap: 'round',
+                d: 'M2.4 4h11.2M2.4 8h11.2M2.4 12h11.2',
+              }),
+            ),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-icon-button dsh-ide-compact-only dsh-ide-mobile-menu',
+              title: 'Меню IDE',
+              'aria-label': 'Меню IDE',
+              onClick: () => {
+                setMenuId('')
+                setMenuSheetOpen(true)
+              },
+            },
+            h('span', { className: 'dsh-ide-activity-glyph' }, '⋮'),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-icon-button dsh-ide-compact-only dsh-ide-mobile-quick',
+              title: 'Открыть файл по имени',
+              'aria-label': 'Открыть файл по имени',
+              onClick: openQuick,
+            },
+            h(
+              'svg',
+              { width: '18', height: '18', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+              h('path', {
+                fill: 'none',
+                stroke: 'currentColor',
+                strokeWidth: '1.3',
+                d: 'M7 2.6a4.4 4.4 0 1 0 0 8.8 4.4 4.4 0 0 0 0-8.8zM10.4 10.4 14 14',
+              }),
+            ),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-icon-button dsh-ide-compact-only dsh-ide-mobile-settings',
+              title: 'Настройки IDE',
+              'aria-label': 'Настройки IDE',
+              onClick: openSettings,
+            },
+            h('span', { className: 'dsh-ide-activity-glyph' }, '⚙'),
+          ),
         ),
         h(
           'div',
@@ -3033,17 +3519,34 @@ function IdeBody(props) {
                 type: 'button',
                 className: 'dsh-ide-activity-button',
                 title: 'Настройки IDE',
-                onClick: () => setSettingsOpen(true),
+                onClick: openSettings,
               },
               h('span', { className: 'dsh-ide-activity-glyph' }, '⚙'),
             ),
           ),
-          showTree && typeof sessionId === 'string'
+          // On a phone the explorer is a drawer over the editor, with a scrim
+          // that dismisses it, instead of a column that squeezes the code.
+          compact && showTree && typeof sessionId === 'string'
+            ? h('div', {
+                className: 'dsh-ide-scrim',
+                'aria-hidden': 'true',
+                onClick: () => setShowTree(false),
+                onContextMenu: (event) => {
+                  event.preventDefault()
+                  setShowTree(false)
+                },
+              })
+            : null,
+          (showTree || (compact && typeof sessionId === 'string')) && typeof sessionId === 'string'
             ? h(
                 'div',
                 {
-                  className: `dsh-ide-explorer-wrap${explorerSide === 'right' ? ' dsh-ide-explorer-right' : ''}`,
-                  style: { width: `${explorerWidth}px`, order: explorerSide === 'left' ? 0 : 2 },
+                  // On a phone the drawer stays mounted while closed: expanded
+                  // folders and the scroll position survive the next open.
+                  className: `dsh-ide-explorer-wrap${explorerSide === 'right' ? ' dsh-ide-explorer-right' : ''}${
+                    compact && !showTree ? ' dsh-ide-explorer-closed' : ''
+                  }`,
+                  style: compact ? undefined : { width: `${explorerWidth}px`, order: explorerSide === 'left' ? 0 : 2 },
                 },
                 h(Explorer, {
                   sessionId,
@@ -3051,6 +3554,8 @@ function IdeBody(props) {
                   reloadSignal,
                   activePath: activeTab === undefined ? '' : activeTab.path,
                   onOpenFile: (path) => {
+                    // The file has to be seen: get the drawer out of the way.
+                    if (compactRef.current) setShowTree(false)
                     void openFile(path, { activate: true })
                   },
                   onToggleHidden: setHidden,
@@ -3066,18 +3571,18 @@ function IdeBody(props) {
                 }),
               )
             : null,
-          showTree && typeof sessionId === 'string'
+          !compact && showTree && typeof sessionId === 'string'
             ? h('div', {
                 className: explorerSide === 'right' ? 'dsh-ide-divider dsh-ide-divider-flip' : 'dsh-ide-divider',
                 style: { order: 1 },
                 title: 'Потяните, чтобы изменить ширину',
-                onMouseDown: startResize,
+                onPointerDown: startResize,
               })
             : null,
           h(
             'div',
-            { className: 'dsh-ide-editor', style: { order: explorerSide === 'left' ? 2 : 0 } },
-            h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab, onContextMenu: openTabMenu }),
+            { className: 'dsh-ide-editor', style: compact ? undefined : { order: explorerSide === 'left' ? 2 : 0 } },
+            h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab, onContextMenu: openTabMenu, compact }),
             consent === undefined
               ? null
               : h(
@@ -3123,11 +3628,79 @@ function IdeBody(props) {
                   { className: 'dsh-ide-empty' },
                   h('div', { className: 'dsh-ide-watermark' }, 'IDE'),
                   h('div', { className: 'dsh-ide-empty-title' }, 'Файл не открыт'),
-                  h('div', { className: 'dsh-ide-empty-text' }, explorerSide === 'left' ? 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.' : 'Ctrl+P — открыть файл по имени, или выберите его в проводнике справа.'),
+                  h(
+                    'div',
+                    { className: 'dsh-ide-empty-text' },
+                    compact
+                      ? 'Выберите файл в проводнике или найдите его по имени.'
+                      : explorerSide === 'left'
+                        ? 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.'
+                        : 'Ctrl+P — открыть файл по имени, или выберите его в проводнике справа.',
+                  ),
+                  compact
+                    ? h(
+                        'div',
+                        { className: 'dsh-ide-empty-actions' },
+                        h(
+                          'button',
+                          { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: openQuick },
+                          'Открыть файл',
+                        ),
+                        h(
+                          'button',
+                          { type: 'button', className: 'dsh-ide-button', onClick: () => setShowTree(true) },
+                          'Проводник',
+                        ),
+                      )
+                    : null,
                 )
               : null,
-            h('div', { className: 'dsh-ide-stage', ref: hostRef }),
-            panel === undefined ? null : h('div', { className: 'dsh-ide-panel-resize', onMouseDown: beginPanelResize }),
+            h(
+              'div',
+              { className: 'dsh-ide-stage-wrap' },
+              h('div', { className: 'dsh-ide-stage', ref: hostRef }),
+              activeTab !== undefined && !editorReady && (editorFailure !== null || editorSlow)
+                ? h(
+                    'div',
+                    { className: 'dsh-ide-stage-fallback' },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-stage-fallback-head' },
+                      h(
+                        'div',
+                        { className: 'dsh-ide-stage-fallback-title' },
+                        editorFailure === null ? 'Редактор ещё загружается' : 'Редактор не загрузился',
+                      ),
+                      h(
+                        'div',
+                        { className: 'dsh-ide-stage-fallback-text' },
+                        editorFailure === null
+                          ? 'Пока файл показан простым текстом: его можно прочитать, но подсветки и правок нет.'
+                          : `Файл показан простым текстом. ${editorFailure}`,
+                      ),
+                      editorFailure === null
+                        ? null
+                        : h(
+                            'div',
+                            { className: 'dsh-ide-stage-fallback-actions' },
+                            h(
+                              'button',
+                              {
+                                type: 'button',
+                                className: 'dsh-ide-button dsh-ide-button-primary',
+                                onClick: () => {
+                                  if (typeof window !== 'undefined') window.location.reload()
+                                },
+                              },
+                              'Обновить страницу',
+                            ),
+                          ),
+                    ),
+                    h('pre', { className: 'dsh-ide-stage-fallback-code' }, activeTab.text),
+                  )
+                : null,
+            ),
+            panel === undefined ? null : h('div', { className: 'dsh-ide-panel-resize', onPointerDown: beginPanelResize }),
             panel === undefined
               ? null
               : h(OutputPanel, {
@@ -3145,13 +3718,36 @@ function IdeBody(props) {
               h('span', { className: 'dsh-ide-status-spacer' }),
               activeTab === undefined
                 ? null
-                : h('span', { className: 'dsh-ide-status-item' }, activeTab.language || 'plain'),
-              activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item' }, `Стр ${cursor.line}, Стлб ${cursor.column}`),
-              activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item' }, activeTab.readOnly ? 'Только чтение' : activeTab.eol === 'crlf' ? 'CRLF' : 'LF'),
-              activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item' }, 'UTF-8'),
+                : h('span', { className: 'dsh-ide-status-item dsh-ide-status-lang' }, activeTab.language || 'plain'),
+              activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item dsh-ide-status-pos' }, `Стр ${cursor.line}, Стлб ${cursor.column}`),
+              activeTab !== undefined && activeTab.readOnly
+                ? h('span', { className: 'dsh-ide-status-item dsh-ide-status-readonly' }, 'Только чтение')
+                : null,
+              activeTab === undefined || activeTab.readOnly
+                ? null
+                : h('span', { className: 'dsh-ide-status-item dsh-ide-status-eol' }, activeTab.eol === 'crlf' ? 'CRLF' : 'LF'),
+              activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item dsh-ide-status-enc' }, 'UTF-8'),
+              compact || coarsePointer
+                ? h(
+                    'span',
+                    { className: 'dsh-ide-zoom' },
+                    h(
+                      'button',
+                      { type: 'button', className: 'dsh-ide-zoom-button', 'aria-label': 'Уменьшить шрифт', onClick: () => zoom(-1) },
+                      'A−',
+                    ),
+                    h('span', { className: 'dsh-ide-zoom-value', title: 'Размер текста' }, `${fontSize}px`),
+                    h(
+                      'button',
+                      { type: 'button', className: 'dsh-ide-zoom-button', 'aria-label': 'Увеличить шрифт', onClick: () => zoom(1) },
+                      'A+',
+                    ),
+                  )
+                : null,
             ),
           ),
         ),
+        menuSheetOpen && compact ? h(MenuSheet, { menus, onClose: () => setMenuSheetOpen(false) }) : null,
         settingsOpen && preferences !== undefined
           ? h(SettingsPanel, {
               preferences,
@@ -3338,7 +3934,18 @@ function IdeBody(props) {
 .dsh-ide-crumb { overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-crumb-last { color:var(--ide-text); }
 .dsh-ide-crumb-sep { padding:0 3px; opacity:.6; }
+.dsh-ide-stage-wrap { position:relative; display:flex; flex:1 1 auto; min-height:0; }
 .dsh-ide-stage { flex:1 1 auto; min-height:0; }
+.dsh-ide-stage-fallback { position:absolute; inset:0; z-index:2; display:flex; flex-direction:column; overflow:auto; background:var(--ide-bg); }
+.dsh-ide-stage-fallback-head { display:flex; flex-direction:column; gap:6px; padding:12px 14px; border-bottom:1px solid var(--ide-border); }
+.dsh-ide-stage-fallback-title { color:var(--ide-text); font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-stage-fallback-text { color:var(--ide-muted); font-size:11.5px; line-height:1.5; overflow-wrap:anywhere; }
+.dsh-ide-stage-fallback-actions { display:flex; gap:8px; margin-top:2px; }
+.dsh-ide-stage-fallback-code { margin:0; padding:10px 14px 48px; color:var(--ide-text); white-space:pre; tab-size:2;
+  font:12px/1.55 var(--ide-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); }
+.dsh-ide-root[data-compact] .dsh-ide-stage-fallback-title { font-size:14px; }
+.dsh-ide-root[data-compact] .dsh-ide-stage-fallback-text { font-size:12.5px; }
+.dsh-ide-root[data-compact] .dsh-ide-stage-fallback-code { font-size:13px; line-height:1.6; }
 .dsh-ide-panel { flex:0 0 auto; min-height:90px; max-height:560px; display:flex; flex-direction:column; border-top:1px solid var(--ide-border); background:var(--ide-panel); }
 .dsh-ide-panel-resize { flex:0 0 auto; height:5px; margin-bottom:-5px; cursor:row-resize; z-index:2; }
 .dsh-ide-panel-resize:hover { background:var(--ide-accent); opacity:.6; }
@@ -3365,8 +3972,10 @@ function IdeBody(props) {
 .dsh-ide-chat { padding:6px 12px 10px; }
 .dsh-ide-chat-label { color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px; font-size:10px; margin:8px 0 3px; }
 .dsh-ide-chat-text { margin:0; white-space:pre-wrap; word-break:break-word; font:400 11.5px/1.5 var(--ide-mono); color:var(--ide-fg); max-height:120px; overflow:auto; background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; }
+/* The editor host is a later sibling, so it paints over this layer; the empty
+   state must sit above it or its buttons never receive a tap on a phone. */
 .dsh-ide-empty { position:absolute; inset:64px 0 24px; display:flex; flex-direction:column; align-items:center; justify-content:center;
-  gap:6px; text-align:center; padding:16px; pointer-events:none; }
+  gap:6px; text-align:center; padding:16px; pointer-events:none; z-index:2; }
 .dsh-ide-watermark { font:700 72px/1 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.02em; color:var(--ide-text);
   opacity:.06; margin-bottom:-4px; }
 .dsh-ide-empty-title { font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
@@ -3459,6 +4068,177 @@ function IdeBody(props) {
 .dsh-ide-action-error { color:#d9534f; font-weight:700; cursor:help; }
 .dsh-ide-action-compact .dsh-ide-action-button { padding:1px 6px; font-size:10px; line-height:1.4;
   letter-spacing:.4px; text-transform:uppercase; }
+
+/* ------------------------------------------------------------- phone layout */
+
+/*
+ * The pane, not the window, decides the layout: on a phone it is the whole
+ * screen, on a desktop it may be a 400px column. Rules therefore key off
+ * data-compact / data-touch on the root element instead of viewport media
+ * queries, and only apply when the measured pane is narrow or the pointer is
+ * coarse. The desktop layout above is never touched.
+ */
+.dsh-ide-compact-only { display:none; }
+.dsh-ide-root { overscroll-behavior:contain; -webkit-tap-highlight-color:transparent; }
+.dsh-ide-root button, .dsh-ide-root input, .dsh-ide-root textarea { touch-action:manipulation; }
+.dsh-ide-divider, .dsh-ide-panel-resize { touch-action:none; }
+.dsh-ide-tabs, .dsh-ide-tree, .dsh-ide-quick-list, .dsh-ide-settings-content, .dsh-ide-settings-nav,
+.dsh-ide-chat-text { overscroll-behavior:contain; }
+
+.dsh-ide-root[data-compact] .dsh-ide-body { position:relative; }
+/* Keep Monaco's own z-indexed widgets inside the editor so the drawer and the
+   scrim always paint over them. */
+.dsh-ide-root[data-compact] .dsh-ide-editor { z-index:1; }
+.dsh-ide-root[data-compact] .dsh-ide-compact-only { display:inline-flex; align-items:center; justify-content:center;
+  flex:0 0 auto; width:38px; height:38px; padding:0; }
+.dsh-ide-root[data-compact] .dsh-ide-compact-only .dsh-ide-activity-glyph { font-size:18px; }
+.dsh-ide-root[data-compact] .dsh-ide-mobile-explorer { order:0; }
+.dsh-ide-root[data-compact] .dsh-ide-mobile-menu { order:2; }
+.dsh-ide-root[data-compact] .dsh-ide-mobile-quick { order:3; }
+.dsh-ide-root[data-compact] .dsh-ide-mobile-settings { order:4; }
+
+/* One compact top bar: drawer toggle, file name, commands, open, settings. */
+.dsh-ide-root[data-compact] .dsh-ide-top { gap:2px; padding:2px 6px; min-height:44px; }
+.dsh-ide-root[data-compact] .dsh-ide-menubar,
+.dsh-ide-root[data-compact] .dsh-ide-activity,
+.dsh-ide-root[data-compact] .dsh-ide-top-swap,
+.dsh-ide-root[data-compact] .dsh-ide-top-spacer,
+.dsh-ide-root[data-compact] .dsh-ide-divider { display:none; }
+.dsh-ide-root[data-compact] .dsh-ide-top-title { order:1; flex:1 1 auto; max-width:none; padding:0 2px;
+  text-align:center; font-size:12.5px; }
+
+/* The explorer is a drawer with a scrim; the editor keeps the whole width. */
+.dsh-ide-scrim { position:absolute; inset:0; z-index:7; background:rgba(0,0,0,.45); }
+.dsh-ide-root[data-compact] .dsh-ide-explorer-wrap { position:absolute; top:0; bottom:0; left:0; z-index:8;
+  width:min(88%, 340px); border-right:1px solid var(--ide-border); box-shadow:10px 0 28px rgba(0,0,0,.5); }
+.dsh-ide-root[data-compact] .dsh-ide-explorer-wrap.dsh-ide-explorer-right { left:auto; right:0;
+  border-right:0; border-left:1px solid var(--ide-border); box-shadow:-10px 0 28px rgba(0,0,0,.5); }
+.dsh-ide-root[data-compact] .dsh-ide-explorer-wrap.dsh-ide-explorer-closed { display:none; }
+.dsh-ide-root[data-compact] .dsh-ide-explorer-head { padding:8px 10px 4px; }
+.dsh-ide-root[data-compact] .dsh-ide-explorer-actions .dsh-ide-icon-button { width:32px; height:32px;
+  display:inline-flex; align-items:center; justify-content:center; }
+.dsh-ide-root[data-compact] .dsh-ide-explorer-search { padding:0 10px 8px; }
+.dsh-ide-root[data-compact] .dsh-ide-search-input { padding:8px 9px; font-size:16px; }
+.dsh-ide-root[data-compact] .dsh-ide-tree { padding:2px 0 16px; }
+.dsh-ide-root[data-compact] .dsh-ide-row { min-height:38px; padding:7px 8px; gap:6px; font-size:13px; }
+.dsh-ide-root[data-touch] .dsh-ide-row { min-height:36px; padding-top:6px; padding-bottom:6px; }
+
+/* Tabs and bars sized for a thumb, not for a mouse pointer. */
+.dsh-ide-root[data-compact] .dsh-ide-tabs-empty { padding:10px 12px; font-size:12px; }
+.dsh-ide-root[data-compact] .dsh-ide-tab { min-height:40px; max-width:65%; padding:8px 8px 8px 11px; font-size:12.5px; }
+.dsh-ide-root[data-compact] .dsh-ide-tab-close { width:24px; height:24px; padding:0; font-size:12px; opacity:.75; }
+.dsh-ide-root[data-compact] .dsh-ide-breadcrumbs { padding:4px 10px; font-size:11px; overflow-x:auto;
+  scrollbar-width:none; }
+.dsh-ide-root[data-compact] .dsh-ide-breadcrumbs::-webkit-scrollbar { display:none; }
+.dsh-ide-root[data-compact] .dsh-ide-status { gap:8px; padding:4px 8px;
+  padding-bottom:max(4px, env(safe-area-inset-bottom)); font-size:11px; min-height:40px; }
+.dsh-ide-root[data-compact] .dsh-ide-status-enc,
+.dsh-ide-root[data-compact] .dsh-ide-status-eol { display:none; }
+.dsh-ide-root[data-compact] .dsh-ide-status-text { max-width:38%; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+/* Text size: two thumb-sized keys at the right edge of the status bar. */
+.dsh-ide-zoom { display:flex; align-items:center; margin-left:2px; margin-right:-4px; }
+.dsh-ide-zoom-button { min-width:34px; min-height:30px; padding:0 4px; border:0; border-radius:5px;
+  background:transparent; color:#fff; font:inherit; font-size:12.5px; line-height:1;
+  touch-action:manipulation; }
+.dsh-ide-zoom-button:active { background:rgba(255,255,255,.22); }
+.dsh-ide-zoom-value { min-width:38px; text-align:center; font-size:11px; opacity:.9;
+  font-variant-numeric:tabular-nums; }
+.dsh-ide-root[data-compact] .dsh-ide-consent { flex-wrap:wrap; gap:6px; padding:8px 10px; }
+.dsh-ide-root[data-compact] .dsh-ide-consent-actions { flex:1 1 100%; justify-content:flex-end; }
+.dsh-ide-root[data-compact] .dsh-ide-consent .dsh-ide-button { min-height:36px; }
+
+.dsh-ide-root[data-compact] .dsh-ide-empty { inset:48px 0 20px; gap:10px; padding:20px; }
+.dsh-ide-root[data-compact] .dsh-ide-watermark { font-size:48px; }
+.dsh-ide-root[data-compact] .dsh-ide-empty-title { font-size:15px; }
+.dsh-ide-root[data-compact] .dsh-ide-empty-text { max-width:300px; font-size:12.5px; line-height:1.5; }
+.dsh-ide-empty-actions { display:flex; gap:8px; margin-top:6px; pointer-events:auto; }
+.dsh-ide-empty-actions .dsh-ide-button { min-height:40px; padding:8px 14px; font-size:12.5px; }
+
+/* Output panel: a wide grip that can actually be caught with a finger. */
+.dsh-ide-root[data-compact] .dsh-ide-panel { max-height:55vh; }
+.dsh-ide-root[data-compact] .dsh-ide-panel-resize { position:relative; height:14px; margin-bottom:-14px; }
+.dsh-ide-root[data-compact] .dsh-ide-panel-resize::after { content:''; position:absolute; left:50%; top:5px;
+  width:36px; height:3px; margin-left:-18px; border-radius:2px; background:var(--ide-muted); opacity:.5; }
+.dsh-ide-root[data-compact] .dsh-ide-panel-head { height:38px; gap:4px; padding:0 8px; }
+.dsh-ide-root[data-compact] .dsh-ide-panel-tab { padding:8px 10px; font-size:11.5px; }
+.dsh-ide-root[data-compact] .dsh-ide-panel-body { overscroll-behavior:contain; }
+
+/* Long-press menus and the command sheet. */
+.dsh-ide-root[data-touch] .dsh-ide-menu-item { min-height:40px; }
+.dsh-ide-root[data-touch] .dsh-ide-icon-button { min-width:32px; min-height:32px; }
+.dsh-ide-root[data-touch] .dsh-ide-context { max-width:calc(100vw - 12px); max-height:70vh; overflow:auto; }
+.dsh-ide-root[data-compact] .dsh-ide-context { min-width:220px; padding:6px; }
+.dsh-ide-root[data-compact] .dsh-ide-context .dsh-ide-menu-item { padding:10px; font-size:13px; }
+
+.dsh-ide-sheet { position:absolute; inset:0; z-index:40; display:flex; align-items:flex-end;
+  background:rgba(0,0,0,.45); }
+.dsh-ide-sheet-card { display:flex; flex-direction:column; width:100%; max-height:82%;
+  background:var(--ide-panel); border-top:1px solid var(--ide-border); border-radius:16px 16px 0 0;
+  box-shadow:0 -12px 32px rgba(0,0,0,.5); padding-bottom:max(4px, env(safe-area-inset-bottom)); }
+.dsh-ide-sheet-head { display:flex; align-items:center; justify-content:space-between; flex:0 0 auto;
+  padding:10px 14px; border-bottom:1px solid var(--ide-border); }
+.dsh-ide-sheet-title { font:600 14px/1.3 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-sheet-close { width:34px; height:34px; border:0; border-radius:50%; background:var(--ide-panel-2);
+  color:inherit; font-size:14px; cursor:pointer; }
+.dsh-ide-sheet-body { flex:1 1 auto; overflow:auto; padding:2px 8px 10px; }
+.dsh-ide-sheet-group { padding-top:6px; }
+.dsh-ide-sheet-group-label { padding:8px 8px 3px; color:var(--ide-muted); font:600 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif);
+  text-transform:uppercase; letter-spacing:.07em; }
+.dsh-ide-sheet-item { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%;
+  min-height:44px; border:0; border-radius:8px; background:transparent; color:inherit; cursor:pointer;
+  text-align:left; padding:10px 12px; font:400 14px/1.35 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-sheet-item:hover, .dsh-ide-sheet-item:active { background:var(--ide-hover); }
+.dsh-ide-sheet-item-label { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-sheet-item-key { flex:0 0 auto; color:var(--ide-muted); font-size:11px; }
+
+/* Dialogs become bottom sheets; quick open takes the screen, because the
+   keyboard already eats half of it. */
+.dsh-ide-root[data-compact] .dsh-ide-modal { align-items:flex-end; padding:10px;
+  padding-bottom:max(10px, env(safe-area-inset-bottom)); }
+.dsh-ide-root[data-compact] .dsh-ide-modal-card { max-width:none; border-radius:14px; }
+.dsh-ide-root[data-compact] .dsh-ide-modal-title { font-size:15px; }
+.dsh-ide-root[data-compact] .dsh-ide-modal-text { font-size:12.5px; }
+.dsh-ide-root[data-compact] .dsh-ide-modal-actions { gap:8px; }
+.dsh-ide-root[data-compact] .dsh-ide-modal-actions .dsh-ide-button { flex:1 1 auto; min-height:44px; }
+.dsh-ide-root[data-compact] .dsh-ide-input,
+.dsh-ide-root[data-compact] .dsh-ide-setting-input,
+.dsh-ide-root[data-compact] .dsh-ide-quick-input { font-size:16px; }
+.dsh-ide-root[data-touch] .dsh-ide-input,
+.dsh-ide-root[data-touch] .dsh-ide-search-input,
+.dsh-ide-root[data-touch] .dsh-ide-quick-input,
+.dsh-ide-root[data-touch] .dsh-ide-setting-input { font-size:16px; }
+.dsh-ide-root[data-compact] .dsh-ide-modal-top { align-items:stretch; padding:0; }
+.dsh-ide-root[data-compact] .dsh-ide-modal-top .dsh-ide-modal-card { height:100%; border:0; border-radius:0;
+  display:flex; flex-direction:column; }
+.dsh-ide-root[data-compact] .dsh-ide-quick { max-height:none; padding:max(10px, env(safe-area-inset-top)) 10px 12px; }
+.dsh-ide-root[data-compact] .dsh-ide-quick-input { padding:11px 12px; }
+.dsh-ide-root[data-compact] .dsh-ide-quick-list { margin-top:8px; }
+.dsh-ide-root[data-compact] .dsh-ide-quick-row { min-height:44px; padding:9px 8px; gap:8px; font-size:13px; }
+
+/* Settings: the vertical nav turns into a scrollable row of chips. */
+.dsh-ide-root[data-compact] .dsh-ide-settings-head { flex-wrap:wrap; gap:6px; padding:8px 10px; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-head-title { order:1; flex:1 1 auto; font-size:14px; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-search { order:3; flex:1 1 100%; max-width:none; padding:9px 10px; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-close { order:2; width:36px; height:36px; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-tabs { gap:10px; padding:0 10px; overflow-x:auto; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-tabs-note { display:none; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-main { flex-direction:column; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-nav { flex:0 0 auto; flex-direction:row; gap:4px; padding:8px 10px;
+  border-right:0; border-bottom:1px solid var(--ide-border); overflow-x:auto; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-nav-item { flex:0 0 auto; white-space:nowrap; border-radius:999px;
+  padding:8px 12px; font-size:12.5px; background:var(--ide-panel-2); }
+.dsh-ide-root[data-compact] .dsh-ide-settings-nav-item-active { background:var(--ide-accent); color:#fff; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-content { padding:4px 14px 48px; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-section-title { font-size:16px; }
+.dsh-ide-root[data-compact] .dsh-ide-setting-desc { font-size:12px; }
+.dsh-ide-root[data-compact] .dsh-ide-setting-control { flex-wrap:wrap; }
+.dsh-ide-root[data-compact] .dsh-ide-setting-input { width:100%; padding:9px 10px; }
+.dsh-ide-root[data-compact] .dsh-ide-setting-control input[type="checkbox"] { width:20px; height:20px; }
+.dsh-ide-root[data-compact] .dsh-ide-settings-foot { flex-wrap:wrap; gap:8px; padding:10px;
+  padding-bottom:max(10px, env(safe-area-inset-bottom)); }
+.dsh-ide-root[data-compact] .dsh-ide-settings-foot .dsh-ide-button { min-height:42px; }
+.dsh-ide-root[data-compact] .dsh-ide-model-dialog { align-items:flex-end; }
 `
 
     function injectStyles() {

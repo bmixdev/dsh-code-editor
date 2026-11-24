@@ -45,12 +45,13 @@ function createDocument() {
   }
 }
 
-async function loadPlugin() {
+async function loadPlugin(options = {}) {
   const source = await readFile(CLIENT_SOURCE, 'utf8')
   const document = createDocument()
   const window = {
     __ModuleLoader__: { load(definition) { this.definition = definition } },
     matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    innerWidth: options.innerWidth ?? 1024,
   }
   const run = new Function('window', 'document', source)
   run(window, document)
@@ -221,4 +222,80 @@ test('every registered component renders its first pass without throwing', async
   assert.match(text, /Файл/)
   assert.match(text, /Правка/)
   assert.match(text, /Справка/)
+})
+
+/** Flattens the stubbed element tree so layout tests can inspect props. */
+function collectElements(element, found = []) {
+  if (element === null || element === undefined || element === false) return found
+  if (typeof element === 'string' || typeof element === 'number') return found
+  if (Array.isArray(element)) {
+    for (const item of element) collectElements(item, found)
+    return found
+  }
+  if (typeof element.type === 'function') {
+    collectElements(element.type({ ...element.props, children: element.children }), found)
+    return found
+  }
+  found.push(element)
+  for (const child of element.children ?? []) collectElements(child, found)
+  return found
+}
+
+function renderPaneElements(plugin, host) {
+  const pane = host.registrations.find((entry) => entry.config.name === 'sidebar.right.pane.tab')
+  return collectElements(pane.component({ tab: { contentId: 'dsh-resource://ide/session/session-1', id: 'tab-1' } }))
+}
+
+test('a wide pane keeps the desktop layout', async () => {
+  const { plugin } = await loadPlugin({ innerWidth: 1024 })
+  const host = createHost()
+  plugin.apply(host.ctx)
+
+  const elements = renderPaneElements(plugin, host)
+  const root = elements.find((element) => element.props.className === 'dsh-ide-root')
+  assert.ok(root, 'the IDE root is rendered')
+  assert.equal(root.props['data-compact'], undefined)
+  assert.equal(
+    elements.some((element) => element.props.className === 'dsh-ide-scrim'),
+    false,
+    'a wide pane has no drawer scrim',
+  )
+})
+
+test('a phone-width pane switches to the compact layout', async () => {
+  const { plugin } = await loadPlugin({ innerWidth: 390 })
+  const host = createHost()
+  plugin.apply(host.ctx)
+
+  const elements = renderPaneElements(plugin, host)
+  const root = elements.find((element) => element.props.className === 'dsh-ide-root')
+  assert.ok(root, 'the IDE root is rendered')
+  assert.equal(root.props['data-compact'], '', 'the root is tagged for the phone stylesheet')
+
+  const classes = elements.map((element) => element.props.className).filter((value) => typeof value === 'string')
+  for (const name of ['dsh-ide-mobile-explorer', 'dsh-ide-mobile-menu', 'dsh-ide-mobile-quick', 'dsh-ide-mobile-settings']) {
+    assert.ok(classes.some((value) => value.includes(name)), `${name} is rendered`)
+  }
+  assert.ok(classes.includes('dsh-ide-scrim'), 'the explorer drawer gets a scrim')
+  assert.ok(classes.includes('dsh-ide-empty-actions'), 'the empty editor offers phone actions')
+  assert.ok(classes.includes('dsh-ide-zoom'), 'the status bar offers a text-size stepper')
+  const zoomValue = elements.find((element) => element.props.className === 'dsh-ide-zoom-value')
+  assert.ok(zoomValue, 'the current text size is shown')
+  assert.equal(zoomValue.children[0], '16px', 'a phone starts with 16px text')
+})
+
+test('the stylesheet carries the phone layout rules', async () => {
+  const { plugin, document } = await loadPlugin()
+  const host = createHost()
+  plugin.apply(host.ctx)
+
+  const style = document.created.find((element) => element.attributes['data-dsh-ide'] !== undefined)
+  assert.ok(style, 'a style element is injected')
+  assert.match(style.textContent, /\[data-compact\]/)
+  assert.match(style.textContent, /\.dsh-ide-sheet/)
+  assert.match(style.textContent, /safe-area-inset-bottom/)
+  assert.match(style.textContent, /min\(88%,\s*340px\)/)
+  assert.match(style.textContent, /touch-action:manipulation/)
+  assert.match(style.textContent, /\.dsh-ide-zoom-button/)
+  assert.match(style.textContent, /\.dsh-ide-empty \{[^}]*z-index:2/, 'the empty-state actions sit above the editor host')
 })
