@@ -13,27 +13,24 @@
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
-/** Same policy as `tree.js`: folders never worth walking for an editor. */
+/**
+ * Dependency installs and version-control internals. The tree itself hides
+ * nothing; search still skips these because vendored packages and object
+ * stores never hold the reader's own source, and a single match budget would
+ * otherwise fill with them. Build output (`dist`, `build`, `target`, …) stays
+ * searchable so generated code can be inspected where the tree shows it.
+ */
 const SKIPPED = new Set([
   '.git',
   '.hg',
   '.svn',
   'node_modules',
   'bower_components',
-  'dist',
-  'build',
-  'out',
-  '.next',
-  '.nuxt',
-  '.svelte-kit',
   '.venv',
   'venv',
-  '__pycache__',
   '.cache',
   '.turbo',
   '.parcel-cache',
-  'coverage',
-  'target',
 ])
 
 const MAX_DEPTH = 8

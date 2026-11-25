@@ -1420,6 +1420,8 @@ export function apply(ctx, config) {
       cwd: scope.cwd,
       relativePath: typeof body.path === 'string' ? body.path : '',
       hidden: body.hidden === undefined ? preferences.hiddenFiles === true : body.hidden === true,
+      offset: typeof body.offset === 'number' ? body.offset : undefined,
+      limit: typeof body.limit === 'number' ? body.limit : undefined,
       signal,
     })
   }

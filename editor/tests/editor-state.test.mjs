@@ -18,8 +18,10 @@ async function makeWorkspace() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'dsh-ce-ws-'))
   await mkdir(path.join(root, 'src'))
   await mkdir(path.join(root, 'node_modules'))
+  await mkdir(path.join(root, 'dist'))
   await writeFile(path.join(root, 'README.md'), '# demo\n', 'utf8')
   await writeFile(path.join(root, 'src', 'index.js'), 'export const answer = 42\n', 'utf8')
+  await writeFile(path.join(root, 'dist', 'bundle.js'), 'export const built = true\n', 'utf8')
   await writeFile(path.join(root, '.env.example'), 'PLACEHOLDER=1\n', 'utf8')
   return root
 }
@@ -173,7 +175,7 @@ test('preferences round-trip through the route, clamp numbers, and reject long v
   }
 })
 
-test('tree lists folders before files, skips generated directories, and honours dotfiles', async () => {
+test('tree lists folders before files, shows generated directories, pages a big one, and honours dotfiles', async () => {
   const root = await makeWorkspace()
   try {
     await withPreferences(async () => {
@@ -182,14 +184,21 @@ test('tree lists folders before files, skips generated directories, and honours 
       const top = await app.call('tree', { sessionId: SESSION_ID })
       assert.equal(top.status, 200)
       const names = top.body.entries.map(entry => entry.name)
-      assert.deepEqual(names, ['src', 'README.md'])
+      // Every folder is listed: node_modules and dist are shown like src.
+      assert.deepEqual(names, ['dist', 'node_modules', 'src', 'README.md'])
       assert.equal(top.body.entries[0].type, 'directory')
-      assert.equal(top.body.entries[0].name, 'src')
-      // node_modules is generated noise and .env.example is a dotfile.
-      assert.ok(!names.includes('node_modules'))
+      assert.equal(top.body.entries[0].name, 'dist')
       assert.ok(!names.includes('.env.example'))
-      assert.equal(top.body.entries[1].type, 'file')
-      assert.equal(typeof top.body.entries[1].size, 'number')
+      assert.equal(top.body.entries[3].type, 'file')
+      assert.equal(typeof top.body.entries[3].size, 'number')
+
+      const first = await app.call('tree', { sessionId: SESSION_ID, offset: 0, limit: 2 })
+      assert.deepEqual(first.body.entries.map(entry => entry.name), ['dist', 'node_modules'])
+      assert.equal(first.body.total, 4)
+      assert.equal(first.body.truncated, true)
+      const second = await app.call('tree', { sessionId: SESSION_ID, offset: 2, limit: 2 })
+      assert.deepEqual(second.body.entries.map(entry => entry.name), ['src', 'README.md'])
+      assert.equal(second.body.truncated, false)
 
       const nested = await app.call('tree', { sessionId: SESSION_ID, path: 'src' })
       assert.deepEqual(nested.body.entries.map(entry => entry.name), ['index.js'])

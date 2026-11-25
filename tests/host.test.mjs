@@ -47,9 +47,12 @@ async function makeWorkspace() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'dsh-ide-ws-'))
   await mkdir(path.join(root, 'src'))
   await mkdir(path.join(root, 'node_modules'))
+  await mkdir(path.join(root, 'dist'))
+  await mkdir(path.join(root, 'build'))
   await writeFile(path.join(root, 'README.md'), '# demo\n', 'utf8')
   await writeFile(path.join(root, 'src', 'index.js'), 'export const answer = 42\n', 'utf8')
   await writeFile(path.join(root, 'src', 'util.ts'), 'export const twice = (value: number) => value * 2\n', 'utf8')
+  await writeFile(path.join(root, 'dist', 'bundle.js'), 'export const built = true\n', 'utf8')
   return root
 }
 
@@ -181,16 +184,31 @@ test('apply registers every IDE route under /api/ide', async () => {
   }
 })
 
-test('the explorer lists a folder and quick open flattens the workspace', async () => {
+test('the explorer lists every folder, pages a big one, and quick open flattens the workspace', async () => {
   const root = await makeWorkspace()
   try {
     const app = setup({ root })
 
     const listing = await app.call('tree', { sessionId: SESSION_ID, path: '', hidden: false })
     const names = listing.body.entries.map((entry) => entry.name)
-    assert.deepEqual(names, ['src', 'README.md'])
+    // Generated folders are listed like any other: hiding them is not the
+    // tree's job, and the client reads only the folders a reader expands.
+    assert.deepEqual(names, ['build', 'dist', 'node_modules', 'src', 'README.md'])
     assert.equal(listing.body.entries[0].type, 'directory')
     assert.equal(listing.body.relativePath, '')
+    assert.equal(listing.body.total, 5)
+    assert.equal(listing.body.truncated, false)
+
+    const first = await app.call('tree', { sessionId: SESSION_ID, path: '', hidden: false, offset: 0, limit: 2 })
+    assert.deepEqual(first.body.entries.map((entry) => entry.name), ['build', 'dist'])
+    assert.equal(first.body.offset, 0)
+    assert.equal(first.body.total, 5)
+    assert.equal(first.body.truncated, true)
+
+    const second = await app.call('tree', { sessionId: SESSION_ID, path: '', hidden: false, offset: 2, limit: 2 })
+    assert.deepEqual(second.body.entries.map((entry) => entry.name), ['node_modules', 'src'])
+    assert.equal(second.body.offset, 2)
+    assert.equal(second.body.truncated, true)
 
     const nested = await app.call('tree', { sessionId: SESSION_ID, path: 'src', hidden: false })
     assert.deepEqual(nested.body.entries.map((entry) => entry.name), ['index.js', 'util.ts'])
@@ -200,7 +218,7 @@ test('the explorer lists a folder and quick open flattens the workspace', async 
 
     const files = await app.call('files', { sessionId: SESSION_ID, hidden: false })
     const paths = files.body.files.map((entry) => entry.path).sort()
-    assert.deepEqual(paths, ['README.md', 'src/index.js', 'src/util.ts'])
+    assert.deepEqual(paths, ['README.md', 'dist/bundle.js', 'src/index.js', 'src/util.ts'])
     assert.equal(files.body.truncated, false)
   } finally {
     await rm(root, { recursive: true, force: true })

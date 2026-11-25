@@ -263,6 +263,32 @@ window.__ModuleLoader__.load({
         [sessionId, hidden],
       )
 
+      // Large folders are not hidden: the row after a full page asks for the
+      // next offset and appends it, so the reader decides how far to read.
+      const loadMore = React.useCallback(
+        async (relativePath) => {
+          const listing = cache.get(relativePath)
+          if (listing === undefined || listing.truncated !== true) return
+          if (typeof sessionId !== 'string' || sessionId === '') return
+          setPending(relativePath)
+          try {
+            const page = await call('tree', { sessionId, path: relativePath, hidden, offset: listing.entries.length })
+            setCache((previous) => {
+              const next = new Map(previous)
+              const base = next.get(relativePath) ?? listing
+              next.set(relativePath, { ...page, entries: [...base.entries, ...page.entries] })
+              return next
+            })
+            setError('')
+          } catch (cause) {
+            setError(cause instanceof Error ? cause.message : String(cause))
+          } finally {
+            setPending('')
+          }
+        },
+        [cache, sessionId, hidden],
+      )
+
       React.useEffect(() => {
         setCache(new Map())
         setExpanded(new Set())
@@ -306,6 +332,10 @@ window.__ModuleLoader__.load({
           }
           rows.push({ entry, path, depth })
           if (entry.type === 'directory' && expanded.has(path)) walk(path, depth + 1)
+        }
+        if (!filtering && listing.truncated === true) {
+          const remaining = Math.max(0, (listing.total ?? listing.entries.length) - listing.entries.length)
+          rows.push({ more: true, directory, depth: depth + 1, remaining })
         }
       }
       walk('', 0)
@@ -363,6 +393,22 @@ window.__ModuleLoader__.load({
           : rows.length === 0
             ? h('div', { className: 'dsh-ce-tree-empty' }, filtering ? 'Ничего не найдено' : 'Пустая папка')
             : rows.map((row) => {
+                if (row.more === true) {
+                  const busy = pending === row.directory
+                  return h(
+                    'button',
+                    {
+                      key: `more:${row.directory}`,
+                      type: 'button',
+                      className: 'dsh-ce-tree-row dsh-ce-tree-more',
+                      style: { paddingLeft: `${26 + row.depth * 12}px` },
+                      disabled: busy,
+                      title: 'Прочитать следующую страницу этого каталога',
+                      onClick: () => void loadMore(row.directory),
+                    },
+                    h('span', { className: 'dsh-ce-tree-name' }, busy ? 'Читаю…' : `Показать ещё${row.remaining > 0 ? ` ${row.remaining}` : ''}`),
+                  )
+                }
                 const entry = row.entry
                 const isDirectory = entry.type === 'directory'
                 const open = filtering || expanded.has(row.path)
@@ -388,9 +434,6 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'dsh-ce-tree-name' }, entry.name),
                 )
               }),
-        root !== undefined && root.truncated === true
-          ? h('div', { className: 'dsh-ce-tree-empty' }, 'Показаны первые 400 записей')
-          : null,
       )
     }
 
@@ -1589,6 +1632,9 @@ window.__ModuleLoader__.load({
 .dsh-ce-tree-input:focus { outline: none; border-color: var(--dsh-accent, #4c8bf5); }
 .dsh-ce-tree-row { display: flex; align-items: center; width: 100%; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; padding: 1px 6px; font: inherit; }
 .dsh-ce-tree-row:hover { background: var(--dsh-hover, rgba(127,127,127,.14)); }
+.dsh-ce-tree-more { color: var(--dsh-muted, #8b949e); font-size: 11px; font-style: italic; }
+.dsh-ce-tree-more:hover:not(:disabled) { color: var(--dsh-accent, #4daafc); }
+.dsh-ce-tree-more:disabled { cursor: default; opacity: .7; }
 .dsh-ce-tree-active { background: var(--dsh-hover, rgba(127,127,127,.2)); }
 .dsh-ce-tree-caret { flex: 0 0 10px; width: 10px; font-size: 10px; opacity: .6; }
 .dsh-ce-tree-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

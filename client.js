@@ -925,6 +925,38 @@ window.__ModuleLoader__.load({
         [sessionId, hidden],
       )
 
+      // A folder with more entries than one page is not hidden: the row at the
+      // end of the listing asks the Host for the next page and appends it, so a
+      // huge `node_modules` is read only as far as the reader scrolls.
+      const loadMore = React.useCallback(
+        async (relativePath) => {
+          const listing = cache.get(relativePath)
+          if (listing === undefined || listing.truncated !== true) return
+          if (typeof sessionId !== 'string' || sessionId === '') return
+          setPending(relativePath)
+          try {
+            const page = await call('tree', {
+              sessionId,
+              path: relativePath,
+              hidden,
+              offset: Array.isArray(listing.entries) ? listing.entries.length : 0,
+            })
+            setCache((previous) => {
+              const next = new Map(previous)
+              const base = next.get(relativePath) ?? listing
+              next.set(relativePath, { ...page, entries: [...base.entries, ...page.entries] })
+              return next
+            })
+            setError('')
+          } catch (cause) {
+            setError(describeError(cause))
+          } finally {
+            setPending('')
+          }
+        },
+        [cache, sessionId, hidden],
+      )
+
       React.useEffect(() => {
         setExpanded(new Set())
         expandedRef.current = new Set()
@@ -1152,8 +1184,25 @@ window.__ModuleLoader__.load({
             )
             if (open) walk(path, depth + 1)
           }
-          if (listing.truncated) {
-            rows.push(h('div', { key: `more:${directory}`, className: 'dsh-ide-tree-empty', style: { paddingLeft: `${10 + depth * 12}px` } }, 'Показаны первые 400 записей'))
+          if (listing.truncated === true) {
+            const remaining = Math.max(0, (listing.total ?? listing.entries.length) - listing.entries.length)
+            const busy = pending === directory
+            rows.push(
+              h(
+                'button',
+                {
+                  key: `more:${directory}`,
+                  type: 'button',
+                  className: 'dsh-ide-row dsh-ide-row-more',
+                  style: { paddingLeft: `${6 + depth * 12}px` },
+                  disabled: busy,
+                  title: 'Прочитать следующую страницу этого каталога',
+                  onClick: () => void loadMore(directory),
+                },
+                h('span', { className: 'dsh-ide-caret' }),
+                h('span', { className: 'dsh-ide-row-name' }, busy ? 'Читаю…' : `Показать ещё${remaining > 0 ? ` ${remaining}` : ''}`),
+              ),
+            )
           }
           if (draft !== undefined && draft.directory === directory) {
             rows.push(draftRow(directory, depth))
@@ -8227,6 +8276,9 @@ function IdeBody(props) {
 .dsh-ide-row-root { font-weight:600; }
 .dsh-ide-row-root-name { color:var(--ide-text); }
 .dsh-ide-row-collapsed { opacity:.85; }
+.dsh-ide-row-more { color:var(--ide-muted); font-size:11px; font-style:italic; }
+.dsh-ide-row-more:hover:not(:disabled) { color:var(--ide-accent); }
+.dsh-ide-row-more:disabled { cursor:default; opacity:.7; }
 .dsh-ide-row-name { overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-row-dim { color:var(--ide-muted); overflow:hidden; text-overflow:ellipsis; max-width:60%; }
 .dsh-ide-row-tag { color:var(--ide-muted); font-size:10px; }

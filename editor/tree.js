@@ -10,31 +10,13 @@
 import { readdir, lstat, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
-/** Folders that are never worth walking in an editor tree. */
-const SKIPPED = new Set([
-  '.git',
-  '.hg',
-  '.svn',
-  'node_modules',
-  'bower_components',
-  'dist',
-  'build',
-  'out',
-  '.next',
-  '.nuxt',
-  '.svelte-kit',
-  '.venv',
-  'venv',
-  '__pycache__',
-  '.cache',
-  '.turbo',
-  '.parcel-cache',
-  'coverage',
-  'target',
-])
-
-/** Hard cap per directory: the tree is a navigator, not a file browser. */
-const MAX_ENTRIES = 400
+/**
+ * One page of a directory listing. A folder with more entries is not hidden:
+ * the tree asks for the next offset when the reader reaches the end of the
+ * page, so a large generated folder costs nothing until it is expanded.
+ */
+const DEFAULT_PAGE = 400
+const MAX_PAGE = 2000
 
 function kindOf(entry) {
   if (entry.isDirectory()) return 'directory'
@@ -57,11 +39,16 @@ async function safeRealpath(local) {
 }
 
 /**
- * List one directory inside the session workspace.
+ * List one page of a directory inside the session workspace.
+ *
+ * Every folder is listed, including `node_modules`, `.git` and build output:
+ * a directory is read only when the tree expands it, and a page is read only
+ * when the previous one was scrolled to its end.
  * @param {object} ctx - Host context carrying `fs`.
- * @param {{cwd: string, relativePath?: string, hidden?: boolean, signal?: AbortSignal}} request
+ * @param {{cwd: string, relativePath?: string, hidden?: boolean, offset?: number,
+ *          limit?: number, signal?: AbortSignal}} request
  */
-export async function listTree(ctx, { cwd, relativePath = '', hidden = false, signal }) {
+export async function listTree(ctx, { cwd, relativePath = '', hidden = false, offset = 0, limit = DEFAULT_PAGE, signal }) {
   const root = await ctx.fs.resolve(cwd, { signal })
   const requested = String(relativePath ?? '').trim()
   const target = requested === ''
@@ -101,7 +88,6 @@ export async function listTree(ctx, { cwd, relativePath = '', hidden = false, si
     const type = kindOf(dirent)
     if (type === 'other') continue
     if (!hidden && name.startsWith('.')) continue
-    if (type === 'directory' && SKIPPED.has(name)) continue
     entries.push({ name, type })
   }
 
@@ -110,8 +96,10 @@ export async function listTree(ctx, { cwd, relativePath = '', hidden = false, si
     return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
   })
 
-  const truncated = entries.length > MAX_ENTRIES
-  const visible = truncated ? entries.slice(0, MAX_ENTRIES) : entries
+  const total = entries.length
+  const pageSize = Math.min(MAX_PAGE, Math.max(1, Math.round(Number.isFinite(limit) ? limit : DEFAULT_PAGE)))
+  const start = Math.min(total, Math.max(0, Math.round(Number.isFinite(offset) ? offset : 0)))
+  const visible = entries.slice(start, start + pageSize)
 
   const decorated = []
   for (const entry of visible) {
@@ -135,7 +123,9 @@ export async function listTree(ctx, { cwd, relativePath = '', hidden = false, si
     relativePath: requested.split(path.sep).join('/'),
     workspaceRoot: ctx.fs.processPath(root),
     entries: decorated,
-    truncated,
+    offset: start,
+    total,
+    truncated: start + decorated.length < total,
   }
 }
 
@@ -171,7 +161,7 @@ export async function listFiles(ctx, { cwd, hidden = false, limit = 3000, signal
       const type = kindOf(dirent)
       const relative = current.relative === '' ? name : `${current.relative}/${name}`
       if (type === 'directory') {
-        if (SKIPPED.has(name) || current.depth >= 8) continue
+        if (current.depth >= 8) continue
         queue.push({ relative, absolute: path.join(current.absolute, name), depth: current.depth + 1 })
       } else if (type === 'file') {
         files.push({ path: relative, name, type })
