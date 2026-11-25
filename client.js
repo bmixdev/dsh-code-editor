@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-24.13'
+    const UI_BUILD = '2026-11-24.12'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -3712,9 +3712,6 @@ function IdeBody(props) {
       const [editorReady, setEditorReady] = React.useState(false)
       const [editorSlow, setEditorSlow] = React.useState(false)
       const [tabs, setTabs] = React.useState([])
-      // Whether the editor currently holds a non-empty selection. Touch has no
-      // selection handles, so the compact layout offers its own action bar.
-      const [selectionActive, setSelectionActive] = React.useState(false)
       const [activeKey, setActiveKey] = React.useState('')
       const [status, setStatus] = React.useState({ kind: 'idle', message: '' })
       const [explorerWidth, setExplorerWidth] = React.useState(220)
@@ -6158,9 +6155,7 @@ function IdeBody(props) {
           ? editor.onDidChangeCursorSelection(() => {
               const selection = editor.getSelection()
               const model = editor.getModel()
-              const hasSelection = selection !== null && model !== null && !selection.isEmpty()
-              setSelectionActive((current) => (current === hasSelection ? current : hasSelection))
-              if (!hasSelection) return
+              if (selection === null || model === null || selection.isEmpty()) return
               const key = runtime.current.modelTabs.get(model.uri.toString())
               if (key === undefined) return
               runtime.current.lastSelection = {
@@ -6171,120 +6166,6 @@ function IdeBody(props) {
               }
             })
           : undefined
-
-        // Monaco ships no selection handles for touch: a drag scrolls and a tap
-        // only moves the caret. Long-press selects the word under the finger,
-        // and dragging afterwards extends the selection, which is the gesture
-        // phone users already expect. The listeners are capture-phase so the
-        // editor's own scroll/tap handling does not undo the new selection.
-        const touchHost = typeof editor.getDomNode === 'function' ? editor.getDomNode() : undefined
-        let touchTimer = 0
-        let touchActive = false
-        let touchAnchor
-        let touchX = 0
-        let touchY = 0
-        let lastTouchAt = 0
-        let suppressTapUntil = 0
-        const selectBetween = (from, to) => {
-          const model = editor.getModel()
-          if (model === null) return
-          const forward = model.getOffsetAt(from) <= model.getOffsetAt(to)
-          const start = forward ? from : to
-          const end = forward ? to : from
-          editor.setSelection({
-            startLineNumber: start.lineNumber,
-            startColumn: start.column,
-            endLineNumber: end.lineNumber,
-            endColumn: end.column,
-          })
-        }
-        const beginTouchSelection = () => {
-          const model = editor.getModel()
-          if (model === null || typeof editor.getTargetAtClientPoint !== 'function') return
-          const target = editor.getTargetAtClientPoint(touchX, touchY)
-          const position = target?.position
-          if (!position) return
-          const word = model.getWordAtPosition(position)
-          if (word === null) {
-            editor.setPosition(position)
-            return
-          }
-          touchActive = true
-          const from = { lineNumber: position.lineNumber, column: word.startColumn }
-          const to = { lineNumber: position.lineNumber, column: word.endColumn }
-          touchAnchor = from
-          selectBetween(from, to)
-          setSelectionActive(true)
-          try {
-            if (typeof navigator !== 'undefined') navigator.vibrate?.(10)
-          } catch {
-            // Vibration is a nicety, not part of the selection contract.
-          }
-        }
-        const onTouchStart = (event) => {
-          if (event.pointerType !== 'touch' || event.button !== 0) return
-          lastTouchAt = Date.now()
-          touchActive = false
-          touchAnchor = undefined
-          touchX = event.clientX
-          touchY = event.clientY
-          if (touchTimer !== 0) window.clearTimeout(touchTimer)
-          touchTimer = window.setTimeout(() => {
-            touchTimer = 0
-            beginTouchSelection()
-          }, 420)
-        }
-        const onTouchMovePointer = (event) => {
-          if (event.pointerType !== 'touch') return
-          if (touchActive) {
-            event.preventDefault()
-            event.stopPropagation()
-            if (typeof editor.getTargetAtClientPoint !== 'function') return
-            const position = editor.getTargetAtClientPoint(event.clientX, event.clientY)?.position
-            if (position && touchAnchor !== undefined) selectBetween(touchAnchor, position)
-            return
-          }
-          if (Math.abs(event.clientX - touchX) > 10 || Math.abs(event.clientY - touchY) > 10) {
-            if (touchTimer !== 0) {
-              window.clearTimeout(touchTimer)
-              touchTimer = 0
-            }
-          }
-        }
-        const endTouchSelection = (event) => {
-          if (event.pointerType !== 'touch') return
-          if (touchTimer !== 0) {
-            window.clearTimeout(touchTimer)
-            touchTimer = 0
-          }
-          if (!touchActive) return
-          touchActive = false
-          suppressTapUntil = Date.now() + 350
-          event.preventDefault()
-          event.stopPropagation()
-        }
-        const onTouchEnd = (event) => {
-          if (!touchActive && Date.now() >= suppressTapUntil) return
-          event.preventDefault()
-          event.stopPropagation()
-        }
-        const onTouchMove = (event) => {
-          if (touchActive) event.preventDefault()
-        }
-        const onTouchContextMenu = (event) => {
-          if (touchActive || Date.now() - lastTouchAt < 1000) event.preventDefault()
-        }
-        const touchBound = touchHost !== undefined && typeof touchHost.addEventListener === 'function'
-        if (touchBound) {
-          touchHost.addEventListener('pointerdown', onTouchStart, true)
-          touchHost.addEventListener('pointermove', onTouchMovePointer, { capture: true, passive: false })
-          touchHost.addEventListener('pointerup', endTouchSelection, true)
-          touchHost.addEventListener('pointercancel', endTouchSelection, true)
-          touchHost.addEventListener('touchend', onTouchEnd, true)
-          touchHost.addEventListener('touchcancel', onTouchEnd, true)
-          touchHost.addEventListener('touchmove', onTouchMove, { passive: false })
-          touchHost.addEventListener('contextmenu', onTouchContextMenu)
-        }
 
         // Chords the user can remap are matched here rather than registered with
         // addCommand: a registered chord cannot be changed afterwards, and a
@@ -6369,17 +6250,6 @@ function IdeBody(props) {
           change.dispose()
           cursorChange.dispose()
           selectionChange?.dispose()
-          if (touchTimer !== 0) window.clearTimeout(touchTimer)
-          if (touchBound) {
-            touchHost.removeEventListener('pointerdown', onTouchStart, true)
-            touchHost.removeEventListener('pointermove', onTouchMovePointer, true)
-            touchHost.removeEventListener('pointerup', endTouchSelection, true)
-            touchHost.removeEventListener('pointercancel', endTouchSelection, true)
-            touchHost.removeEventListener('touchend', onTouchEnd, true)
-            touchHost.removeEventListener('touchcancel', onTouchEnd, true)
-            touchHost.removeEventListener('touchmove', onTouchMove)
-            touchHost.removeEventListener('contextmenu', onTouchContextMenu)
-          }
           editor.dispose()
           runtime.current.editor = undefined
         }
@@ -7054,24 +6924,6 @@ function IdeBody(props) {
         nextTab: () => cycleTab(1),
         prevTab: () => cycleTab(-1),
         openInlineEdit: () => openInlineEdit(),
-        // A selection-free path for touch: tap a line, then use the menu. It
-        // also covers the case where a long-press is claimed by the WebView.
-        openInlineEditLine: () => {
-          const editor = runtime.current.editor
-          const model = editor?.getModel()
-          const position = editor?.getPosition()
-          if (editor === undefined || model === null || model === undefined || position === null || position === undefined) {
-            return openInlineEdit()
-          }
-          const line = position.lineNumber
-          editor.setSelection({
-            startLineNumber: line,
-            startColumn: 1,
-            endLineNumber: line,
-            endColumn: model.getLineMaxColumn(line),
-          })
-          return openInlineEdit()
-        },
         cancelInline: () => dismissInlineEdit('esc', true),
       }
 
@@ -7268,7 +7120,6 @@ function IdeBody(props) {
             { separator: true },
             { id: 'quote', label: 'Строки в чат', key: chordLabel('quote'), run: () => handlersRef.current.quoteSelection?.() },
             { id: 'inline-edit', label: 'Изменить выделение…', key: chordLabel('inline-edit'), run: () => handlersRef.current.openInlineEdit?.() },
-            { id: 'inline-edit-line', label: 'Изменить строку…', run: () => handlersRef.current.openInlineEditLine?.() },
           ],
         },
         {
@@ -7697,22 +7548,6 @@ function IdeBody(props) {
             },
             dragOver === '' ? null : h('div', { className: 'dsh-ide-drop-overlay' }, h('span', { className: 'dsh-ide-drop-overlay-text' }, `Сослаться в чате: ${mentionLabel(dragOver)}`)),
             h(TabStrip, { tabs, activeKey, onActivate: setActiveKey, onClose: closeTab, onContextMenu: openTabMenu, compact }),
-            compact && selectionActive && inlineView === undefined
-              ? h(
-                  'div',
-                  { className: 'dsh-ide-touch-actions' },
-                  h(
-                    'button',
-                    { type: 'button', className: 'dsh-ide-touch-action', onClick: () => handlersRef.current.openInlineEdit?.() },
-                    'Изменить',
-                  ),
-                  h(
-                    'button',
-                    { type: 'button', className: 'dsh-ide-touch-action', onClick: () => handlersRef.current.quoteSelection?.() },
-                    'В чат',
-                  ),
-                )
-              : null,
             consent === undefined
               ? null
               : h(
@@ -8655,16 +8490,7 @@ function IdeBody(props) {
 .dsh-ide-root[data-compact] .dsh-ide-body { position:relative; }
 /* Keep Monaco's own z-indexed widgets inside the editor so the drawer and the
    scrim always paint over them. */
-.dsh-ide-root[data-compact] .dsh-ide-editor { z-index:1; -webkit-touch-callout:none; }
-/* The action bar for the long-press selection. It sits above code and below
-   sheets, so the same two actions are reachable without a context menu. */
-.dsh-ide-root[data-compact] .dsh-ide-touch-actions { position:absolute; right:10px; bottom:12px; z-index:30;
-  display:flex; gap:6px; padding:5px; border:1px solid var(--ide-border); border-radius:12px;
-  background:var(--ide-panel); box-shadow:0 6px 20px rgba(0,0,0,.35); }
-.dsh-ide-root[data-compact] .dsh-ide-touch-action { min-height:38px; padding:0 14px; border:1px solid var(--ide-border);
-  border-radius:8px; background:var(--ide-hover); color:var(--ide-text); font:inherit; font-size:13px;
-  touch-action:manipulation; }
-.dsh-ide-root[data-compact] .dsh-ide-touch-action:active { background:var(--ide-active); }
+.dsh-ide-root[data-compact] .dsh-ide-editor { z-index:1; }
 .dsh-ide-root[data-compact] .dsh-ide-compact-only { display:inline-flex; align-items:center; justify-content:center;
   flex:0 0 auto; width:38px; height:38px; padding:0; }
 .dsh-ide-root[data-compact] .dsh-ide-compact-only .dsh-ide-activity-glyph { font-size:18px; }
