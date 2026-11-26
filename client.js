@@ -25,7 +25,11 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'dsh-ide'
     // Bumped with every change that has to reach the browser: the number is
     // shown in the settings drawer, so "did the tab reload?" stops being a guess.
-    const UI_BUILD = '2026-11-24.12'
+    const UI_BUILD = '2026-11-26.3'
+    // The theme service has no subscribe method; the shell emits this event
+    // instead, and the IDE re-renders so data-theme and Monaco follow a live
+    // light/dark switch.
+    const THEME_EVENT = 'dsh-ide:theme-change'
     const ACTION_ID = 'dsh-ide.open'
     const ACTION_SLOTS = [
       ['sidebar.right.tab.document.actions', ACTION_ID, 30, 'IDE'],
@@ -493,10 +497,21 @@ window.__ModuleLoader__.load({
     function themeName() {
       try {
         const snapshot = services.theme && typeof services.theme.getTheme === 'function' ? services.theme.getTheme() : undefined
-        const name = typeof snapshot === 'string' ? snapshot : snapshot && (snapshot.id || snapshot.name || snapshot.theme)
+        // The live shape is `{ preference, active: { id, colorScheme }, ... }`;
+        // older hosts returned a bare id. Accept both, plus a resolved flag.
+        const active = snapshot && typeof snapshot === 'object' ? snapshot.active : undefined
+        const name = typeof snapshot === 'string'
+          ? snapshot
+          : snapshot && (snapshot.id || snapshot.name || snapshot.theme
+            || (active && (active.colorScheme || active.id || active.name))
+            || snapshot.preference)
         if (typeof name === 'string') {
           if (/dark/i.test(name)) return 'dark'
           if (/light/i.test(name)) return 'light'
+        }
+        if (active && typeof active.colorScheme === 'string') {
+          if (/dark/i.test(active.colorScheme)) return 'dark'
+          if (/light/i.test(active.colorScheme)) return 'light'
         }
         if (snapshot && typeof snapshot === 'object' && typeof snapshot.dark === 'boolean') return snapshot.dark ? 'dark' : 'light'
       } catch {
@@ -604,6 +619,944 @@ window.__ModuleLoader__.load({
      * A component rather than inline JSX: the editor surface of `IdeBody` is
      * already the largest expression in this file.
      */
+    // ------------------------------------------------------------------- git
+
+    // The Host groups a status entry by where its content lives: the index or
+    // the working tree. An `MM` file therefore belongs to both lists, and each
+    // row compares the side pair of its own group.
+    const SCM_SECTIONS = [
+      { id: 'conflicts', title: 'Конфликты' },
+      { id: 'staged', title: 'Подготовленные' },
+      { id: 'changes', title: 'Изменения' },
+    ]
+
+    const SCM_GRAPH_COLORS = ['#4e94ce', '#d18616', '#89d185', '#c586c0', '#e2c08d', '#f48771', '#73c991', '#9cdcfe']
+
+    function scmGroupsOf(entry) {
+      if (entry === undefined || entry === null) return []
+      if (entry.kind === 'conflict') return ['conflicts']
+      if (entry.kind === 'ignored') return []
+      if (entry.kind === 'untracked') return ['changes']
+      const groups = []
+      if (entry.indexStatus !== '.' && entry.indexStatus !== '?') groups.push('staged')
+      if (entry.worktreeStatus !== '.') groups.push('changes')
+      return groups
+    }
+
+    function scmSections(snapshot) {
+      const entries = snapshot !== undefined && snapshot !== null && Array.isArray(snapshot.entries) ? snapshot.entries : []
+      const buckets = new Map(SCM_SECTIONS.map((section) => [section.id, []]))
+      for (const entry of entries) {
+        if (typeof entry?.path !== 'string' || entry.path === '') continue
+        for (const group of scmGroupsOf(entry)) {
+          const rows = buckets.get(group)
+          if (rows === undefined) continue
+          rows.push({ group, path: entry.path, key: `${group}:${entry.path}`, entry })
+        }
+      }
+      return SCM_SECTIONS.map((section) => ({ ...section, rows: buckets.get(section.id) })).filter((section) => section.rows.length > 0)
+    }
+
+    function scmLetter(row) {
+      if (row.group === 'conflicts') return 'U'
+      // `?` records carry no worktree status: the Host reports the kind, and
+      // reading the empty status field here once turned every new file into `·`.
+      if (row.entry.kind === 'untracked') return '?'
+      const code = row.group === 'changes' ? row.entry.worktreeStatus : row.entry.indexStatus
+      if (code === '?') return '?'
+      return typeof code === 'string' && code !== '' && code !== '.' ? code[0] : '·'
+    }
+
+    const SCM_STATUS_LABELS = {
+      A: 'добавлен',
+      M: 'изменён',
+      D: 'удалён',
+      R: 'переименован',
+      C: 'скопирован',
+      T: 'изменён тип',
+      U: 'конфликт',
+      '?': 'новый файл',
+      '·': 'без изменений',
+    }
+
+    function scmLetterLabel(letter) {
+      return SCM_STATUS_LABELS[letter] ?? 'изменён'
+    }
+
+    // A stable, theme-independent palette: the letter and the commit text stay
+    // the real status signal, the colour only helps to follow a branch line.
+    function scmGraphColor(column) {
+      const index = Math.abs(Number(column) || 0) % SCM_GRAPH_COLORS.length
+      return SCM_GRAPH_COLORS[index]
+    }
+
+    /**
+     * Assigns every commit a column and puts the branch lines between rows.
+     *
+     * The result is what the SVG renderer draws: for each row, `segments` with
+     * unit coordinates (`y` 0 = top, 11 = node centre, 22 = bottom). Lanes keep
+     * the expected OID, so a line continues across a page boundary when the
+     * caller passes the previous page's `lanes` as `carry`.
+     */
+    function layoutGraph(commits, carry) {
+      const lanes = Array.isArray(carry?.lanes) ? carry.lanes.slice() : []
+      const rows = []
+      let width = 0
+      for (const commit of Array.isArray(commits) ? commits : []) {
+        if (commit === undefined || commit === null || typeof commit.oid !== 'string' || commit.oid === '') continue
+        const parents = Array.isArray(commit.parents)
+          ? commit.parents.filter((oid) => typeof oid === 'string' && oid !== '')
+          : []
+        const before = lanes.slice()
+        let column = lanes.indexOf(commit.oid)
+        if (column === -1) {
+          column = lanes.indexOf(undefined)
+          if (column === -1) {
+            column = lanes.length
+            lanes.push(commit.oid)
+          } else {
+            lanes[column] = commit.oid
+          }
+        }
+        const segments = []
+        for (let index = 0; index < before.length; index += 1) {
+          if (before[index] === undefined) continue
+          if (index === column) {
+            if (before[index] === commit.oid) segments.push({ kind: 'in', x1: index, y1: 0, x2: index, y2: 11 })
+          } else {
+            segments.push({ kind: 'through', x1: index, y1: 0, x2: index, y2: 22 })
+          }
+        }
+        lanes[column] = undefined
+        parents.forEach((parent, parentIndex) => {
+          let target = lanes.indexOf(parent)
+          if (target === -1) {
+            if (parentIndex === 0) {
+              target = column
+            } else {
+              target = lanes.indexOf(undefined)
+              if (target === -1) target = lanes.length
+            }
+            lanes[target] = parent
+          }
+          segments.push({ kind: 'out', x1: column, y1: 11, x2: target, y2: 22, parent })
+        })
+        const visible = Math.max(column + 1, lanes.length, ...segments.map((segment) => Math.max(segment.x1, segment.x2) + 1))
+        width = Math.max(width, visible)
+        rows.push({ oid: commit.oid, column, segments, parents, lanes: lanes.slice() })
+      }
+      // A trailing free slot is not a line: trim it so the next page does not
+      // inherit an empty column and the width stays honest.
+      while (lanes.length > 0 && lanes[lanes.length - 1] === undefined) lanes.pop()
+      return { rows, lanes: lanes.slice(), width }
+    }
+
+    function formatScmTime(seconds) {
+      const value = Number(seconds)
+      if (!Number.isFinite(value) || value <= 0) return ''
+      try {
+        return new Date(value * 1000).toLocaleString('ru-RU', {
+          day: '2-digit',
+          month: '2-digit',
+          year: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      } catch {
+        return ''
+      }
+    }
+
+    function describeScmError(cause) {
+      const code = cause !== null && typeof cause === 'object' ? cause.code : undefined
+      if (code === 'git-unavailable') return 'Git недоступен: политика сессии не подтверждена.'
+      if (code === 'git-not-found') return 'Git не найден на компьютере.'
+      if (code === 'not-repository') return 'Рабочая папка не является Git-репозиторием.'
+      if (code === 'not-root') return typeof cause.message === 'string' ? cause.message : 'Откройте корень Git-репозитория.'
+      if (code === 'read-only') return 'Сессия работает только для чтения: изменения индекса недоступны.'
+      if (code === 'locked') return 'Git занят другой операцией (index.lock). Повторите позже.'
+      if (code === 'timeout') return 'Git не ответил вовремя. Повторите запрос.'
+      if (code === 'output-limit') return 'Слишком большой список изменений: панель показала предел, а не «чисто».'
+      if (code === 'stale') return typeof cause.message === 'string' && cause.message !== '' ? cause.message : 'Список изменений обновился — обновите панель.'
+      if (code === 'history-stale') return 'Ветки изменились — граф начнётся заново.'
+      if (code === 'nothing-staged') return 'Нет подготовленных изменений — фиксировать нечего.'
+      if (code === 'identity') return typeof cause.message === 'string' ? cause.message : 'Git не знает автора фиксации.'
+      if (code === 'branch-exists') return 'Ветка с таким именем уже есть.'
+      if (code === 'branch-current') return 'Текущую ветку удалить нельзя.'
+      if (code === 'branch-unmerged') return 'В ветке есть невлитые коммиты — безопасно удалить её нельзя.'
+      if (code === 'switch-conflict') return 'Несохранённые изменения мешают переключению ветки.'
+      return describeError(cause)
+    }
+
+    function ScmBranchIcon() {
+      return h(
+        'svg',
+        { width: '15', height: '15', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+        h('path', { fill: 'none', stroke: 'currentColor', strokeWidth: '1.3', d: 'M4 2.5v7M4 13.2v-.4M4.8 5.5h3.7a3 3 0 0 1 3 3v4.7M11.5 2.5v.6M11.5 2.2a1.1 1.1 0 1 0 0 2.2 1.1 1.1 0 0 0 0-2.2M4 1.4a1.1 1.1 0 1 0 0 2.2 1.1 1.1 0 0 0 0-2.2M4 12.4a1.1 1.1 0 1 0 0 2.2 1.1 1.1 0 0 0 0-2.2' }),
+      )
+    }
+
+    function ScmRow({ row, active, unsaved, busy, onOpen, onStage, onUnstage }) {
+      const letter = scmLetter(row)
+      const label = scmLetterLabel(letter)
+      const name = baseName(row.entry.path)
+      const directory = dirName(row.entry.path)
+      const rename = typeof row.entry.oldPath === 'string' && row.entry.oldPath !== '' ? `${row.entry.oldPath} → ${row.entry.path}` : row.entry.path
+      const action = row.group === 'conflicts' ? null : row.group === 'staged' ? '−' : '+'
+      const actionLabel = row.group === 'staged' ? 'Снять с подготовки' : 'Подготовить файл'
+      return h(
+        'div',
+        { className: `dsh-ide-scm-row${active ? ' dsh-ide-scm-row-active' : ''}`, 'data-group': row.group },
+        h(
+          'div',
+          {
+            className: 'dsh-ide-scm-row-main',
+            role: 'button',
+            tabIndex: 0,
+            title: rename,
+            'aria-label': `${name}, ${label}: ${row.entry.path}`,
+            onClick: () => onOpen(row),
+            onKeyDown: (event) => {
+              if (event.key !== 'Enter' && event.key !== ' ') return
+              event.preventDefault()
+              onOpen(row)
+            },
+          },
+          h('span', { className: 'dsh-ide-scm-letter', 'data-letter': letter, 'aria-hidden': 'true' }, letter),
+          h(
+            'span',
+            { className: 'dsh-ide-scm-row-text' },
+            h(
+              'span',
+              { className: 'dsh-ide-scm-name' },
+              name,
+              unsaved ? h('span', { className: 'dsh-ide-scm-dirty', title: 'В редакторе есть несохранённые правки', 'aria-label': 'есть несохранённые правки' }, '•') : null,
+            ),
+            directory === '' ? null : h('span', { className: 'dsh-ide-scm-dir' }, directory),
+          ),
+        ),
+        action === null
+          ? h('span', { className: 'dsh-ide-scm-conflict-note' }, 'решите вне панели')
+          : h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-scm-action',
+                title: actionLabel,
+                'aria-label': `${actionLabel}: ${row.entry.path}`,
+                disabled: busy,
+                onClick: (event) => {
+                  event.stopPropagation()
+                  if (row.group === 'staged') onUnstage(row)
+                  else onStage(row)
+                },
+              },
+              action,
+            ),
+      )
+    }
+
+    function ScmGraph({ history, activeOid, onSelect, onMore, onReload }) {
+      if (history.unborn) return h('div', { className: 'dsh-ide-scm-graph-note' }, 'Пока нет коммитов.')
+      if (history.phase === 'loading') return h('div', { className: 'dsh-ide-scm-graph-note' }, 'Читаю историю…')
+      if (history.phase === 'failed' && history.commits.length === 0) {
+        return h(
+          'div',
+          { className: 'dsh-ide-scm-graph-note' },
+          history.error,
+          h('button', { type: 'button', className: 'dsh-ide-scm-link', onClick: onReload }, 'Повторить'),
+        )
+      }
+      const layout = layoutGraph(history.commits)
+      const columnWidth = 14
+      const width = Math.max(columnWidth, layout.width * columnWidth)
+      const rows = []
+      history.commits.forEach((commit, index) => {
+        const geometry = layout.rows[index]
+        if (geometry === undefined) return
+        const refs = Array.isArray(commit.refs) ? commit.refs.filter((ref) => typeof ref === 'string' && ref !== '') : []
+        rows.push(
+          h(
+            'div',
+            { className: `dsh-ide-scm-graph-row${activeOid === commit.oid ? ' dsh-ide-scm-graph-row-active' : ''}`, key: commit.oid },
+            h(
+              'svg',
+              { className: 'dsh-ide-scm-graph-svg', width, height: 22, viewBox: `0 0 ${width} 22`, 'aria-hidden': 'true' },
+              geometry.segments.map((segment, segmentIndex) =>
+                h('path', {
+                  key: segmentIndex,
+                  d: `M${segment.x1 * columnWidth + 7} ${segment.y1} L${segment.x2 * columnWidth + 7} ${segment.y2}`,
+                  fill: 'none',
+                  stroke: scmGraphColor(segment.kind === 'out' ? segment.x2 : segment.x1),
+                  strokeWidth: '1.4',
+                  strokeLinecap: 'round',
+                }),
+              ),
+              h('circle', { cx: geometry.column * columnWidth + 7, cy: 11, r: 4, fill: scmGraphColor(geometry.column) }),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-scm-graph-commit',
+                title: `${commit.oid}\n${commit.author || ''}\n${formatScmTime(commit.time)}`,
+                'aria-pressed': activeOid === commit.oid,
+                onClick: () => onSelect(commit),
+              },
+              h('span', { className: 'dsh-ide-scm-graph-subject' }, commit.subject || '(без сообщения)'),
+              h(
+                'span',
+                { className: 'dsh-ide-scm-graph-meta' },
+                `${commit.oid.slice(0, 7)} · ${commit.author || ''}${formatScmTime(commit.time) === '' ? '' : ` · ${formatScmTime(commit.time)}`}`,
+              ),
+              refs.length === 0 ? null : h('span', { className: 'dsh-ide-scm-graph-refs' }, refs.join(', ')),
+            ),
+          ),
+        )
+      })
+      if (rows.length === 0) return h('div', { className: 'dsh-ide-scm-graph-note' }, 'История пуста.')
+      return h(
+        'div',
+        { className: 'dsh-ide-scm-graph' },
+        h('div', { className: 'dsh-ide-scm-graph-list' }, rows),
+        history.error ? h('div', { className: 'dsh-ide-scm-error' }, history.error) : null,
+        history.cursor === null
+          ? null
+          : h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-scm-more',
+                disabled: history.phase === 'more',
+                onClick: onMore,
+              },
+              history.phase === 'more' ? 'Читаю…' : 'Ещё',
+            ),
+      )
+    }
+
+    // A Git comparison reuses the single Monaco diff editor of the assistant
+    // review; only the shell around it differs: side labels, change navigation
+    // and a visible way back to the list.
+    function GitDiff({ view, dirty, onClose, onOpenFile, onPrevious, onNext, containerRef }) {
+      const ready = view.phase === 'ready'
+      const textual = ready && (view.kind === undefined || view.kind === 'text')
+      const reason =
+        view.phase === 'failed'
+          ? view.error
+          : ready && !textual
+            ? view.message || (view.kind === 'binary' ? 'Двоичный файл: сравнение текстом недоступно.' : view.kind === 'outside' ? 'Файл вне рабочей папки.' : view.kind === 'too-large' ? 'Файл слишком большой для сравнения.' : 'Сравнение недоступно.')
+            : ''
+      return h(
+        'div',
+        { className: 'dsh-ide-diffview dsh-ide-gitdiff', 'data-phase': view.phase },
+        h(
+          'div',
+          { className: 'dsh-ide-diffview-head dsh-ide-gitdiff-head' },
+          h(
+            'div',
+            { className: 'dsh-ide-gitdiff-titles' },
+            h(
+              'button',
+              { type: 'button', className: 'dsh-ide-diffview-action', title: 'Вернуться к списку изменений', onClick: onClose },
+              '← К списку',
+            ),
+            h(
+              'span',
+              { className: 'dsh-ide-gitdiff-caption' },
+              h('span', { className: 'dsh-ide-diffview-title' }, typeof view.oldPath === 'string' && view.oldPath !== '' ? `${view.oldPath} → ${view.path}` : view.path),
+              h('span', { className: 'dsh-ide-diffview-sub' }, `${view.beforeLabel ?? ''} → ${view.afterLabel ?? ''}`),
+              dirty ? h('span', { className: 'dsh-ide-diffview-note' }, 'На диске; есть несохранённые правки') : null,
+              view.phase === 'pending' ? h('span', { className: 'dsh-ide-diffview-note' }, 'Читаю снимок…') : null,
+              view.phase === 'failed' ? h('span', { className: 'dsh-ide-diffview-error' }, view.error) : null,
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsh-ide-gitdiff-actions' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-diffview-action',
+                title: 'Предыдущее изменение',
+                'aria-label': 'Предыдущее изменение',
+                disabled: !textual,
+                onClick: onPrevious,
+              },
+              '‹',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-diffview-action',
+                title: 'Следующее изменение',
+                'aria-label': 'Следующее изменение',
+                disabled: !textual,
+                onClick: onNext,
+              },
+              '›',
+            ),
+            view.canOpen === true
+              ? h(
+                  'button',
+                  { type: 'button', className: 'dsh-ide-diffview-action', title: 'Открыть файл на диске', onClick: () => onOpenFile(view.path) },
+                  'Открыть файл',
+                )
+              : null,
+          ),
+        ),
+        h(
+          'div',
+          { className: 'dsh-ide-diffview-body', ref: textual ? containerRef : undefined },
+          view.phase === 'pending'
+            ? h('div', { className: 'dsh-ide-diffview-reason' }, 'Читаю снимок…')
+            : reason !== ''
+              ? h('div', { className: 'dsh-ide-diffview-reason' }, reason)
+              : null,
+        ),
+      )
+    }
+
+    function SourceControl(props) {
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
+      const snapshot = props.status
+      const error = typeof props.error === 'string' ? props.error : ''
+      const loading = props.loading === true
+      const readOnly = snapshot !== undefined && snapshot !== null && snapshot.readOnly === true
+      const sections = scmSections(snapshot)
+      const stagedCount = sections.find((section) => section.id === 'staged')?.rows.length ?? 0
+      const head = snapshot !== undefined && snapshot !== null && typeof snapshot.head === 'string' ? snapshot.head : ''
+      const branch = snapshot !== undefined && snapshot !== null && typeof snapshot.branch === 'string' && snapshot.branch !== '' ? snapshot.branch : ''
+      const detached = snapshot !== undefined && snapshot !== null && snapshot.detached === true
+      const unborn = snapshot !== undefined && snapshot !== null && snapshot.unborn === true
+      const message = typeof props.message === 'string' ? props.message : ''
+      const [graphOpen, setGraphOpen] = React.useState(true)
+      const [history, setHistory] = React.useState({ phase: 'idle', commits: [], cursor: null, error: '', unborn: false })
+      const [historyReload, setHistoryReload] = React.useState(0)
+      const [commitView, setCommitView] = React.useState(undefined)
+      const [branchOpen, setBranchOpen] = React.useState(false)
+      const [branchState, setBranchState] = React.useState({ phase: 'idle', current: '', detached: false, branches: [], error: '' })
+      const [branchReload, setBranchReload] = React.useState(0)
+      const [branchBusy, setBranchBusy] = React.useState('')
+      const [branchCreating, setBranchCreating] = React.useState(false)
+      const [branchDraft, setBranchDraft] = React.useState('')
+      const [branchDelete, setBranchDelete] = React.useState('')
+      const historySeq = React.useRef(0)
+      const commitSeq = React.useRef(0)
+      const branchSeq = React.useRef(0)
+
+      React.useEffect(() => {
+        if (!branchOpen || sessionId === '') return undefined
+        let cancelled = false
+        const seq = (branchSeq.current += 1)
+        setBranchState((previous) => ({
+          ...previous,
+          phase: previous.branches.length === 0 ? 'loading' : 'refreshing',
+          error: '',
+        }))
+        void call('scmBranches', { sessionId })
+          .then((payload) => {
+            if (cancelled || seq !== branchSeq.current) return
+            setBranchState({
+              phase: 'ready',
+              current: typeof payload?.current === 'string' ? payload.current : '',
+              detached: payload?.detached === true,
+              branches: Array.isArray(payload?.branches) ? payload.branches : [],
+              error: '',
+            })
+          })
+          .catch((cause) => {
+            if (cancelled || seq !== branchSeq.current || cause?.code === 'cancelled') return
+            setBranchState((previous) => ({ ...previous, phase: 'failed', error: describeScmError(cause) }))
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [branchOpen, sessionId, branch, head, branchReload])
+
+      React.useEffect(() => {
+        if (!graphOpen || sessionId === '') return undefined
+        let cancelled = false
+        const seq = (historySeq.current += 1)
+        setHistory((previous) => ({ ...previous, phase: previous.commits.length === 0 ? 'loading' : 'more', error: '' }))
+        void call('scmHistory', { sessionId })
+          .then((page) => {
+            if (cancelled || seq !== historySeq.current) return
+            setHistory({
+              phase: 'ready',
+              commits: page !== null && Array.isArray(page.commits) ? page.commits : [],
+              cursor: page !== null && page.nextCursor !== undefined ? page.nextCursor : null,
+              error: '',
+              unborn: page !== null && page.unborn === true,
+            })
+          })
+          .catch((cause) => {
+            if (cancelled || seq !== historySeq.current || cause?.code === 'cancelled') return
+            setHistory((previous) => ({ ...previous, phase: 'failed', error: describeScmError(cause) }))
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [graphOpen, sessionId, head, branch, historyReload])
+
+      const loadMore = () => {
+        if (sessionId === '' || history.cursor === null || history.phase === 'more') return
+        const seq = (historySeq.current += 1)
+        setHistory((previous) => ({ ...previous, phase: 'more', error: '' }))
+        void call('scmHistory', { sessionId, cursor: history.cursor })
+          .then((page) => {
+            if (seq !== historySeq.current) return
+            const next = page !== null && Array.isArray(page.commits) ? page.commits : []
+            setHistory((previous) => {
+              const seen = new Set(previous.commits.map((commit) => commit.oid))
+              const commits = previous.commits.concat(next.filter((commit) => !seen.has(commit.oid)))
+              return { phase: 'ready', commits, cursor: page?.nextCursor ?? null, error: '', unborn: previous.unborn }
+            })
+          })
+          .catch((cause) => {
+            if (seq !== historySeq.current || cause?.code === 'cancelled') return
+            setHistory((previous) => ({ ...previous, phase: 'failed', error: describeScmError(cause) }))
+          })
+      }
+
+      const openCommit = (commit, base) => {
+        if (sessionId === '' || commit === undefined) return
+        const parents = Array.isArray(commit.parents) ? commit.parents.filter((oid) => typeof oid === 'string' && oid !== '') : []
+        const selectedBase = typeof base === 'string' ? base : parents[0] ?? ''
+        const seq = (commitSeq.current += 1)
+        setCommitView({ phase: 'loading', oid: commit.oid, subject: commit.subject, time: commit.time, parents, base: selectedBase, files: [], error: '' })
+        void call('scmCommitFiles', { sessionId, oid: commit.oid, base: selectedBase })
+          .then((payload) => {
+            if (seq !== commitSeq.current) return
+            setCommitView({
+              phase: 'ready',
+              oid: commit.oid,
+              subject: commit.subject,
+              time: commit.time,
+              parents,
+              base: typeof payload?.base === 'string' ? payload.base : selectedBase,
+              files: Array.isArray(payload?.entries) ? payload.entries : [],
+              error: '',
+            })
+          })
+          .catch((cause) => {
+            if (seq !== commitSeq.current || cause?.code === 'cancelled') return
+            setCommitView((previous) => (previous === undefined ? previous : { ...previous, phase: 'failed', error: describeScmError(cause) }))
+          })
+      }
+
+      const runBranch = (route, value) => {
+        const name = typeof value === 'string' ? value.trim() : ''
+        if (sessionId === '' || branchBusy !== '' || name === '') return
+        setBranchBusy(route)
+        setBranchState((previous) => ({ ...previous, error: '' }))
+        void call(route, { sessionId, name })
+          .then((payload) => {
+            if (payload?.branches !== undefined && Array.isArray(payload.branches.branches)) {
+              setBranchState({
+                phase: 'ready',
+                current: typeof payload.branches.current === 'string' ? payload.branches.current : '',
+                detached: payload.branches.detached === true,
+                branches: payload.branches.branches,
+                error: '',
+              })
+            }
+            if (route !== 'scmDeleteBranch') {
+              setCommitView(undefined)
+              setBranchOpen(false)
+              setBranchCreating(false)
+              setBranchDraft('')
+              if (typeof props.onBranchChanged === 'function') props.onBranchChanged(payload)
+              setHistoryReload((value) => value + 1)
+            }
+            setBranchDelete('')
+          })
+          .catch((cause) => {
+            if (cause?.code === 'cancelled') return
+            setBranchState((previous) => ({ ...previous, error: describeScmError(cause) }))
+          })
+          .finally(() => setBranchBusy(''))
+      }
+
+      const header = h(
+        'div',
+        { className: 'dsh-ide-explorer-head' },
+        h('span', { className: 'dsh-ide-explorer-title' }, 'GIT'),
+        h(
+          'span',
+          { className: 'dsh-ide-explorer-actions' },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-icon-button',
+              title: 'Обновить состояние Git',
+              'aria-label': 'Обновить состояние Git',
+              disabled: loading,
+              onClick: () => {
+                if (typeof props.onRefresh === 'function') props.onRefresh()
+              },
+            },
+            h(ToolbarIcon, { kind: 'refresh' }),
+          ),
+          h(
+            'button',
+            { type: 'button', className: 'dsh-ide-icon-button', title: 'Скрыть панель Git', 'aria-label': 'Скрыть панель Git', onClick: () => props.onClose() },
+            '✕',
+          ),
+        ),
+      )
+
+      if (snapshot === undefined && loading) {
+        return h('div', { className: 'dsh-ide-explorer dsh-ide-scm' }, header, h('div', { className: 'dsh-ide-scm-graph-note' }, 'Читаю состояние Git…'))
+      }
+
+      if (snapshot === undefined) {
+        return h(
+          'div',
+          { className: 'dsh-ide-explorer dsh-ide-scm' },
+          header,
+          h(
+            'div',
+            { className: 'dsh-ide-scm-error', role: 'status' },
+            error === '' ? 'Состояние Git недоступно.' : error,
+            h('button', { type: 'button', className: 'dsh-ide-scm-link', onClick: () => props.onRefresh() }, 'Повторить'),
+          ),
+        )
+      }
+
+      const branchLabel = detached ? 'отдельная HEAD' : branch === '' ? 'ветка не определена' : branch
+      const composer = h(
+        'div',
+        { className: 'dsh-ide-scm-commit' },
+        h('textarea', {
+          className: 'dsh-ide-scm-message',
+          rows: 3,
+          value: message,
+          placeholder: 'Сообщение фиксации',
+          'aria-label': 'Сообщение фиксации',
+          disabled: readOnly,
+          onChange: (event) => props.onMessage(event.target.value),
+          onKeyDown: (event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+              event.preventDefault()
+              props.onCommit()
+            }
+          },
+        }),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dsh-ide-button dsh-ide-button-primary dsh-ide-scm-commit-button',
+            disabled: readOnly || props.committing === true || message.trim() === '' || stagedCount === 0,
+            title:
+              stagedCount === 0
+                ? 'Сначала подготовьте изменения кнопкой «+»'
+                : message.trim() === ''
+                  ? 'Введите сообщение фиксации'
+                  : 'Зафиксировать только подготовленные файлы',
+            onClick: () => props.onCommit(),
+          },
+          props.committing === true ? 'Фиксирую…' : 'Зафиксировать',
+        ),
+        h(
+          'div',
+          { className: 'dsh-ide-scm-hint' },
+          stagedCount === 0 ? 'Отметьте «+» файлы, которые войдут в коммит.' : `В коммит войдут подготовленные файлы: ${stagedCount}.`,
+        ),
+      )
+
+      const workingSections = h(
+        'div',
+        { className: 'dsh-ide-scm-working' },
+        composer,
+        sections.length === 0
+          ? h('div', { className: 'dsh-ide-scm-clean' }, 'Рабочая папка чиста.')
+          : sections.map((section) =>
+              h(
+                'div',
+                { className: 'dsh-ide-scm-section', key: section.id },
+                h(
+                  'div',
+                  { className: 'dsh-ide-scm-section-head' },
+                  h('span', { className: 'dsh-ide-scm-section-title' }, section.title),
+                  h('span', { className: 'dsh-ide-scm-section-count' }, String(section.rows.length)),
+                ),
+                section.rows.map((row) =>
+                  h(ScmRow, {
+                    key: row.key,
+                    row,
+                    active: typeof props.activePath === 'string' && props.activePath === row.entry.path,
+                    unsaved:
+                      props.unsavedPaths instanceof Set
+                        ? props.unsavedPaths.has(row.entry.path)
+                        : Array.isArray(props.unsavedPaths) && props.unsavedPaths.includes(row.entry.path),
+                    busy: typeof props.busy === 'string' && props.busy !== '',
+                    onOpen: (target) => props.onOpenRow(target),
+                    onStage: (target) => props.onStageRow(target),
+                    onUnstage: (target) => props.onUnstageRow(target),
+                  }),
+                ),
+              ),
+            ),
+      )
+
+      const selectedCommit = commitView === undefined ? null : h(
+        'div',
+        { className: 'dsh-ide-scm-selected' },
+        h(
+          'div',
+          { className: 'dsh-ide-scm-section-head' },
+          h('span', { className: 'dsh-ide-scm-section-title' }, 'Изменения'),
+          h(
+            'span',
+            { className: 'dsh-ide-scm-section-count' },
+            commitView.phase === 'ready' ? String(commitView.files.length) : '…',
+          ),
+        ),
+        h(
+          'div',
+          { className: 'dsh-ide-scm-commit-summary' },
+          h('div', { className: 'dsh-ide-scm-commit-subject' }, commitView.subject || '(без сообщения)'),
+          h('div', { className: 'dsh-ide-scm-commit-oid' }, `${commitView.oid.slice(0, 12)} · ${commitView.time === undefined ? '' : formatScmTime(commitView.time)}`),
+          commitView.parents.length > 1
+            ? h(
+                'label',
+                { className: 'dsh-ide-scm-parent' },
+                h('span', { className: 'dsh-ide-scm-parent-label' }, 'Сравнить с родителем'),
+                h(
+                  'select',
+                  {
+                    value: commitView.base,
+                    'aria-label': 'Родитель для сравнения',
+                    onChange: (event) => openCommit({ oid: commitView.oid, subject: commitView.subject, parents: commitView.parents, time: commitView.time }, event.target.value),
+                  },
+                  commitView.parents.map((parent, index) =>
+                    h('option', { value: parent, key: parent }, `${index + 1}: ${parent.slice(0, 7)}`),
+                  ),
+                ),
+              )
+            : h('div', { className: 'dsh-ide-scm-commit-base' }, commitView.base === '' ? 'Корневой коммит: до него файлов нет' : `Родитель: ${commitView.base.slice(0, 7)}`),
+          h(
+            'button',
+            { type: 'button', className: 'dsh-ide-scm-back', onClick: () => setCommitView(undefined) },
+            '← К рабочим изменениям',
+          ),
+        ),
+        commitView.phase === 'loading'
+          ? h('div', { className: 'dsh-ide-scm-graph-note' }, 'Читаю файлы коммита…')
+          : commitView.phase === 'failed'
+            ? h('div', { className: 'dsh-ide-scm-error', role: 'status' }, commitView.error)
+            : commitView.files.length === 0
+              ? h('div', { className: 'dsh-ide-scm-graph-note' }, 'В этом коммите нет изменённых файлов.')
+              : h(
+                  'div',
+                  { className: 'dsh-ide-scm-files', role: 'list' },
+                  commitView.files.map((file) =>
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        key: `${file.status}:${file.path}`,
+                        className: 'dsh-ide-scm-file',
+                        title: file.oldPath === undefined ? file.path : `${file.oldPath} → ${file.path}`,
+                        onClick: () => props.onOpenCommitFile(commitView, file),
+                      },
+                      h('span', { className: 'dsh-ide-scm-letter', 'data-letter': file.status, 'aria-hidden': 'true' }, file.status),
+                      h('span', { className: 'dsh-ide-scm-file-path' }, file.path),
+                    ),
+                  ),
+                ),
+      )
+
+      const branchPanel = branchOpen
+        ? h(
+            'div',
+            { className: 'dsh-ide-scm-branches', id: 'dsh-ide-scm-branches', role: 'group', 'aria-label': 'Ветки Git' },
+            h(
+              'div',
+              { className: 'dsh-ide-scm-branches-head' },
+              h('span', { className: 'dsh-ide-scm-branches-title' }, 'Ветки'),
+              h(
+                'button',
+                { type: 'button', className: 'dsh-ide-scm-link', title: 'Обновить список веток', onClick: () => setBranchReload((value) => value + 1) },
+                'Обновить',
+              ),
+            ),
+            branchState.error === '' ? null : h('div', { className: 'dsh-ide-scm-error', role: 'status' }, branchState.error),
+            branchState.phase === 'loading' && branchState.branches.length === 0
+              ? h('div', { className: 'dsh-ide-scm-graph-note' }, 'Читаю ветки…')
+              : h(
+                  'div',
+                  { className: 'dsh-ide-scm-branch-list' },
+                  branchState.branches.map((entry) => {
+                    const isCurrent = entry.current === true || entry.name === (branchState.current || branch)
+                    if (branchDelete === entry.name) {
+                      return h(
+                        'div',
+                        { className: 'dsh-ide-scm-branch-confirm', key: entry.name },
+                        h('span', { className: 'dsh-ide-scm-branch-confirm-text' }, `Удалить ветку ${entry.name}?`),
+                        h(
+                          'button',
+                          { type: 'button', className: 'dsh-ide-scm-branch-danger', disabled: branchBusy !== '', onClick: () => runBranch('scmDeleteBranch', entry.name) },
+                          'Удалить',
+                        ),
+                        h('button', { type: 'button', className: 'dsh-ide-scm-link', onClick: () => setBranchDelete('') }, 'Отмена'),
+                      )
+                    }
+                    return h(
+                      'div',
+                      { className: `dsh-ide-scm-branch-row${isCurrent ? ' dsh-ide-scm-branch-row-current' : ''}`, key: entry.name },
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-scm-branch-pick',
+                          disabled: isCurrent || branchBusy !== '',
+                          title: isCurrent ? `Текущая ветка: ${entry.name}` : `Переключиться на ${entry.name}`,
+                          onClick: () => runBranch('scmSwitchBranch', entry.name),
+                        },
+                        h('span', { className: 'dsh-ide-scm-branch-check', 'aria-hidden': 'true' }, isCurrent ? '✓' : ''),
+                        h('span', { className: 'dsh-ide-scm-branch-option-name' }, entry.name),
+                        isCurrent ? h('span', { className: 'dsh-ide-scm-branch-badge' }, 'текущая') : null,
+                      ),
+                      isCurrent
+                        ? null
+                        : h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-ide-scm-branch-delete',
+                              title: `Удалить ветку ${entry.name}`,
+                              'aria-label': `Удалить ветку ${entry.name}`,
+                              disabled: branchBusy !== '',
+                              onClick: () => setBranchDelete(entry.name),
+                            },
+                            '×',
+                          ),
+                    )
+                  }),
+                ),
+            h(
+              'form',
+              {
+                className: 'dsh-ide-scm-new-branch',
+                onSubmit: (event) => {
+                  event.preventDefault()
+                  if (branchDraft.trim() !== '') runBranch('scmCreateBranch', branchDraft)
+                },
+              },
+              branchCreating
+                ? [
+                    h('input', {
+                      key: 'name',
+                      className: 'dsh-ide-scm-branch-input',
+                      value: branchDraft,
+                      placeholder: 'Имя новой ветки',
+                      'aria-label': 'Имя новой ветки',
+                      autoFocus: true,
+                      onChange: (event) => setBranchDraft(event.target.value),
+                      onKeyDown: (event) => {
+                        if (event.key !== 'Escape') return
+                        setBranchCreating(false)
+                        setBranchDraft('')
+                      },
+                    }),
+                    h(
+                      'button',
+                      { key: 'create', type: 'submit', className: 'dsh-ide-scm-new-branch-submit', disabled: branchBusy !== '' || branchDraft.trim() === '' },
+                      branchBusy === 'scmCreateBranch' ? 'Создаю…' : 'Создать',
+                    ),
+                    h(
+                      'button',
+                      { key: 'cancel', type: 'button', className: 'dsh-ide-scm-link', onClick: () => { setBranchCreating(false); setBranchDraft('') } },
+                      'Отмена',
+                    ),
+                  ]
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-scm-new-branch-button',
+                      disabled: branchBusy !== '',
+                      onClick: () => { setBranchCreating(true); setBranchDraft('') },
+                    },
+                    '+ Новая ветка',
+                  ),
+            ),
+          )
+        : null
+
+      return h(
+        'div',
+        { className: 'dsh-ide-explorer dsh-ide-scm' },
+        header,
+        h(
+          'button',
+          {
+            type: 'button',
+            className: `dsh-ide-scm-branch${branchOpen ? ' dsh-ide-scm-branch-open' : ''}`,
+            title: detached ? `HEAD: ${head}. Выбрать ветку` : `Ветка ${branchLabel}. Выбрать ветку`,
+            'aria-expanded': branchOpen,
+            'aria-controls': 'dsh-ide-scm-branches',
+            'aria-label': `Ветка: ${branchLabel}. Выбрать ветку`,
+            onClick: () => {
+              setBranchOpen((value) => !value)
+              setBranchDelete('')
+              setBranchCreating(false)
+              setBranchDraft('')
+            },
+          },
+          h('span', { className: 'dsh-ide-scm-branch-icon' }, h(ScmBranchIcon)),
+          h('span', { className: 'dsh-ide-scm-branch-name' }, branchLabel),
+          h('span', { className: 'dsh-ide-scm-branch-head' }, head === '' ? '' : head.slice(0, 7)),
+          h('span', { className: 'dsh-ide-scm-branch-caret', 'aria-hidden': 'true' }, branchOpen ? '▴' : '▾'),
+        ),
+        branchPanel,
+        error === '' ? null : h('div', { className: 'dsh-ide-scm-error', role: 'status' }, error),
+        readOnly ? h('div', { className: 'dsh-ide-scm-note' }, 'Только чтение: политика сессии не разрешает менять индекс.') : null,
+        unborn ? h('div', { className: 'dsh-ide-scm-note' }, 'Ветка ещё без коммитов: первый коммит заберёт подготовленные файлы.') : null,
+        h(
+          'div',
+          { className: 'dsh-ide-scm-scroll' },
+          commitView === undefined ? workingSections : selectedCommit,
+        ),
+        h(
+          'div',
+          { className: 'dsh-ide-scm-history' },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-scm-history-toggle',
+              'aria-expanded': graphOpen,
+              title: graphOpen ? 'Свернуть граф коммитов' : 'Развернуть граф коммитов',
+              onClick: () => {
+                const next = !graphOpen
+                setGraphOpen(next)
+                if (next && history.phase === 'idle') setHistoryReload((value) => value + 1)
+              },
+            },
+            h('span', { className: 'dsh-ide-scm-history-title' }, 'Граф'),
+            h('span', { className: 'dsh-ide-scm-history-count' }, history.commits.length === 0 ? '' : String(history.commits.length)),
+            h('span', { className: 'dsh-ide-scm-history-chevron', 'aria-hidden': 'true' }, graphOpen ? '▾' : '▸'),
+          ),
+          graphOpen
+            ? h(ScmGraph, {
+                history,
+                activeOid: commitView === undefined ? '' : commitView.oid,
+                onSelect: (commit) => openCommit(commit),
+                onMore: loadMore,
+                onReload: () => setHistoryReload((value) => value + 1),
+              })
+            : null,
+        ),
+      )
+    }
+
     function DiffReview({ view, work, onAccept, onRevert, onAcceptAll, onRevertAll, onOpenFile, onClose, containerRef }) {
       const files = Array.isArray(view.files) ? view.files : []
       const stateOf = (file) => work[`${view.seq}:${file.index}`]
@@ -3765,6 +4718,9 @@ function IdeBody(props) {
       const [status, setStatus] = React.useState({ kind: 'idle', message: '' })
       const [explorerWidth, setExplorerWidth] = React.useState(220)
       const [showTree, setShowTree] = React.useState(true)
+      // The left column is either the file tree or the Source Control view;
+      // both keep the same width and drawer behaviour.
+      const [explorerMode, setExplorerMode] = React.useState('files')
       const [searchOpen, setSearchOpen] = React.useState(false)
       const [changes, setChanges] = React.useState([])
       /** Host checkpoints of assistant turns: `{phase, available, turns, error}`. */
@@ -3775,9 +4731,34 @@ function IdeBody(props) {
       /** Side-by-side comparison over the editor: `{phase, seq, index, path, display, before, after, language, error}`. */
       const [diffView, setDiffView] = React.useState(undefined)
       const diffContainerRef = React.useRef(undefined)
+      // A theme switch changes CSS variables and Monaco at once; the counter
+      // only exists to re-run render and the Monaco theme effect.
+      const [themeTick, setThemeTick] = React.useState(0)
+      React.useEffect(() => {
+        const onTheme = () => setThemeTick((value) => value + 1)
+        window.addEventListener(THEME_EVENT, onTheme)
+        return () => window.removeEventListener(THEME_EVENT, onTheme)
+      }, [])
+      React.useEffect(() => {
+        if (monaco !== undefined) monaco.editor.setTheme(themeName() === 'dark' ? 'vs-dark' : 'vs')
+      }, [monaco, themeTick])
       // Bumped after «Отменить правки» so the pane refetches the turn list
       // instead of showing a snapshot the Host has already superseded.
       const [changesReload, setChangesReload] = React.useState(0)
+      // Source Control: the snapshot is the Host's revisioned view of the
+      // worktree, never a client guess. The request counter discards an answer
+      // that belongs to an older session or an older panel open.
+      const [scmStatus, setScmStatus] = React.useState(undefined)
+      const [scmError, setScmError] = React.useState('')
+      const [scmLoading, setScmLoading] = React.useState(false)
+      const [scmBusy, setScmBusy] = React.useState('')
+      const [scmMessage, setScmMessage] = React.useState('')
+      /** Git comparison over the editor: `{phase, seq, group, path, before, after, ...}`. */
+      const [scmDiff, setScmDiff] = React.useState(undefined)
+      const [scmReload, setScmReload] = React.useState(0)
+      const scmSeq = React.useRef(0)
+      const scmAbort = React.useRef(undefined)
+      const scmDiffSeq = React.useRef(0)
       const [paletteOpen, setPaletteOpen] = React.useState(false)
       const [explorerSide, setExplorerSide] = React.useState('left')
       const [hidden, setHidden] = React.useState(false)
@@ -4351,6 +5332,9 @@ function IdeBody(props) {
           setTabs((previous) => previous.map((candidate) => (candidate.key === key ? { ...candidate, token: payload.token, dirty: false } : candidate)))
           setChanges((previous) => previous.map((change) => (change.path === target.path ? { ...change, saved: true } : change)))
           setStatus({ kind: 'ok', message: `Сохранено: ${target.name}` })
+          // A save is also a worktree change: the Git panel must not keep
+          // showing the previous bytes as if the file were still dirty.
+          setScmReload((value) => value + 1)
           return true
         } catch (cause) {
           setStatus({ kind: 'error', message: describeError(cause) })
@@ -6627,6 +7611,9 @@ function IdeBody(props) {
 
       const openAssistantDiff = async (turn, file) => {
         if (typeof sessionId !== 'string' || sessionId === '') return
+        // Only one comparison owns the stage: opening the assistant review
+        // closes a Git comparison and the other way round.
+        setScmDiff(undefined)
         // `files` keeps the whole turn in the footer list, so «Принять все» and
         // «Отменить все» act on the same set the pane shows.
         setDiffView({
@@ -6655,47 +7642,250 @@ function IdeBody(props) {
         }
       }
 
+      // ---------------------------------------------------------- git panel
+
+      // One status read at a time: the abort is what keeps a slow answer from a
+      // superseded session or a superseded request out of the panel.
+      const refreshScm = async () => {
+        if (typeof sessionId !== 'string' || sessionId === '') return
+        const ticket = (scmSeq.current += 1)
+        scmAbort.current?.abort()
+        const controller = new AbortController()
+        scmAbort.current = controller
+        setScmLoading(true)
+        try {
+          const snapshot = await call('scmStatus', { sessionId }, controller.signal)
+          if (ticket !== scmSeq.current || controller.signal.aborted) return
+          setScmStatus(snapshot)
+          setScmError('')
+        } catch (cause) {
+          if (ticket !== scmSeq.current || controller.signal.aborted || cause?.code === 'cancelled') return
+          setScmStatus(undefined)
+          setScmError(describeScmError(cause))
+        } finally {
+          if (ticket === scmSeq.current) setScmLoading(false)
+        }
+      }
+
+      React.useEffect(() => {
+        // A pane keeps no state of another session: the snapshot, the open
+        // comparison, the draft and a late answer all belong to one session.
+        scmDiffSeq.current += 1
+        scmAbort.current?.abort()
+        scmSeq.current += 1
+        setScmStatus(undefined)
+        setScmDiff(undefined)
+        setScmError('')
+        setScmBusy('')
+        setScmMessage('')
+        setScmLoading(false)
+      }, [sessionId])
+
+      React.useEffect(() => {
+        if (explorerMode !== 'scm' || typeof sessionId !== 'string' || sessionId === '') return undefined
+        const timer = window.setTimeout(() => {
+          void refreshScm()
+        }, 150)
+        return () => {
+          window.clearTimeout(timer)
+          scmAbort.current?.abort()
+        }
+        // The function reads the current session; only these three things ask
+        // for a new snapshot.
+      }, [explorerMode, sessionId, scmReload])
+
+      React.useEffect(() => {
+        if (explorerMode !== 'scm') return undefined
+        const onFocus = () => {
+          void refreshScm()
+        }
+        window.addEventListener('focus', onFocus)
+        return () => window.removeEventListener('focus', onFocus)
+      }, [explorerMode, sessionId])
+
+      React.useEffect(
+        () => () => {
+          scmAbort.current?.abort()
+        },
+        [],
+      )
+
+      const stageScm = async (row) => {
+        if (scmBusy !== '' || scmStatus === undefined || row === undefined) return
+        setScmBusy(row.key)
+        setScmError('')
+        try {
+          const payload = await call('scmStage', {
+            sessionId,
+            group: row.group,
+            path: row.path,
+            revision: scmStatus.revision,
+            token: row.entry.token,
+          })
+          scmAbort.current?.abort()
+          scmSeq.current += 1
+          setScmLoading(false)
+          setScmStatus(payload.status)
+        } catch (cause) {
+          setScmError(describeScmError(cause))
+          if (cause?.code === 'stale' || cause?.code === 'locked') setScmReload((value) => value + 1)
+        } finally {
+          setScmBusy('')
+        }
+      }
+
+      const unstageScm = async (row) => {
+        if (scmBusy !== '' || scmStatus === undefined || row === undefined) return
+        setScmBusy(row.key)
+        setScmError('')
+        try {
+          const payload = await call('scmUnstage', {
+            sessionId,
+            group: row.group,
+            path: row.path,
+            revision: scmStatus.revision,
+          })
+          scmAbort.current?.abort()
+          scmSeq.current += 1
+          setScmLoading(false)
+          setScmStatus(payload.status)
+        } catch (cause) {
+          setScmError(describeScmError(cause))
+          if (cause?.code === 'stale' || cause?.code === 'locked') setScmReload((value) => value + 1)
+        } finally {
+          setScmBusy('')
+        }
+      }
+
+      const commitScm = async () => {
+        const message = scmMessage.trim()
+        if (scmBusy !== '' || scmStatus === undefined || message === '') return
+        setScmBusy('commit')
+        setScmError('')
+        try {
+          const payload = await call('scmCommit', { sessionId, message, revision: scmStatus.revision })
+          scmAbort.current?.abort()
+          scmSeq.current += 1
+          setScmLoading(false)
+          setScmStatus(payload.status)
+          setScmMessage('')
+          setScmReload((value) => value + 1)
+          setStatus({ kind: 'ok', message: `Зафиксировано: ${String(payload.head ?? '').slice(0, 7)}` })
+        } catch (cause) {
+          setScmError(describeScmError(cause))
+          if (cause?.code === 'stale' || cause?.code === 'locked') setScmReload((value) => value + 1)
+        } finally {
+          setScmBusy('')
+        }
+      }
+
+      const openScmRow = async (row) => {
+        if (scmStatus === undefined || row === undefined) return
+        setDiffView(undefined)
+        if (compactRef.current) setShowTree(false)
+        const seq = (scmDiffSeq.current += 1)
+        setScmDiff({ phase: 'pending', source: 'git', seq, group: row.group, path: row.path })
+        try {
+          const payload = await call('scmDiff', {
+            sessionId,
+            group: row.group,
+            path: row.path,
+            revision: scmStatus.revision,
+          })
+          if (seq !== scmDiffSeq.current) return
+          setScmDiff({ ...payload.diff, phase: 'ready', source: 'git', seq })
+        } catch (cause) {
+          if (seq !== scmDiffSeq.current || cause?.code === 'cancelled') return
+          setScmDiff({ phase: 'failed', source: 'git', seq, group: row.group, path: row.path, beforeLabel: '', afterLabel: '', error: describeScmError(cause) })
+          if (cause?.code === 'stale') setScmReload((value) => value + 1)
+        }
+      }
+
+      const openScmCommitFile = async (commit, file) => {
+        if (commit === undefined || file === undefined) return
+        setDiffView(undefined)
+        if (compactRef.current) setShowTree(false)
+        const seq = (scmDiffSeq.current += 1)
+        setScmDiff({ phase: 'pending', source: 'git', seq, group: 'commit', path: file.path, oid: commit.oid })
+        try {
+          const payload = await call('scmCommitDiff', {
+            sessionId,
+            oid: commit.oid,
+            base: commit.base,
+            path: file.path,
+          })
+          if (seq !== scmDiffSeq.current) return
+          setScmDiff({ ...payload.diff, phase: 'ready', source: 'git', seq })
+        } catch (cause) {
+          if (seq !== scmDiffSeq.current || cause?.code === 'cancelled') return
+          setScmDiff({ phase: 'failed', source: 'git', seq, group: 'commit', path: file.path, error: describeScmError(cause) })
+        }
+      }
+
+      const jumpDiff = (direction) => {
+        const info = runtime.current.diffEditor
+        if (info === undefined || info === null) return
+        const changes = typeof info.editor.getLineChanges === 'function' ? info.editor.getLineChanges() : undefined
+        if (!Array.isArray(changes) || changes.length === 0) return
+        const modified = info.editor.getModifiedEditor()
+        if (modified === undefined) return
+        const line = modified.getPosition()?.lineNumber ?? 1
+        let target
+        if (direction === 'next') {
+          target = changes.find((change) => change.modifiedStartLineNumber > line) ?? changes[0]
+        } else {
+          const earlier = changes.filter((change) => change.modifiedStartLineNumber < line)
+          target = earlier.length > 0 ? earlier[earlier.length - 1] : changes[changes.length - 1]
+        }
+        if (target === undefined) return
+        modified.revealLineInCenter(target.modifiedStartLineNumber)
+        modified.setPosition({ lineNumber: target.modifiedStartLineNumber, column: 1 })
+        modified.focus()
+      }
+
       // The explorer pane is far too narrow for two columns, so the comparison
       // opens over the editor the way Cursor shows a change before accepting it.
-      const diffKey = diffView === undefined ? '' : `${diffView.phase}:${diffView.seq}:${diffView.index}`
+      // A Git comparison takes precedence; both shells share this one editor.
+      const activeDiff = scmDiff !== undefined ? scmDiff : diffView
+      const diffKey =
+        activeDiff === undefined
+          ? ''
+          : scmDiff !== undefined
+            ? `git:${scmDiff.phase}:${scmDiff.seq}:${scmDiff.group}:${scmDiff.path}`
+            : `agent:${diffView.phase}:${diffView.seq}:${diffView.index}`
+      const diffUid = scmDiff !== undefined ? `git-${scmDiff.seq}` : `agent-${diffView?.seq}-${diffView?.index}`
       React.useEffect(() => {
         const container = diffContainerRef.current
-        if (!monaco || diffView === undefined || diffView.phase !== 'ready' || container === undefined) return undefined
-        const language = typeof diffView.language === 'string' && diffView.language !== '' ? diffView.language : 'plaintext'
-        const uid = `${diffView.seq}-${diffView.index}`
+        const view = activeDiff
+        const textual = view !== undefined && (view.kind === undefined || view.kind === 'text')
+        if (!monaco || view === undefined || view.phase !== 'ready' || !textual || container === undefined) return undefined
+        const language = typeof view.language === 'string' && view.language !== '' ? view.language : 'plaintext'
         const original = monaco.editor.createModel(
-          String(diffView.before ?? ''),
+          String(view.before ?? ''),
           language,
-          monaco.Uri.parse(`inmemory://dsh-ide/diff-before/${uid}`),
+          monaco.Uri.parse(`inmemory://dsh-ide/diff-before/${diffUid}`),
         )
         const modified = monaco.editor.createModel(
-          String(diffView.after ?? ''),
+          String(view.after ?? ''),
           language,
-          monaco.Uri.parse(`inmemory://dsh-ide/diff-after/${uid}`),
+          monaco.Uri.parse(`inmemory://dsh-ide/diff-after/${diffUid}`),
         )
         const editor = monaco.editor.createDiffEditor(container, {
           readOnly: true,
-          // The two-column view is the desktop default, but on a phone each
-          // column would be half of an already narrow pane, so compact turns on
-          // the unified view instead.
           renderSideBySide: !compact,
-          useInlineViewWhenSpaceIsLimited: compact,
-          renderSideBySideInlineBreakpoint: compact ? 900 : 0,
-          // Same wrapping as the request: long lines must not force a horizontal
-          // scroll in a pane that is shown side by side on every width.
+          // A docked pane can be desktop-sized while the stage left for the
+          // diff is narrow (the change list takes its own column). Let Monaco
+          // fall back to the unified view by width, not by device class.
+          useInlineViewWhenSpaceIsLimited: true,
+          renderSideBySideInlineBreakpoint: 900,
           wordWrap: 'on',
           diffWordWrap: 'on',
-          // The overview ruler is what shows where the changes are on the
-          // scrollbar; without it the two columns give no map of the diff.
           renderOverviewRuler: true,
           overviewRulerBorder: false,
           renderIndicators: true,
           automaticLayout: true,
           ignoreTrimWhitespace: false,
           scrollBeyondLastLine: false,
-          // `themeName()` answers 'dark'/'light', which are not Monaco theme
-          // ids, so the diff fell back to the default light theme while the
-          // plain editor already used vs-dark.
           theme: themeName() === 'dark' ? 'vs-dark' : 'vs',
         })
         editor.setModel({ original, modified })
@@ -7445,9 +8635,32 @@ function IdeBody(props) {
               'button',
               {
                 type: 'button',
-                className: `dsh-ide-activity-button${showTree ? ' dsh-ide-activity-button-active' : ''}`,
-                title: showTree ? 'Скрыть проводник' : 'Показать проводник',
-                onClick: () => setShowTree(!showTree),
+                className: `dsh-ide-activity-button${explorerMode === 'scm' && showTree ? ' dsh-ide-activity-button-active' : ''}`,
+                title: explorerMode === 'scm' ? 'Показать проводник' : 'Система контроля версий',
+                'aria-label': 'Система контроля версий',
+                onClick: () => {
+                  setExplorerMode('scm')
+                  setShowTree(true)
+                  setChangesOpen(false)
+                  setSearchOpen(false)
+                },
+              },
+              h(ScmBranchIcon, { size: 18 }),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: `dsh-ide-activity-button${explorerMode === 'files' && showTree ? ' dsh-ide-activity-button-active' : ''}`,
+                title: explorerMode === 'files' && showTree ? 'Скрыть проводник' : 'Проводник',
+                onClick: () => {
+                  if (explorerMode !== 'files') {
+                    setExplorerMode('files')
+                    setShowTree(true)
+                    return
+                  }
+                  setShowTree(!showTree)
+                },
               },
               h(
                 'svg',
@@ -7468,6 +8681,7 @@ function IdeBody(props) {
                 title: 'Поиск в файлах (Ctrl+Shift+F)',
                 'aria-label': 'Поиск в файлах',
                 onClick: () => {
+                  setExplorerMode('files')
                   setShowTree(true)
                   setChangesOpen(false)
                   setSearchOpen(true)
@@ -7483,6 +8697,7 @@ function IdeBody(props) {
                 title: changes.length === 0 ? 'Изменения этой сессии' : `Изменения этой сессии: ${changes.length}`,
                 'aria-label': 'Изменения',
                 onClick: () => {
+                  setExplorerMode('files')
                   setShowTree(true)
                   setSearchOpen(false)
                   setChangesOpen((open) => !open)
@@ -7526,7 +8741,50 @@ function IdeBody(props) {
                   }`,
                   style: compact ? undefined : { width: `${explorerWidth}px`, order: explorerSide === 'left' ? 0 : 2 },
                 },
-                h(Explorer, {
+                explorerMode === 'scm'
+                  ? h(SourceControl, {
+                      key: sessionId,
+                      sessionId,
+                      status: scmStatus,
+                      error: scmError,
+                      loading: scmLoading,
+                      message: scmMessage,
+                      onMessage: setScmMessage,
+                      committing: scmBusy === 'commit',
+                      busy: scmBusy,
+                      onCommit: commitScm,
+                      onRefresh: () => {
+                        void refreshScm()
+                      },
+                      onClose: () => setShowTree(false),
+                      activePath: activeTab === undefined ? '' : activeTab.path,
+                      unsavedPaths: new Set(tabs.filter((tab) => tab.dirty === true).map((tab) => tab.path)),
+                      onOpenRow: (row) => {
+                        void openScmRow(row)
+                      },
+                      onStageRow: (row) => {
+                        void stageScm(row)
+                      },
+                      onUnstageRow: (row) => {
+                        void unstageScm(row)
+                      },
+                      onOpenCommitFile: (commit, file) => {
+                        void openScmCommitFile(commit, file)
+                      },
+                      onBranchChanged: (payload) => {
+                        if (payload?.status !== undefined) {
+                          scmDiffSeq.current += 1
+                          scmAbort.current?.abort()
+                          scmSeq.current += 1
+                          setScmStatus(payload.status)
+                          setScmLoading(false)
+                          setScmBusy('')
+                        }
+                        setScmDiff(undefined)
+                        setScmError('')
+                      },
+                    })
+                  : h(Explorer, {
                   sessionId,
                   hidden,
                   reloadSignal,
@@ -7783,7 +9041,14 @@ function IdeBody(props) {
                         ),
                         h(
                           'button',
-                          { type: 'button', className: 'dsh-ide-button', onClick: () => setShowTree(true) },
+                          {
+                            type: 'button',
+                            className: 'dsh-ide-button',
+                            onClick: () => {
+                              setExplorerMode('files')
+                              setShowTree(true)
+                            },
+                          },
                           'Проводник',
                         ),
                       )
@@ -7834,11 +9099,28 @@ function IdeBody(props) {
                     h('pre', { className: 'dsh-ide-stage-fallback-code' }, activeTab.text),
                   )
                 : null,
-              // Side-by-side comparison of one assistant file, drawn over the
-              // editor: two panes need the width, the explorer pane has none.
-            diffView === undefined
-              ? null
-              : h(DiffReview, {
+              // Side-by-side comparison of one assistant file or one Git change,
+              // drawn over the editor: two panes need the width, the explorer
+              // pane has none. Only one comparison is open at a time.
+              scmDiff !== undefined
+                ? h(GitDiff, {
+                    view: scmDiff,
+                    dirty: scmDiff.group !== 'commit' && tabs.some((tab) => tab.path === scmDiff.path && tab.dirty === true),
+                    onClose: () => {
+                      setScmDiff(undefined)
+                      if (compactRef.current) setShowTree(true)
+                    },
+                    onOpenFile: (path) => {
+                      setScmDiff(undefined)
+                      void openFile(path, { activate: true })
+                    },
+                    onPrevious: () => jumpDiff('previous'),
+                    onNext: () => jumpDiff('next'),
+                    containerRef: diffContainerRef,
+                  })
+                : diffView === undefined
+                  ? null
+                  : h(DiffReview, {
                   view: diffView,
                   work: assistantWork,
                   onAccept: (file) => acceptAssistant(diffView.turn, file),
@@ -8249,6 +9531,192 @@ function IdeBody(props) {
   font:400 10.5px/1.7 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-change-revert:hover { border-color:var(--ide-accent); }
 .dsh-ide-change-error { color:#f48771; }
+.dsh-ide-scm { min-height:0; }
+.dsh-ide-scm-branch { display:flex; align-items:center; gap:6px; width:100%; padding:5px 10px; flex:0 0 auto;
+  border:0; border-bottom:1px solid var(--ide-border); background:var(--ide-panel-2); color:inherit;
+  cursor:pointer; text-align:left; font:inherit; min-width:0; }
+.dsh-ide-scm-branch:hover { background:var(--ide-hover); }
+.dsh-ide-scm-branch:focus-visible { outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-scm-branch-icon { display:flex; color:var(--ide-accent); flex:0 0 auto; }
+.dsh-ide-scm-branch-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-scm-branch-head { margin-left:auto; color:var(--ide-fg-dim);
+  font:400 10px/1.4 var(--dsh-font-mono, ui-monospace, monospace); flex:0 0 auto; }
+.dsh-ide-scm-branch-caret { color:var(--ide-fg-dim); flex:0 0 auto; font-size:10px; }
+.dsh-ide-scm-branch-open .dsh-ide-scm-branch-caret { color:var(--ide-accent); }
+.dsh-ide-scm-branches { flex:0 0 auto; max-height:44%; overflow:auto; padding:6px 10px 8px;
+  border-bottom:1px solid var(--ide-border); background:var(--ide-panel-2); }
+.dsh-ide-scm-branches-head { display:flex; align-items:center; justify-content:space-between; gap:8px;
+  margin-bottom:3px; color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px;
+  font:600 10px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-branch-list { display:flex; flex-direction:column; gap:1px; }
+.dsh-ide-scm-branch-row { display:flex; align-items:center; gap:2px; border-radius:3px; }
+.dsh-ide-scm-branch-row:hover { background:var(--ide-hover); }
+.dsh-ide-scm-branch-row-current { background:var(--ide-select); }
+.dsh-ide-scm-branch-pick { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px;
+  padding:3px 4px; border:0; background:transparent; color:inherit; cursor:pointer;
+  text-align:left; font:inherit; }
+.dsh-ide-scm-branch-pick:disabled { cursor:default; }
+.dsh-ide-scm-branch-pick:focus-visible { outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-scm-branch-check { flex:0 0 12px; color:var(--ide-accent);
+  font:700 10px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-branch-option-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-scm-branch-badge { margin-left:auto; padding:0 4px; border:1px solid var(--ide-border); border-radius:6px;
+  color:var(--ide-fg-dim); font:400 9px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-branch-delete { flex:0 0 auto; width:20px; height:20px; padding:0; border:0; border-radius:3px;
+  background:transparent; color:var(--ide-fg-dim); cursor:pointer;
+  font:600 13px/1 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-branch-delete:hover:not(:disabled) { background:var(--ide-hover); color:var(--ide-error); }
+.dsh-ide-scm-branch-delete:disabled { opacity:.5; cursor:default; }
+.dsh-ide-scm-branch-confirm { display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:4px;
+  border:1px solid var(--ide-error); border-radius:4px; margin-top:2px; }
+.dsh-ide-scm-branch-confirm-text { flex:1 1 100%; overflow-wrap:anywhere;
+  font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-branch-danger { padding:2px 7px; border:1px solid var(--ide-error); border-radius:3px;
+  background:transparent; color:var(--ide-error); cursor:pointer;
+  font:600 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-branch-danger:disabled { opacity:.5; cursor:default; }
+.dsh-ide-scm-new-branch { display:flex; flex-wrap:wrap; align-items:center; gap:4px; margin-top:6px; }
+.dsh-ide-scm-branch-input { flex:1 1 120px; min-width:0; padding:2px 5px; color:var(--ide-fg);
+  background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:3px; outline:none;
+  font:400 11px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-branch-input:focus { border-color:var(--ide-accent); }
+.dsh-ide-scm-new-branch-submit { padding:2px 8px; border:1px solid var(--ide-accent); border-radius:3px;
+  background:var(--ide-accent); color:#ffffff; cursor:pointer;
+  font:600 10.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-new-branch-submit:disabled { opacity:.5; cursor:default; }
+.dsh-ide-scm-new-branch-button { padding:2px 0; border:0; background:transparent; color:var(--ide-accent);
+  cursor:pointer; text-align:left; font:400 11px/1.6 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-new-branch-button:hover { text-decoration:underline; }
+.dsh-ide-scm-scroll { flex:1 1 auto; min-height:0; overflow:auto; }
+.dsh-ide-scm-commit { padding:8px 10px; border-bottom:1px solid var(--ide-border); }
+.dsh-ide-scm-message { width:100%; min-height:48px; resize:vertical; padding:5px 6px; color:var(--ide-fg);
+  background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; outline:none;
+  font:400 11.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-message:focus { border-color:var(--ide-accent); }
+.dsh-ide-scm-commit-button { width:100%; margin-top:4px; }
+.dsh-ide-scm-hint { margin-top:3px; color:var(--ide-fg-dim);
+  font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-section { border-top:1px solid var(--ide-border); }
+.dsh-ide-scm-section-head { display:flex; align-items:center; justify-content:space-between; gap:8px;
+  padding:6px 10px 2px; color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px;
+  font:600 10px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-section-count { padding:0 5px; border-radius:8px; background:var(--ide-hover); letter-spacing:0; }
+.dsh-ide-scm-row { display:flex; align-items:center; gap:2px; padding:1px 4px 1px 8px; }
+.dsh-ide-scm-row:hover { background:var(--ide-hover); }
+.dsh-ide-scm-row-active { background:var(--ide-select); }
+.dsh-ide-scm-row-main { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px; padding:3px 0;
+  border:0; background:transparent; color:inherit; text-align:left; cursor:pointer; font:inherit; }
+.dsh-ide-scm-row-main:focus-visible { outline:1px solid var(--ide-accent); outline-offset:-1px; border-radius:3px; }
+.dsh-ide-scm-letter { flex:0 0 13px; width:13px; text-align:center; font:700 10px/1.6 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-letter[data-letter="A"], .dsh-ide-scm-letter[data-letter="?"] { color:#89d185; }
+.dsh-ide-scm-letter[data-letter="M"] { color:#dcdcaa; }
+.dsh-ide-scm-letter[data-letter="D"] { color:#f48771; }
+.dsh-ide-scm-letter[data-letter="R"], .dsh-ide-scm-letter[data-letter="C"] { color:#9cdcfe; }
+.dsh-ide-scm-letter[data-letter="T"], .dsh-ide-scm-letter[data-letter="U"] { color:#c586c0; }
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="A"],
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="?"] { color:#1a7f37; }
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="M"] { color:#8a5a00; }
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="D"] { color:#cf222e; }
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="R"],
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="C"] { color:#0969da; }
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="T"],
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-letter[data-letter="U"] { color:#8250df; }
+.dsh-ide-root[data-theme="light"] .dsh-ide-scm-graph-svg { filter:brightness(0.68) saturate(1.05); }
+.dsh-ide-scm-row-text { min-width:0; display:flex; flex-direction:column; }
+.dsh-ide-scm-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-scm-dir { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ide-fg-dim);
+  font:400 10px/1.35 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-dirty { margin-left:3px; color:var(--ide-accent); }
+.dsh-ide-scm-action { flex:0 0 auto; width:22px; height:22px; padding:0; border:1px solid transparent; border-radius:3px;
+  background:transparent; color:var(--ide-fg-dim); cursor:pointer;
+  font:600 13px/1 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-action:hover:not(:disabled) { border-color:var(--ide-border); background:var(--ide-panel-2); color:var(--ide-fg); }
+.dsh-ide-scm-action:disabled { opacity:.5; cursor:default; }
+.dsh-ide-scm-conflict-note { flex:0 0 auto; color:var(--ide-fg-dim);
+  font:400 9.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-note { padding:5px 10px; color:var(--ide-fg-dim); background:var(--ide-panel-2);
+  border-bottom:1px solid var(--ide-border); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-error { padding:6px 10px; color:var(--ide-error);
+  font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-link { margin-left:6px; border:0; background:transparent; padding:0; color:var(--ide-accent);
+  cursor:pointer; font:inherit; text-decoration:underline; }
+.dsh-ide-scm-clean { padding:10px; color:var(--ide-fg-dim); }
+.dsh-ide-scm-history { flex:0 0 auto; max-height:46%; display:flex; flex-direction:column; min-height:0;
+  border-top:1px solid var(--ide-border); }
+.dsh-ide-scm-history-toggle { display:flex; align-items:center; gap:6px; width:100%; padding:5px 10px; border:0;
+  background:var(--ide-panel-2); color:inherit; cursor:pointer; text-align:left;
+  font:600 10px/1.5 var(--dsh-font-ui, system-ui, sans-serif); text-transform:uppercase; letter-spacing:.4px; }
+.dsh-ide-scm-history-toggle:hover { background:var(--ide-hover); }
+.dsh-ide-scm-history-toggle:focus-visible { outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-scm-history-title { color:var(--ide-fg-dim); }
+.dsh-ide-scm-history-count { color:var(--ide-fg-dim); }
+.dsh-ide-scm-history-chevron { margin-left:auto; color:var(--ide-fg-dim); }
+.dsh-ide-scm-graph { min-height:0; display:flex; flex-direction:column; }
+.dsh-ide-scm-graph-list { min-height:0; overflow:auto; }
+.dsh-ide-scm-graph-row { display:flex; align-items:stretch; border-top:1px solid rgba(60, 60, 60, .45); }
+.dsh-ide-scm-graph-row:hover { background:var(--ide-hover); }
+.dsh-ide-scm-graph-row-active { background:var(--ide-select); box-shadow:inset 3px 0 0 var(--ide-accent); }
+.dsh-ide-scm-graph-row-active .dsh-ide-scm-graph-subject { font-weight:600; }
+.dsh-ide-scm-selected .dsh-ide-scm-section-head { padding-top:6px; }
+.dsh-ide-scm-selected .dsh-ide-scm-commit-summary { border-bottom:1px solid var(--ide-border); }
+.dsh-ide-scm-selected .dsh-ide-scm-back { margin-top:5px; }
+.dsh-ide-scm-graph-svg { flex:0 0 auto; display:block; }
+.dsh-ide-scm-graph-commit { flex:1 1 auto; min-width:0; display:flex; flex-direction:column; align-items:flex-start;
+  gap:1px; padding:2px 6px 2px 2px; border:0; background:transparent; color:inherit; cursor:pointer;
+  text-align:left; font:inherit; }
+.dsh-ide-scm-graph-commit:focus-visible { outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-scm-graph-subject { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-scm-graph-meta { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  color:var(--ide-fg-dim); font:400 9.5px/1.4 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-graph-refs { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  padding:0 4px; margin-top:1px; border-radius:3px; background:var(--ide-active); color:var(--ide-fg);
+  font:400 9.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-graph-note { padding:6px 10px; color:var(--ide-fg-dim);
+  font:400 10.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-more { margin:6px 10px; padding:3px 8px; border:1px solid var(--ide-border); border-radius:4px;
+  background:var(--ide-panel); color:var(--ide-fg); cursor:pointer;
+  font:400 11px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-more:hover:not(:disabled) { border-color:var(--ide-accent); }
+.dsh-ide-scm-more:disabled { opacity:.5; cursor:default; }
+.dsh-ide-scm-back { border:0; background:transparent; padding:0; color:var(--ide-accent); cursor:pointer;
+  font:inherit; text-transform:none; letter-spacing:0; }
+.dsh-ide-scm-commit-summary { padding:8px 10px; border-bottom:1px solid var(--ide-border); }
+.dsh-ide-scm-commit-subject { font-weight:600; overflow-wrap:anywhere; }
+.dsh-ide-scm-commit-oid { margin-top:2px; color:var(--ide-fg-dim);
+  font:400 10px/1.4 var(--dsh-font-mono, ui-monospace, monospace); overflow-wrap:anywhere; }
+.dsh-ide-scm-commit-base, .dsh-ide-scm-parent { display:flex; align-items:center; gap:6px; margin-top:6px;
+  color:var(--ide-fg-dim); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-parent { flex-direction:column; align-items:stretch; gap:2px; }
+.dsh-ide-scm-parent select { flex:1 1 auto; min-width:0; padding:2px 4px; color:var(--ide-fg);
+  background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:3px;
+  font:400 10.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-files { overflow:auto; padding:4px 0; }
+.dsh-ide-scm-file { display:flex; align-items:center; gap:6px; width:100%; padding:3px 10px; border:0;
+  background:transparent; color:inherit; cursor:pointer; text-align:left; font:inherit; }
+.dsh-ide-scm-file:hover { background:var(--ide-hover); }
+.dsh-ide-scm-file:focus-visible { outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-scm-file-path { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font:400 11px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-gitdiff-head { flex-wrap:wrap; row-gap:4px; align-items:flex-start; padding:6px 8px; }
+.dsh-ide-gitdiff-titles { display:flex; align-items:center; gap:6px; min-width:0; flex:1 1 240px; }
+.dsh-ide-gitdiff-caption { display:flex; flex-direction:column; gap:1px; min-width:0; }
+.dsh-ide-gitdiff-caption .dsh-ide-diffview-title { max-width:100%; }
+.dsh-ide-gitdiff-caption .dsh-ide-diffview-sub { max-width:none; }
+.dsh-ide-gitdiff-actions { display:flex; align-items:center; gap:4px; margin-left:auto; flex:0 0 auto; }
+.dsh-ide-diffview-reason { flex:1 1 auto; display:flex; align-items:center; justify-content:center; padding:20px;
+  color:var(--ide-fg-dim); text-align:center;
+  font:400 12px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-root[data-compact] .dsh-ide-scm-row { padding-top:4px; padding-bottom:4px; }
+.dsh-ide-root[data-compact] .dsh-ide-scm-row-main { min-height:34px; }
+.dsh-ide-root[data-compact] .dsh-ide-scm-action { width:34px; height:34px; }
+.dsh-ide-root[data-compact] .dsh-ide-scm-branch { min-height:34px; }
+.dsh-ide-root[data-compact] .dsh-ide-scm-branch-pick { min-height:34px; }
+.dsh-ide-root[data-compact] .dsh-ide-scm-branch-delete { width:34px; height:34px; }
+.dsh-ide-root[data-compact] .dsh-ide-scm-branches { max-height:52%; }
+.dsh-ide-root[data-compact] .dsh-ide-diffview-action { min-height:32px; }
+.dsh-ide-root[data-compact] .dsh-ide-scm-history { max-height:52%; }
+.dsh-ide-root[data-compact] .dsh-ide-gitdiff .dsh-ide-diffview-title,
+.dsh-ide-root[data-compact] .dsh-ide-gitdiff .dsh-ide-diffview-sub { max-width:100%; }
 .dsh-ide-palette-layer { position:absolute; inset:0; z-index:30; display:flex; justify-content:center;
   align-items:flex-start; padding-top:8vh; background:rgba(0, 0, 0, .35); }
 .dsh-ide-palette { width:min(560px, 92%); max-height:70%; display:flex; flex-direction:column;
@@ -8692,6 +10160,9 @@ function IdeBody(props) {
 .dsh-ide-root[data-compact] .dsh-ide-diffview-title { flex:1 1 100%; font-size:12.5px; }
 .dsh-ide-root[data-compact] .dsh-ide-diffview-sub,
 .dsh-ide-root[data-compact] .dsh-ide-diffview-spacer { display:none; }
+/* The Git comparison must name both sides even on a phone; only the
+   assistant summary can drop that line. */
+.dsh-ide-root[data-compact] .dsh-ide-gitdiff .dsh-ide-diffview-sub { display:block; flex:1 1 100%; max-width:100%; }
 .dsh-ide-root[data-compact] .dsh-ide-diffview-action { min-height:34px; padding:6px 9px; }
 .dsh-ide-root[data-compact] .dsh-ide-diffview-files { max-height:40%; }
 .dsh-ide-root[data-compact] .dsh-ide-diffview-file { flex-wrap:wrap; gap:4px; padding:6px 8px; }
@@ -8738,6 +10209,9 @@ function IdeBody(props) {
     // ------------------------------------------------------------------ apply
 
     const plugin = {
+      // Small, pure pieces of the Git panel are testable without a browser;
+      // the module loader gives the tests exactly this object.
+      __test: { layoutGraph, scmSections, scmGroupsOf, scmLetter, describeScmError },
       inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'theme'],
       apply(ctx) {
         services = {
@@ -8767,6 +10241,24 @@ function IdeBody(props) {
         }
 
         ctx.effect(injectStyles, 'dsh-ide: styles')
+
+        // `ctx.theme` owns the preference but exposes no subscribe; the Client
+        // context emits `theme/change` instead. Bridge it to the mounted pane.
+        ctx.effect(() => {
+          if (typeof ctx.on !== 'function') return () => {}
+          try {
+            const dispose = ctx.on('theme/change', () => {
+              try {
+                window.dispatchEvent(new Event(THEME_EVENT))
+              } catch (cause) {
+                // A non-browser host has no window; the next render picks it up.
+              }
+            })
+            return typeof dispose === 'function' ? dispose : () => {}
+          } catch (cause) {
+            return () => {}
+          }
+        }, 'dsh-ide: theme change')
 
         // Chips link files the way `@` does, but carry their line range into
         // the sent message. The source is registered eagerly when the shell's

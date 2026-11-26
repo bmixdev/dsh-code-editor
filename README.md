@@ -36,10 +36,22 @@ VS Code внутри правой панели DeepSeek Harness. Своё дер
   хранилище секретов DSH. Разрешение отправлять текст модели выдаётся один раз на
   рабочую папку: в редакторе появляется полоса «Включить» / «Не сейчас», а само
   разрешение запоминается в `~/.dsh/code-editor.json` и переживает перезапуск DSH.
-- **Вид VS Code.** Узкая панель активности слева (проводник, поиск в файлах,
+- **Вид VS Code.** Узкая панель активности слева (ветка Git, проводник, поиск в файлах,
   изменения, настройки), заголовок секции «ПРОВОДНИК» с действиями, вкладки как в VS Code,
   синий статус-бар, меню `☰` с командами «Сохранить», «Сохранить всё»,
   «Закрыть вкладку», «Открыть файл по имени», «Настройки IDE».
+- **Система контроля версий.** Кнопка с веткой на панели активности показывает
+  состояние рабочей папки: ветка и HEAD, подготовленные файлы, изменения на диске
+  и конфликты. Файл открывается сравнением «индекс → диск» или «HEAD → индекс»,
+  `+` и `−` готовят и снимают файлы, сообщение и кнопка «Зафиксировать» создают
+  локальный коммит только из индекса. Внизу — сворачиваемый граф истории с
+  ветками и слияниями: выбранный коммит подсвечивается, а его файлы показываются
+  в том же списке «Изменения»; для слияния можно выбрать родителя. Кнопка ветки
+  открывает список локальных веток — переключение, создание с переключением и
+  безопасное удаление через `git branch -d` (без принудительного удаления).
+  Панель сама обновляется при открытии, возврате фокуса и после сохранения в IDE,
+  плюс кнопка «Обновить». Запись недоступна в сессии «только чтение», а Git не
+  запускается для удалённых и виртуальных рабочих папок.
 - **Статус-бар.** Язык файла, позиция курсора, переводы строк, UTF-8, режим
   «только чтение», текущая модель автодополнения.
 - **Сохранение состояния.** Открытые вкладки, активный файл, ширина дерева и
@@ -345,10 +357,14 @@ npm run test:all     # оба набора
 
 `tests/host.test.mjs` поднимает фейковый контекст, собирает маршруты `/api/ide/*`
 и проверяет дерево, быстрый поиск, открытие/сохранение, состояние сессии, общие
-настройки и деградацию без хранилища ключей. `tests/client.test.mjs` загружает
+настройки и деградацию без хранилища ключей. `tests/scm.test.mjs` собирает
+настоящие временные репозитории и проверяет чтение состояния, сравнение сторон,
+подготовку, частичный коммит, историю с ветками и слияниями, а также создание,
+переключение и безопасное удаление веток. `tests/client.test.mjs` загружает
 бандл через `__ModuleLoader__` с заглушкой React и проверяет регистрации: тип
-вкладки, слоты, кнопку «IDE», защиту от закрытия грязных вкладок и заголовок
-вкладки. `tests/tab.test.mjs` проверяет механику подсказок без редактора: план
+вкладки, слоты, кнопку «IDE», защиту от закрытия грязных вкладок, заголовок
+вкладки, раскладку графа и разбор групп изменений. `tests/tab.test.mjs` проверяет
+механику подсказок без редактора: план
 вставки и замены, эхо уже набранного текста, CRLF, проверки «плохих случаев» и
 границы слова для `Ctrl+→`.
 
@@ -370,9 +386,10 @@ npm run test:all     # оба набора
   search.js           Поиск по содержимому рабочей папки (Host, локальный)
   proposal.js         Проверенная правка фрагмента для «Изменить выделение…»
   agentChanges.js     Индекс ходов workspace/changes для панели «Изменения» (Host)
+  scm.js              Git: состояние, сравнения, индекс, коммит и история (Host)
   vendor/vs/          Сборка Monaco
-  tests/              host.test.mjs, client.test.mjs, tab.test.mjs, edits.test.mjs,
-                      proposal.test.mjs, search.test.mjs
+  tests/              host.test.mjs, scm.test.mjs, client.test.mjs, tab.test.mjs, edits.test.mjs,
+                      proposal.test.mjs, search.test.mjs, agentChanges.test.mjs
   editor/             @local/dsh-code-editor — вспомогательный бандл
     index.js          Host: маршруты /api/code-editor/*, раздача Monaco
     client.js         Клиент: вкладка редактора, дерево, настройки
@@ -392,15 +409,20 @@ npm run test:all     # оба набора
   разных сессиях независимы.
 - Быстрый поиск `Ctrl+P` ищет по путям; поиск по содержимому — отдельная панель
   «Поиск в файлах» (литеральная подстрока, без регулярных выражений и индекса).
-- Diff-режим, рефакторинги и LSP не входят в эту версию.
+- Сравнение показывает две версии целиком; правки по фрагментам, `git push`,
+  `reset --hard`, `clean` и удаление неотслеживаемых файлов из панели не входят в
+  эту версию.
+- Рефакторинги, LSP и запуск тестов из IDE не входят в эту версию.
 
 ## English summary
 
 `@local/dsh-ide` is the main plugin of this repository: a VS Code style IDE in
 the DeepSeek Harness right sidebar, with an explorer tree, file tabs, quick open
-(`Ctrl+P`), a Monaco editor with AI inline suggestions, a VS Code style menu and
-status bar, and per-session layout state. It opens from the IDE button on the
-Start tab, in the composer row, or in the file/Files tab actions. Install with
+(`Ctrl+P`), a Monaco editor with AI inline suggestions, a Source Control panel
+(status, per-side diffs, staging and local commits, history graph), a VS Code
+style menu and status bar, and per-session layout state. It opens from the IDE
+button on the Start tab, in the composer row, or in the file/Files tab actions.
+Install with
 `plugin_manager action=install_bundle target=<repository root>`; run tests with
 `npm test`. The repository also ships a secondary, optional Monaco editor bundle
 in `editor/` (`@local/dsh-code-editor`, opened from the Edit button in the

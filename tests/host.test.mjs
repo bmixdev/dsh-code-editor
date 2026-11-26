@@ -6,6 +6,7 @@
  * connection layer does (a POST with a JSON body).
  */
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -25,6 +26,18 @@ const ROUTES = [
   'agentChangeDiff',
   'agentChangeRestore',
   'agentChangeText',
+  'scmStatus',
+  'scmDiff',
+  'scmStage',
+  'scmUnstage',
+  'scmCommit',
+  'scmHistory',
+  'scmCommitFiles',
+  'scmCommitDiff',
+  'scmBranches',
+  'scmCreateBranch',
+  'scmSwitchBranch',
+  'scmDeleteBranch',
   'resolve',
   'tree',
   'files',
@@ -56,7 +69,7 @@ async function makeWorkspace() {
   return root
 }
 
-function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1', models = [{ id: 'fixture-model', name: 'Fixture model' }], workspaceChanges }) {
+function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1', models = [{ id: 'fixture-model', name: 'Fixture model' }], workspaceChanges, policyMode = 'workspace-write' }) {
   // The catalog is cached per provider for five minutes, so one test's catalog
   // would leak into the next one and hide a model it added.
   resetModelCatalog()
@@ -89,7 +102,7 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
     },
     sessions: { get: (id) => (id === SESSION_ID ? session : undefined), list: () => [session] },
     workingDirectory: { get: () => root },
-    sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: root }) },
+    sandboxPolicy: { resolve: () => ({ mode: policyMode, workspaceRoot: root }) },
     agentDefaultModel: { currentSelection: () => selection },
     llm: {
       listProviders: () => [{ id: 'fixture', name: 'Fixture' }],
@@ -1140,6 +1153,259 @@ test('a turn file is served as full before and after texts for a real diff view'
     await writeFile(target, 'export const answer = 44\n', 'utf8')
     const conflict = await app.call('agentChangeText', { sessionId: SESSION_ID, seq: 6, index: 0 })
     assert.equal(errorCode(conflict.body), 'conflict')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/** A repository inside a test workspace, with identity and no user config. */
+function initRepository(root) {
+  const run = (args) =>
+    execFileSync(
+      'git',
+      ['-c', 'core.autocrlf=false', '-c', 'commit.gpgsign=false', ...args],
+      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    )
+  run(['init', '-q'])
+  run(['symbolic-ref', 'HEAD', 'refs/heads/main'])
+  run(['config', 'user.name', 'Тест'])
+  run(['config', 'user.email', 'test@example.com'])
+  run(['add', '-A'])
+  run(['commit', '-q', '-m', 'начало'])
+  return run
+}
+
+test('the Git panel lists, compares, stages, commits and reads history through routes', async () => {
+  const root = await makeWorkspace()
+  try {
+    const git = initRepository(root)
+    const app = setup({ root })
+
+    let status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    assert.equal(status.status, 200)
+    assert.equal(status.body.branch, 'main')
+    assert.equal(status.body.unborn, false)
+    assert.deepEqual(status.body.entries, [])
+    assert.equal(status.body.readOnly, false)
+    const initialRevision = status.body.revision
+
+    const readme = path.join(root, 'README.md')
+    await writeFile(readme, '# изменено\n', 'utf8')
+    status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const entry = status.body.entries.find((item) => item.path === 'README.md')
+    assert.ok(entry)
+    assert.equal(entry.worktreeStatus, 'M')
+    assert.match(entry.token, /^f:/)
+    const revision = status.body.revision
+    assert.notEqual(revision, initialRevision)
+
+    const changes = await app.call('scmDiff', {
+      sessionId: SESSION_ID,
+      group: 'changes',
+      path: 'README.md',
+      revision,
+    })
+    assert.equal(changes.status, 200)
+    assert.equal(changes.body.diff.kind, 'text')
+    assert.equal(changes.body.diff.before, '# demo\n')
+    assert.equal(changes.body.diff.after, '# изменено\n')
+    assert.equal(changes.body.diff.language, 'markdown')
+    assert.equal(changes.body.diff.canOpen, true)
+
+    const stale = await app.call('scmDiff', {
+      sessionId: SESSION_ID,
+      group: 'changes',
+      path: 'README.md',
+      revision: initialRevision,
+    })
+    assert.equal(errorCode(stale.body), 'stale')
+
+    const staged = await app.call('scmStage', {
+      sessionId: SESSION_ID,
+      group: 'changes',
+      path: 'README.md',
+      revision,
+      token: entry.token,
+    })
+    assert.equal(staged.status, 200)
+    assert.equal(staged.body.status.entries.filter((item) => item.path === 'README.md').length, 1)
+    const stagedEntry = staged.body.status.entries[0]
+    assert.equal(stagedEntry.indexStatus, 'M')
+    assert.equal(stagedEntry.worktreeStatus, '.')
+
+    // A stage request based on the pre-stage list is refused, not replayed.
+    const repeated = await app.call('scmStage', {
+      sessionId: SESSION_ID,
+      group: 'changes',
+      path: 'README.md',
+      revision,
+      token: entry.token,
+    })
+    assert.equal(errorCode(repeated.body), 'stale')
+
+    const stagedDiff = await app.call('scmDiff', {
+      sessionId: SESSION_ID,
+      group: 'staged',
+      path: 'README.md',
+      revision: staged.body.status.revision,
+    })
+    assert.equal(stagedDiff.body.diff.before, '# demo\n')
+    assert.equal(stagedDiff.body.diff.after, '# изменено\n')
+    assert.equal(stagedDiff.body.diff.beforeLabel, 'HEAD')
+
+    const unstaged = await app.call('scmUnstage', {
+      sessionId: SESSION_ID,
+      group: 'staged',
+      path: 'README.md',
+      revision: staged.body.status.revision,
+    })
+    assert.equal(unstaged.status, 200)
+    assert.equal(unstaged.body.status.entries[0].indexStatus, '.')
+
+    const afterUnstage = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const token = afterUnstage.body.entries.find((item) => item.path === 'README.md').token
+    const stagedAgain = await app.call('scmStage', {
+      sessionId: SESSION_ID,
+      group: 'changes',
+      path: 'README.md',
+      revision: afterUnstage.body.revision,
+      token,
+    })
+    assert.equal(stagedAgain.status, 200)
+
+    const commit = await app.call('scmCommit', {
+      sessionId: SESSION_ID,
+      message: 'обновить README',
+      revision: stagedAgain.body.status.revision,
+    })
+    assert.equal(commit.status, 200)
+    assert.match(commit.body.head, /^[0-9a-f]{40,64}$/)
+    assert.deepEqual(commit.body.status.entries, [])
+
+    const staleCommit = await app.call('scmCommit', {
+      sessionId: SESSION_ID,
+      message: 'ещё раз',
+      revision: stagedAgain.body.status.revision,
+    })
+    assert.equal(errorCode(staleCommit.body), 'stale')
+    const emptyCommit = await app.call('scmCommit', {
+      sessionId: SESSION_ID,
+      message: '   ',
+      revision: commit.body.status.revision,
+    })
+    assert.equal(errorCode(emptyCommit.body), 'bad-request')
+
+    const history = await app.call('scmHistory', { sessionId: SESSION_ID })
+    assert.equal(history.status, 200)
+    assert.equal(history.body.commits[0].subject, 'обновить README')
+    assert.equal(history.body.commits.length, 2)
+    const oid = history.body.commits[0].oid
+    assert.equal(history.body.commits[0].parents[0], history.body.commits[1].oid)
+
+    const files = await app.call('scmCommitFiles', { sessionId: SESSION_ID, oid })
+    assert.equal(files.status, 200)
+    assert.deepEqual(
+      files.body.entries.map((row) => [row.path, row.status]),
+      [['README.md', 'M']],
+    )
+
+    const historical = await app.call('scmCommitDiff', {
+      sessionId: SESSION_ID,
+      oid,
+      path: 'README.md',
+    })
+    assert.equal(historical.status, 200)
+    assert.equal(historical.body.diff.before, '# demo\n')
+    assert.equal(historical.body.diff.after, '# изменено\n')
+    assert.equal(historical.body.diff.language, 'markdown')
+
+    // A later disk edit cannot change what the commit holds.
+    await writeFile(readme, '# позже\n', 'utf8')
+    const again = await app.call('scmCommitDiff', {
+      sessionId: SESSION_ID,
+      oid,
+      path: 'README.md',
+    })
+    assert.equal(again.body.diff.after, '# изменено\n')
+    assert.ok(git(['rev-parse', 'HEAD']).trim().length >= 40)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the Git panel creates, switches and deletes branches through routes', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const app = setup({ root })
+
+    let branches = await app.call('scmBranches', { sessionId: SESSION_ID })
+    assert.equal(branches.status, 200)
+    assert.equal(branches.body.current, 'main')
+    assert.deepEqual(branches.body.branches.map((branch) => branch.name), ['main'])
+
+    const created = await app.call('scmCreateBranch', { sessionId: SESSION_ID, name: 'feature' })
+    assert.equal(created.status, 200)
+    assert.equal(created.body.status.branch, 'feature')
+    assert.equal(created.body.branches.current, 'feature')
+    assert.deepEqual(created.body.branches.branches.map((branch) => branch.name), ['feature', 'main'])
+
+    const switched = await app.call('scmSwitchBranch', { sessionId: SESSION_ID, name: 'main' })
+    assert.equal(switched.status, 200)
+    assert.equal(switched.body.status.branch, 'main')
+
+    await app.call('scmCreateBranch', { sessionId: SESSION_ID, name: 'temporary' })
+    await app.call('scmSwitchBranch', { sessionId: SESSION_ID, name: 'main' })
+    const deleted = await app.call('scmDeleteBranch', { sessionId: SESSION_ID, name: 'temporary' })
+    assert.equal(deleted.status, 200)
+    assert.deepEqual(deleted.body.branches.branches.map((branch) => branch.name), ['feature', 'main'])
+
+    const current = await app.call('scmDeleteBranch', { sessionId: SESSION_ID, name: 'main' })
+    assert.equal(errorCode(current.body), 'branch-current')
+
+    const invalid = await app.call('scmCreateBranch', { sessionId: SESSION_ID, name: 'bad..name' })
+    assert.equal(errorCode(invalid.body), 'bad-request')
+    const missing = await app.call('scmSwitchBranch', { sessionId: SESSION_ID, name: 'missing' })
+    assert.equal(errorCode(missing.body), 'not-found')
+
+    const readOnly = setup({ root, policyMode: 'read-only' })
+    const refused = await readOnly.call('scmCreateBranch', { sessionId: SESSION_ID, name: 'blocked' })
+    assert.equal(errorCode(refused.body), 'read-only')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the Git panel refuses a nested folder, a non-repository and read-only writes', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+    const missing = await app.call('scmStatus', { sessionId: SESSION_ID })
+    assert.equal(errorCode(missing.body), 'not-repository')
+
+    initRepository(root)
+    await writeFile(path.join(root, 'README.md'), '# изменено\n', 'utf8')
+
+    const nested = setup({ root: path.join(root, 'src') })
+    const refused = await nested.call('scmStatus', { sessionId: SESSION_ID })
+    assert.equal(errorCode(refused.body), 'not-root')
+
+    const readOnly = setup({ root, policyMode: 'read-only' })
+    const status = await readOnly.call('scmStatus', { sessionId: SESSION_ID })
+    assert.equal(status.status, 200)
+    assert.equal(status.body.readOnly, true)
+    assert.equal(status.body.entries.length, 1)
+    const written = await readOnly.call('scmStage', {
+      sessionId: SESSION_ID,
+      group: 'changes',
+      path: 'README.md',
+      revision: status.body.revision,
+      token: status.body.entries[0].token,
+    })
+    assert.equal(errorCode(written.body), 'read-only')
+
+    const noSession = await app.call('scmStatus', { sessionId: 'missing' })
+    assert.equal(errorCode(noSession.body), 'no-session')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

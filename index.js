@@ -24,7 +24,7 @@
 import { spawn } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, readlink, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -43,6 +43,7 @@ import { boundLines, evaluateSuggestion, planEdit, reasonLabel } from './tab.js'
 import { listFiles, listTree } from './tree.js'
 import { searchText as searchWorkspace } from './search.js'
 import { applyHunks, createChangeTracker, revertHunks } from './agentChanges.js'
+import * as scm from './scm.js'
 import { readSessionState, writeSessionState } from './state.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -52,6 +53,9 @@ const API_PREFIX = '/api/ide/'
 
 /** Files above this size stay in the preview: the editor refuses them. */
 const MAX_EDIT_BYTES = 1024 * 1024
+/** Bytes read from a worktree file for a status token or a Git diff side. */
+const SCM_READ_BYTES = 4 * 1024 * 1024
+const MAX_SCM_PATH = 4096
 const CONTEXT_LEFT = 4000
 const CONTEXT_RIGHT = 1000
 /**
@@ -320,6 +324,18 @@ export function apply(ctx, config) {
     agentChangeDiff: (body, signal) => agentChangeDiffRoute(body, signal),
     agentChangeRestore: (body, signal) => agentChangeRestoreRoute(body, signal),
     agentChangeText: (body, signal) => agentChangeTextRoute(body, signal),
+    scmStatus: (body, signal) => scmStatusRoute(body, signal),
+    scmDiff: (body, signal) => scmDiffRoute(body, signal),
+    scmStage: (body, signal) => scmStageRoute(body, signal),
+    scmUnstage: (body, signal) => scmUnstageRoute(body, signal),
+    scmCommit: (body, signal) => scmCommitRoute(body, signal),
+    scmHistory: (body, signal) => scmHistoryRoute(body, signal),
+    scmCommitFiles: (body, signal) => scmCommitFilesRoute(body, signal),
+    scmCommitDiff: (body, signal) => scmCommitDiffRoute(body, signal),
+    scmBranches: (body, signal) => scmBranchesRoute(body, signal),
+    scmCreateBranch: (body, signal) => scmCreateBranchRoute(body, signal),
+    scmSwitchBranch: (body, signal) => scmSwitchBranchRoute(body, signal),
+    scmDeleteBranch: (body, signal) => scmDeleteBranchRoute(body, signal),
     resolve: (body) => resolveSession(body),
     tree: (body, signal) => treeRoute(body, signal),
     files: (body, signal) => filesRoute(body, signal),
@@ -1380,6 +1396,444 @@ export function apply(ctx, config) {
       file.policy,
     )
     return { restored: true, path: diff.path, display: diff.display, version: outcome.version }
+  }
+
+  // ------------------------------------------------------------ source control
+  //
+  // Git runs only against a real local folder whose DSH policy is known, and
+  // only when that folder is itself the repository root. Everything a browser
+  // sends is a group and a path relative to that root; the argv is fixed here.
+
+  const scmQueues = new Map()
+  const SCM_ERROR_CODES = new Set([
+    'git-unavailable',
+    'not-root',
+    'not-repository',
+    'unsafe-repository',
+    'locked',
+    'git-not-found',
+    'git-failed',
+    'timeout',
+    'cancelled',
+    'output-limit',
+    'stale',
+    'bad-request',
+    'not-found',
+    'history-stale',
+    'identity',
+    'nothing-staged',
+    'branch-exists',
+    'branch-unmerged',
+    'branch-current',
+    'switch-conflict',
+  ])
+
+  function scmFailure(error) {
+    const raw = typeof error?.code === 'string' ? error.code : ''
+    const message = error instanceof Error && error.message !== '' ? error.message : String(error)
+    return fail(SCM_ERROR_CODES.has(raw) ? raw : 'git-failed', message)
+  }
+
+  function isLocalDirectory(value) {
+    if (typeof value !== 'string' || value === '') return false
+    if (process.platform === 'win32') {
+      return /^[a-zA-Z]:[\\/]/.test(value) && !value.startsWith('\\\\')
+    }
+    return value.startsWith('/') && !value.startsWith('//')
+  }
+
+  // A path from the Git listing, or undefined. `..`, absolute paths, NUL and
+  // backslashes cannot reach the file reader; Git itself always emits '/'.
+  function scmTarget(value) {
+    if (typeof value !== 'string' || value === '' || value.length > MAX_SCM_PATH) return undefined
+    if (value.includes('\0') || value.includes('\\')) return undefined
+    if (value.startsWith('/') || /^[a-zA-Z]:/.test(value)) return undefined
+    const segments = value.split('/')
+    for (const segment of segments) {
+      if (segment === '' || segment === '.' || segment === '..') return undefined
+    }
+    return segments.join('/')
+  }
+
+  function scmGroup(value) {
+    return value === 'staged' || value === 'changes' || value === 'conflicts' ? value : undefined
+  }
+
+  // Resolve the session folder, prove it is local, and prove it is the Git
+  // root. A nested folder is a deliberate refusal: opening the root instead is
+  // the user's decision, and DSH never walks upward to find a repository.
+  async function scmContext(scope, signal) {
+    let policy
+    try {
+      policy = ctx.sandboxPolicy.resolve({ session: scope.session })
+    } catch {
+      policy = undefined
+    }
+    if (policy === undefined || policy === null || typeof policy.mode !== 'string') {
+      throw new scm.ScmError('git-unavailable', 'Политика доступа к этой папке не подтверждена — панель Git отключена.')
+    }
+    const root = await rootTarget(scope.cwd, signal)
+    const display = ctx.fs.processPath(root)
+    if (!isLocalDirectory(display)) {
+      throw new scm.ScmError('git-unavailable', 'Рабочая папка не является локальным каталогом — панель Git отключена.')
+    }
+    const git = scm.createGit(scope.cwd)
+    let top
+    try {
+      top = await scm.resolveRoot(git, signal)
+    } catch (error) {
+      if (error?.code === 'not-repository') {
+        throw new scm.ScmError('not-repository', 'В этой папке нет Git-репозитория. Панель не создаёт его автоматически.')
+      }
+      if (error?.code === 'unsafe-repository') {
+        throw new scm.ScmError('unsafe-repository', error.message)
+      }
+      throw error
+    }
+    if (!(await scm.sameDirectory(top, display))) {
+      throw new scm.ScmError(
+        'not-root',
+        `Репозиторий этой папки лежит выше: ${top}. Откройте корень репозитория как рабочую папку — панель не ищет его вверх по дереву.`,
+      )
+    }
+    return { git, root, display, policy }
+  }
+
+  // Read one worktree path for a status token or a diff side. The physical
+  // file is checked before reading: a symlink is reported as its target text,
+  // a symlink resolving outside the root is refused, and a directory, device
+  // or gitlink is never opened as text.
+  function scmReader(scope, context, signal) {
+    const rootReal = realpath(ctx.fs.processPath(context.root)).catch(() => undefined)
+    return async (target) => {
+      const relative = scmTarget(target)
+      if (relative === undefined) return { kind: 'outside' }
+      let resolved
+      try {
+        resolved = await ctx.fs.resolve(relative.split('/').join(path.sep), { cwd: scope.cwd, signal })
+      } catch {
+        return { kind: 'missing' }
+      }
+      if (!ctx.fs.contains(context.root, resolved)) return { kind: 'outside' }
+      const native = ctx.fs.processPath(resolved)
+      let info
+      try {
+        info = await lstat(native)
+      } catch {
+        return { kind: 'missing' }
+      }
+      if (info.isSymbolicLink()) {
+        let link = ''
+        try {
+          link = await readlink(native)
+        } catch {
+          link = ''
+        }
+        return { kind: 'symlink', target: link }
+      }
+      if (!info.isFile()) return { kind: 'special' }
+      const resolvedReal = await realpath(native).catch(() => undefined)
+      const baseReal = await rootReal
+      if (resolvedReal !== undefined && baseReal !== undefined) {
+        const prefix = baseReal.endsWith(path.sep) ? baseReal : baseReal + path.sep
+        const inside =
+          resolvedReal === baseReal ||
+          resolvedReal.toLowerCase().startsWith(prefix.toLowerCase())
+        if (!inside) return { kind: 'outside' }
+      }
+      let bytes
+      try {
+        bytes = await ctx.fs.readBytes(resolved, signal, SCM_READ_BYTES + 1)
+      } catch {
+        return { kind: 'missing' }
+      }
+      const truncated = bytes.byteLength > SCM_READ_BYTES
+      return {
+        kind: 'file',
+        bytes: truncated ? bytes.subarray(0, SCM_READ_BYTES) : bytes,
+        size: info.size,
+        truncated,
+      }
+    }
+  }
+
+  async function scmSnapshot(scope, context, signal) {
+    const snapshot = await scm.loadSnapshot(context.git, {
+      readWorktree: scmReader(scope, context, signal),
+      signal,
+    })
+    snapshot.readOnly = context.policy.mode === 'read-only'
+    return snapshot
+  }
+
+  // Two tabs of the panel may fire stage/unstage/commit at once; a shared queue
+  // per worktree keeps those argv sequences off each other's index. External
+  // Git is outside this queue, so its lock errors are surfaced, not retried.
+  async function scmSerialized(context, task) {
+    const key = context.display.toLowerCase()
+    const previous = scmQueues.get(key) ?? Promise.resolve()
+    const run = previous.then(task, task)
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    scmQueues.set(key, tail)
+    try {
+      return await run
+    } finally {
+      if (scmQueues.get(key) === tail) scmQueues.delete(key)
+    }
+  }
+
+  async function scmStatusRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — панель Git недоступна.')
+    try {
+      const context = await scmContext(scope, signal)
+      return await scmSnapshot(scope, context, signal)
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmDiffRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — сравнение Git недоступно.')
+    const group = scmGroup(body.group)
+    if (group === undefined) return fail('bad-request', 'Не указана группа изменений.')
+    const target = scmTarget(body.path)
+    if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    try {
+      const context = await scmContext(scope, signal)
+      const snapshot = await scmSnapshot(scope, context, signal)
+      if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+        return fail('stale', 'Список изменений обновился — обновите панель и откройте файл заново.')
+      }
+      const diff = await scm.loadDiff(context.git, snapshot, {
+        group,
+        path: target,
+        signal,
+        readWorktree: scmReader(scope, context, signal),
+      })
+      const row = scm.findRow(snapshot, group, target)
+      const worktreeGone =
+        row === undefined || row.entry.worktreeStatus === 'D' || row.entry.kind === 'deleted'
+      return {
+        diff: {
+          ...diff,
+          language: languageOf(target),
+          canOpen: diff.kind === 'text' && group !== 'conflicts' && !worktreeGone,
+        },
+      }
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  // Read-only sessions may look at Git state but never prepare or commit.
+  function scmWriteRefusal(context) {
+    return context.policy.mode === 'read-only'
+      ? fail('read-only', 'Сессия работает в режиме только для чтения — изменения индекса недоступны.')
+      : undefined
+  }
+
+  async function scmStageRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — подготовка файла недоступна.')
+    const group = scmGroup(body.group)
+    if (group === undefined) return fail('bad-request', 'Не указана группа изменений.')
+    if (group === 'staged') return fail('bad-request', 'Файл уже подготовлен.')
+    const target = scmTarget(body.path)
+    if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      return await scmSerialized(context, async () => {
+        const snapshot = await scmSnapshot(scope, context, signal)
+        if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+          return fail('stale', 'Список изменений обновился — обновите панель и повторите.')
+        }
+        const row = scm.findRow(snapshot, group, target)
+        if (row === undefined) return fail('stale', 'Файл больше не в этой группе изменений — обновите панель.')
+        const read = await scmReader(scope, context, signal)(target)
+        if (typeof body.token !== 'string' || body.token !== scm.worktreeToken(read)) {
+          return fail('stale', 'Содержимое файла изменилось с момента просмотра — обновите панель и повторите.')
+        }
+        await scm.addRow(context.git, row.entry, { signal })
+        return { status: await scmSnapshot(scope, context, signal) }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmUnstageRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — снятие с подготовки недоступно.')
+    if (scmGroup(body.group) !== 'staged') return fail('bad-request', 'Снять с подготовки можно только подготовленный файл.')
+    const target = scmTarget(body.path)
+    if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      return await scmSerialized(context, async () => {
+        const snapshot = await scmSnapshot(scope, context, signal)
+        if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+          return fail('stale', 'Список изменений обновился — обновите панель и повторите.')
+        }
+        const row = scm.findRow(snapshot, 'staged', target)
+        if (row === undefined) return fail('stale', 'Файл больше не подготовлен — обновите панель.')
+        await scm.unstageRow(context.git, row.entry, { unborn: snapshot.unborn, signal })
+        return { status: await scmSnapshot(scope, context, signal) }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmCommitRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — фиксация недоступна.')
+    const message = typeof body.message === 'string' ? body.message.trim() : ''
+    if (message === '') return fail('bad-request', 'Введите сообщение фиксации.')
+    if (message.length > 20000) return fail('bad-request', 'Сообщение фиксации слишком длинное.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      return await scmSerialized(context, async () => {
+        const snapshot = await scmSnapshot(scope, context, signal)
+        if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+          return fail('stale', 'Индекс изменился с момента просмотра — обновите панель и повторите.')
+        }
+        const staged = snapshot.entries.some((entry) => scm.groupsOf(entry).includes('staged'))
+        if (!staged) return fail('nothing-staged', 'Нет подготовленных изменений — фиксировать нечего.')
+        const outcome = await scm.commitIndex(context.git, message, { signal })
+        return { head: outcome.head, status: await scmSnapshot(scope, context, signal) }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmHistoryRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — история Git недоступна.')
+    let cursor
+    if (body.cursor !== undefined && body.cursor !== null) {
+      if (typeof body.cursor !== 'object') return fail('bad-request', 'Некорректное продолжение истории.')
+      cursor = body.cursor
+    }
+    try {
+      const context = await scmContext(scope, signal)
+      return await scm.loadHistoryPage(context.git, { cursor, signal })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmCommitFilesRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — история Git недоступна.')
+    try {
+      const context = await scmContext(scope, signal)
+      const base = typeof body.base === 'string' && body.base !== '' ? body.base : undefined
+      return await scm.loadCommitFiles(context.git, { oid: body.oid, base, signal })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmCommitDiffRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — сравнение недоступно.')
+    const target = scmTarget(body.path)
+    if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    try {
+      const context = await scmContext(scope, signal)
+      const base = typeof body.base === 'string' && body.base !== '' ? body.base : undefined
+      const diff = await scm.loadCommitDiff(context.git, {
+        oid: body.oid,
+        base,
+        path: target,
+        signal,
+      })
+      return { diff: { ...diff, language: languageOf(target) } }
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  // Branch routes are separate from staging so the client never sends a Git
+  // command: it names a branch, and every argv tail is fixed here.
+  async function scmBranchesRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — ветки Git недоступны.')
+    try {
+      const context = await scmContext(scope, signal)
+      return await scm.listBranches(context.git, { signal })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmCreateBranchRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — создание ветки недоступно.')
+    try {
+      scm.branchName(body.name)
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      return await scmSerialized(context, async () => {
+        await scm.createBranch(context.git, body.name, { signal })
+        return {
+          branches: await scm.listBranches(context.git, { signal }),
+          status: await scmSnapshot(scope, context, signal),
+        }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmSwitchBranchRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — переключение ветки недоступно.')
+    try {
+      scm.branchName(body.name)
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      return await scmSerialized(context, async () => {
+        await scm.switchBranch(context.git, body.name, { signal })
+        return {
+          branches: await scm.listBranches(context.git, { signal }),
+          status: await scmSnapshot(scope, context, signal),
+        }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmDeleteBranchRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — удаление ветки недоступно.')
+    try {
+      scm.branchName(body.name)
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      return await scmSerialized(context, async () => {
+        await scm.deleteBranch(context.git, body.name, { signal })
+        return { branches: await scm.listBranches(context.git, { signal }) }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
   }
 
   // ---------------------------------------------------------------- resolve

@@ -121,7 +121,12 @@ test('apply registers the tab type, its slots, the action and the close guard', 
   const host = createHost()
   plugin.apply(host.ctx)
 
-  assert.deepEqual(host.effects, ['dsh-ide: styles', 'dsh-ide: tab type', 'dsh-ide: unsaved close guard'])
+  assert.deepEqual(host.effects, [
+    'dsh-ide: styles',
+    'dsh-ide: theme change',
+    'dsh-ide: tab type',
+    'dsh-ide: unsaved close guard',
+  ])
 
   assert.equal(host.tabTypes.length, 1)
   const tabType = host.tabTypes[0]
@@ -719,4 +724,154 @@ test('the IDE action closes its visible tab on a second press', async () => {
   button = findButton(view.getTree())
   assert.equal(button.props['data-open'], 'false', 'closing the tab clears the outline')
   assert.equal(button.props['aria-pressed'], false)
+})
+
+test('the Git graph keeps a linear history in one column', async () => {
+  const { plugin } = await loadPlugin()
+  const { layoutGraph } = plugin.__test
+  const layout = layoutGraph([
+    { oid: 'c', parents: ['b'] },
+    { oid: 'b', parents: ['a'] },
+    { oid: 'a', parents: [] },
+  ])
+  assert.deepEqual(
+    layout.rows.map((row) => row.column),
+    [0, 0, 0],
+  )
+  assert.deepEqual(layout.lanes, [])
+  assert.equal(layout.width, 1)
+  assert.deepEqual(
+    layout.rows.map((row) => row.segments.filter((segment) => segment.kind === 'out').length),
+    [1, 1, 0],
+  )
+})
+
+test('the Git graph gives a second branch its own column and joins at the merge base', async () => {
+  const { plugin } = await loadPlugin()
+  const { layoutGraph } = plugin.__test
+  const layout = layoutGraph([
+    { oid: 'merge', parents: ['one', 'two'] },
+    { oid: 'one', parents: ['base'] },
+    { oid: 'two', parents: ['base'] },
+    { oid: 'base', parents: [] },
+  ])
+  assert.deepEqual(
+    layout.rows.map((row) => row.column),
+    [0, 0, 1, 0],
+  )
+  assert.equal(layout.width, 2)
+  for (const row of layout.rows) {
+    for (const segment of row.segments) {
+      if (segment.kind !== 'out') continue
+      assert.ok(segment.parent, 'an outgoing line names its parent')
+      assert.equal(segment.x2 >= 0 && segment.x2 < row.lanes.length, true)
+    }
+  }
+  const join = layout.rows[2].segments.find((segment) => segment.kind === 'out')
+  assert.equal(join.parent, 'base')
+  assert.equal(join.x2, 0, 'the side branch joins the line that already expects the shared parent')
+})
+
+test('the Git graph continues the line across a page boundary', async () => {
+  const { plugin } = await loadPlugin()
+  const { layoutGraph } = plugin.__test
+  const first = layoutGraph([
+    { oid: 'c', parents: ['b'] },
+    { oid: 'b', parents: ['a'] },
+  ])
+  const second = layoutGraph([{ oid: 'a', parents: [] }], { lanes: first.lanes })
+  assert.deepEqual(second.rows[0].column, 0)
+  const entry = second.rows[0].segments.find((segment) => segment.kind === 'in')
+  assert.ok(entry, 'the node that was expected by the previous page gets an incoming line')
+  assert.equal(entry.x1, 0)
+})
+
+test('the Git graph carries both parents of a merge across a page boundary', async () => {
+  const { plugin } = await loadPlugin()
+  const { layoutGraph } = plugin.__test
+  const merge = { oid: 'merge', parents: ['one', 'two'] }
+  const first = layoutGraph([merge])
+  assert.deepEqual(first.lanes, ['one', 'two'], 'both parents are already expected by the next page')
+  const second = layoutGraph(
+    [
+      { oid: 'one', parents: ['base'] },
+      { oid: 'two', parents: ['base'] },
+      { oid: 'base', parents: [] },
+    ],
+    { lanes: first.lanes },
+  )
+  assert.deepEqual(
+    second.rows.map((row) => row.column),
+    [0, 1, 0],
+    'the first parent keeps the merge column and the second parent takes the other lane',
+  )
+  const join = second.rows[1].segments.find((segment) => segment.kind === 'out' && segment.parent === 'base')
+  assert.equal(join.x2, 0, 'the side branch joins the line that already expects the shared parent')
+})
+
+test('one file can be staged and modified at the same time', async () => {
+  const { plugin } = await loadPlugin()
+  const { scmSections, scmLetter } = plugin.__test
+  const entry = { path: 'src/app.js', indexStatus: 'M', worktreeStatus: 'M', kind: 'modified' }
+  const sections = scmSections({ entries: [entry] })
+  assert.deepEqual(
+    sections.map((section) => section.id),
+    ['staged', 'changes'],
+  )
+  assert.deepEqual(
+    sections.map((section) => section.rows[0].key),
+    ['staged:src/app.js', 'changes:src/app.js'],
+  )
+  for (const section of sections) assert.equal(scmLetter(section.rows[0]), 'M')
+})
+
+test('new files belong to changes only and conflicts to the conflict list only', async () => {
+  const { plugin } = await loadPlugin()
+  const { scmSections, scmLetter, scmGroupsOf } = plugin.__test
+  // The Host emits the shape `git status` really has: a `?` record has no
+  // worktree status, so the letter has to come from the kind.
+  const created = { path: 'новый файл.txt', indexStatus: '?', worktreeStatus: '.', kind: 'untracked' }
+  const conflict = { path: 'конфликт.txt', indexStatus: 'U', worktreeStatus: 'U', kind: 'conflict' }
+  const ignored = { path: 'dist/app.js', indexStatus: '!', worktreeStatus: '!', kind: 'ignored' }
+  const sections = scmSections({ entries: [created, conflict, ignored] })
+  assert.deepEqual(
+    sections.map((section) => section.id),
+    ['conflicts', 'changes'],
+  )
+  const changes = sections.find((section) => section.id === 'changes')
+  assert.deepEqual(
+    changes.rows.map((row) => row.path),
+    ['новый файл.txt'],
+  )
+  assert.equal(scmLetter(changes.rows[0]), '?', 'an untracked file is a new file, not a conflict')
+  assert.equal(scmLetter(sections[0].rows[0]), 'U')
+  assert.deepEqual(scmGroupsOf(ignored), [], 'ignored files never reach the panel')
+})
+
+test('section paths survive Cyrillic, spaces and CJK characters', async () => {
+  const { plugin } = await loadPlugin()
+  const { scmSections } = plugin.__test
+  const paths = ['папка/файл с пробелом.js', '中文/文件.md']
+  const sections = scmSections({
+    entries: paths.map((path) => ({ path, indexStatus: '.', worktreeStatus: 'M', kind: 'modified' })),
+  })
+  assert.deepEqual(
+    sections[0].rows.map((row) => row.path),
+    paths,
+  )
+})
+
+test('Git errors are explained in the panel language', async () => {
+  const { plugin } = await loadPlugin()
+  const { describeScmError } = plugin.__test
+  assert.match(describeScmError({ code: 'git-unavailable' }), /Git недоступен/)
+  assert.match(describeScmError({ code: 'not-repository' }), /не является Git-репозиторием/)
+  assert.match(describeScmError({ code: 'read-only' }), /Только чтение|только для чтения/)
+  assert.match(describeScmError({ code: 'locked' }), /index\.lock/)
+  assert.match(describeScmError({ code: 'nothing-staged' }), /нечего/)
+  assert.match(describeScmError({ code: 'history-stale' }), /Ветки изменились/)
+  assert.match(describeScmError({ code: 'branch-exists' }), /уже есть/)
+  assert.match(describeScmError({ code: 'branch-current' }), /Текущую ветку/)
+  assert.match(describeScmError({ code: 'branch-unmerged' }), /невлитые коммиты/)
+  assert.match(describeScmError({ code: 'switch-conflict' }), /мешают переключению/)
 })
