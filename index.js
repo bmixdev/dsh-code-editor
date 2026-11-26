@@ -44,6 +44,9 @@ import { listFiles, listTree } from './tree.js'
 import { searchText as searchWorkspace } from './search.js'
 import { applyHunks, createChangeTracker, revertHunks } from './agentChanges.js'
 import * as scm from './scm.js'
+import { chooseRules, discoverRules, rulePrompt } from './rules.js'
+import { listPlans, readPlan, savePlan } from './plans.js'
+import { loadIgnore, relativePath } from './ignore.js'
 import { readSessionState, writeSessionState } from './state.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -56,6 +59,81 @@ const MAX_EDIT_BYTES = 1024 * 1024
 /** Bytes read from a worktree file for a status token or a Git diff side. */
 const SCM_READ_BYTES = 4 * 1024 * 1024
 const MAX_SCM_PATH = 4096
+/**
+ * Review and commit-draft calls read the index once and wait for one answer.
+ * The timeout is longer than a completion, because a patch is larger input;
+ * the character ceilings stop a runaway stream before it fills the browser.
+ */
+const SCM_ANSWER_TIMEOUT_MS = 60000
+const SCM_MAX_ANSWER_CHARS = 16000
+const SCM_MAX_MESSAGE_CHARS = 4000
+/** Deep review is the same prompt over smaller file groups, so each call sees
+ * less diff; the cap keeps one click from becoming an unbounded batch. */
+const SCM_DEEP_MAX_CALLS = 4
+const SCM_DEEP_CHUNK_CHARS = 24000
+const TEST_RUN_TIMEOUT_MS = 180000
+const TEST_RUN_OUTPUT_BYTES = 2 * 1024 * 1024
+const SCM_REVIEW_SYSTEM_PROMPT =
+  'Ты — ревьюер подготовленных изменений Git. Тебе дан точный diff индекса. ' +
+  'Верни только JSON-объект {"findings":[{"path":"файл","line":12,' +
+  '"severity":"high|medium|low","message":"причина"}]} — без markdown-ограждений и пояснений. ' +
+  'Указывай только строки новой стороны diff, которые присутствуют в diff как добавленные ' +
+  'или контекстные. path — ровно один из перечисленных файлов. severity: high — ошибка или ' +
+  'риск потери данных, medium — вероятный дефект, low — замечание по стилю. ' +
+  'Если замечаний нет, верни {"findings":[]}. Не пересказывай diff и не предлагай правки ' +
+  'вне перечисленных строк.'
+const SCM_MESSAGE_SYSTEM_PROMPT =
+  'Ты — автор сообщения коммита. По diff индекса верни только текст сообщения: ' +
+  'первая строка не длиннее 72 символов, при необходимости пустая строка и тело. ' +
+  'Без кавычек, markdown-ограждений и пояснений. Пиши по-русски, в повелительном ' +
+  'наклонении, о сути изменения. Не добавляй подпись и не упоминай модель.'
+/**
+ * Conversation search goes through the Host's `sessionQuery` service, which
+ * reads its own FTS5 index. The IDE narrows every search to sessions whose
+ * recorded working directory is the open workspace, so changing projects never
+ * surfaces another project's conversation.
+ */
+const SESSION_SEARCH_MAX_QUERY = 200
+const SESSION_SEARCH_LIMIT = 20
+const SESSION_EXCERPT_MAX_CHARS = 8000
+
+/**
+ * Explore is a keyword search plus one short answer. There is no embedding
+ * index, so the prompt gets a bounded list of matching lines, and the answer
+ * must cite `path:line` coordinates that actually came from that list.
+ */
+const EXPLORE_MAX_QUESTION = 500
+const EXPLORE_MAX_TERMS = 6
+const EXPLORE_MAX_EXCERPTS = 40
+const EXPLORE_MAX_ANSWER_CHARS = 8000
+const EXPLORE_STOPWORDS = new Set([
+  'что', 'где', 'как', 'зачем', 'почему', 'когда', 'какой', 'какая', 'какие',
+  'это', 'для', 'или', 'при', 'чем', 'кто', 'куда', 'откуда', 'можно', 'нужно',
+  'есть', 'ли', 'найди', 'покажи', 'объясни', 'расскажи', 'про', 'без', 'над',
+  'под', 'все', 'всё', 'чем', 'the', 'and', 'for', 'with', 'from', 'this',
+])
+const EXPLORE_SYSTEM_PROMPT =
+  'Ты — помощник по кодовой базе. Тебе дан вопрос и ограниченный список строк ' +
+  'из рабочей папки в виде `путь:строка: текст`. Ответь коротко, по-русски, ' +
+  'опираясь только на эти строки. Каждый факт сопровождай ссылкой `путь:строка` ' +
+  'ровно в том виде, как в списке. Если ответа в строках нет, скажи это прямо и ' +
+  'не выдумывай файлы. Не предлагай изменений и не вставляй блоки кода.'
+const SIDE_CHAT_MAX_QUESTION = 2000
+const SIDE_CHAT_MAX_TURNS = 6
+const SIDE_CHAT_MAX_SELECTION = 8000
+const SIDE_CHAT_MAX_ANSWER_CHARS = 4000
+const SIDE_CHAT_SYSTEM_PROMPT =
+  'Ты отвечаешь на побочный вопрос по выделенному фрагменту кода. Ответь по-русски, ' +
+  'кратко и по существу. Не переписывай файл, не предлагай патч и не проси ' +
+  'разрешения что-то изменить: это разговор только для понимания. Если вопрос не ' +
+  'относится к фрагменту, скажи это прямо.'
+const SCM_CONFLICT_SYSTEM_PROMPT =
+  'Ты разрешаешь конфликт слияния Git. Тебе даны base, ours и theirs — версии одного файла. ' +
+  'Верни только итоговый текст файла после разрешения, без пояснений и markdown-ограждений. ' +
+  'Сохрани полезные изменения обеих сторон; если они несовместимы, выбери вариант, который ' +
+  'не теряет изменения другой стороны и остаётся синтаксически целым. ' +
+  'Не добавляй маркеры конфликта <<<<<<<, =======, >>>>>>>.'
+const SCM_RESOLVE_MAX_CHARS = 60000
 const CONTEXT_LEFT = 4000
 const CONTEXT_RIGHT = 1000
 /**
@@ -75,6 +153,8 @@ const INLINE_EDIT_MAX_SELECTION = 20000
 const INLINE_EDIT_CONTEXT_LINES = 40
 const INLINE_EDIT_MAX_INSTRUCTION = 2000
 const INLINE_EDIT_MAX_ANSWER = 40000
+const INLINE_EDIT_MAX_TURNS = 4
+const INLINE_EDIT_MAX_HISTORY = 80000
 const INLINE_EDIT_DEADLINE_MS = 60000
 const INLINE_EDIT_SYSTEM_PROMPT =
   'Ты — движок правки выделенного фрагмента кода. Верни только JSON-объект ' +
@@ -280,6 +360,16 @@ export function apply(ctx, config) {
 
   const fail = (code, message) => ({ error: { code, message } })
 
+  /**
+   * Session-wide "ask only" switch. It lives in preferences, so every write
+   * route can refuse independently of the client that calls it.
+   */
+  async function askRefusal() {
+    const preferences = await readPreferences()
+    if (preferences.askMode !== true) return undefined
+    return fail('ask-mode', 'Включён режим вопросов: запись в рабочую папку запрещена. Отключите его в меню «Вид».')
+  }
+
   const token = () => {
     sequence += 1
     return `${sequence.toString(36)}-${Math.random().toString(36).slice(2, 10)}`
@@ -320,6 +410,11 @@ export function apply(ctx, config) {
     complete: (body, signal) => complete(body, signal),
     inlineEdit: (body, signal) => inlineEdit(body, signal),
     searchText: (body, signal) => searchText(body, signal),
+    explore: (body, signal) => exploreRoute(body, signal),
+    sessionSearch: (body, signal) => sessionSearchRoute(body, signal),
+    sessionExcerpt: (body, signal) => sessionExcerptRoute(body, signal),
+    sideChat: (body, signal) => sideChatRoute(body, signal),
+    rules: (body) => rulesRoute(body),
     agentChanges: (body) => agentChangesRoute(body),
     agentChangeDiff: (body, signal) => agentChangeDiffRoute(body, signal),
     agentChangeRestore: (body, signal) => agentChangeRestoreRoute(body, signal),
@@ -333,9 +428,23 @@ export function apply(ctx, config) {
     scmCommitFiles: (body, signal) => scmCommitFilesRoute(body, signal),
     scmCommitDiff: (body, signal) => scmCommitDiffRoute(body, signal),
     scmBranches: (body, signal) => scmBranchesRoute(body, signal),
+  scmCompare: (body, signal) => scmCompareRoute(body, signal),
     scmCreateBranch: (body, signal) => scmCreateBranchRoute(body, signal),
     scmSwitchBranch: (body, signal) => scmSwitchBranchRoute(body, signal),
     scmDeleteBranch: (body, signal) => scmDeleteBranchRoute(body, signal),
+    scmWorktrees: (body, signal) => scmWorktreesRoute(body, signal),
+    scmCreateWorktree: (body, signal) => scmCreateWorktreeRoute(body, signal),
+    scmRemoveWorktree: (body, signal) => scmRemoveWorktreeRoute(body, signal),
+  planSave: (body) => planSaveRoute(body),
+  planList: (body) => planListRoute(body),
+  planRead: (body) => planReadRoute(body),
+    scmPatch: (body, signal) => scmPatchRoute(body, signal),
+    scmReview: (body, signal) => scmReviewRoute(body, signal),
+    scmDraftMessage: (body, signal) => scmDraftMessageRoute(body, signal),
+    runTests: (body, signal) => runTestsRoute(body, signal),
+    scmConflict: (body, signal) => scmConflictRoute(body, signal),
+    scmResolve: (body, signal) => scmResolveRoute(body, signal),
+    scmResolveApply: (body, signal) => scmResolveApplyRoute(body, signal),
     resolve: (body) => resolveSession(body),
     tree: (body, signal) => treeRoute(body, signal),
     files: (body, signal) => filesRoute(body, signal),
@@ -500,6 +609,8 @@ export function apply(ctx, config) {
   // ------------------------------------------------------------------- save
 
   async function save(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const document = documents.get(body.id)
     if (document === undefined) return fail('no-document', 'Документ не открыт — откройте файл заново.')
     if (body.sessionId !== document.sessionId) return fail('wrong-session', 'Документ принадлежит другой сессии.')
@@ -777,6 +888,33 @@ export function apply(ctx, config) {
           `--- текст до курсора ---\n${windowPrefix}\n--- курсор ---\n` +
           `--- текст после курсора ---\n${windowSuffix}`
 
+    // Diagnostics are optional context from the editor: a short linter message
+    // and its range, never a whole log. They are sanitized here so a client
+    // cannot smuggle unbounded text into the prompt.
+    const diagnostics = Array.isArray(body.diagnostics)
+      ? body.diagnostics
+          .slice(0, 5)
+          .map((item) => ({
+            line: Math.round(Number(item?.line)),
+            column: Math.round(Number(item?.column)),
+            message:
+              typeof item?.message === 'string' ? item.message.replace(/\s+/g, ' ').trim().slice(0, 300) : '',
+          }))
+          .filter(
+            (item) =>
+              item.message !== '' &&
+              Number.isFinite(item.line) &&
+              item.line > 0 &&
+              Number.isFinite(item.column) &&
+              item.column > 0,
+          )
+      : []
+    const diagnosticBlock =
+      diagnostics.length === 0
+        ? ''
+        : `\n\n--- диагностика ---\n` +
+          diagnostics.map((item) => `Строка ${item.line}, столбец ${item.column}: ${item.message}`).join('\n')
+
     // A thinking model spends the output budget on hidden reasoning and then
     // returns nothing, and it is also what turned a hint into a 20 s wait.
     // DSH exposes an adapter-owned `off` level that sends `thinking: { type:
@@ -842,7 +980,7 @@ export function apply(ctx, config) {
                 content: [
                   {
                     type: 'text',
-                    text: requestText,
+                    text: requestText + diagnosticBlock,
                   },
                 ],
               },
@@ -1097,6 +1235,10 @@ export function apply(ctx, config) {
     if (excludedFiles.has(fileKey(document.displayPath))) {
       return fail('excluded-file', 'Правка выделения выключена для этого файла.')
     }
+    const ignore = await loadIgnore(document.workspaceRoot)
+    if (ignore.blocked(relativePath(document.workspaceRoot, document.target.path))) {
+      return fail('ignored-file', 'Файл исключён правилами рабочей папки (.cursorignore) — модель его не получит.')
+    }
 
     const text = String(body.text ?? '')
     if (text.length > MAX_CONTEXT_TEXT_CHARS) {
@@ -1130,30 +1272,70 @@ export function apply(ctx, config) {
     const fragment = text.slice(start, end)
     const before = boundLines(text.slice(0, start), INLINE_EDIT_CONTEXT_LINES, 'end')
     const after = boundLines(text.slice(end), INLINE_EDIT_CONTEXT_LINES, 'start')
-    const requestText = [
-      `Файл: ${document.displayPath}`,
-      `Язык: ${document.language}`,
-      `Задача: ${instruction}`,
-      '',
-      'Контекст файла; менять можно только фрагмент между маркерами.',
-      '--- до фрагмента ---',
-      before,
-      '--- фрагмент ---',
-      fragment,
-      '--- после фрагмента ---',
-      after,
-    ].join('\n')
+    const requestTextFor = (task) =>
+      [
+        `Файл: ${document.displayPath}`,
+        `Язык: ${document.language}`,
+        `Задача: ${task}`,
+        '',
+        'Контекст файла; менять можно только фрагмент между маркерами.',
+        '--- до фрагмента ---',
+        before,
+        '--- фрагмент ---',
+        fragment,
+        '--- после фрагмента ---',
+        after,
+      ].join('\n')
+    const requestText = requestTextFor(instruction)
+
+    // A refinement keeps the earlier exchange, so "сделай короче" still refers
+    // to the proposal the user rejected. Only the explicit turn list is sent;
+    // an absent list means the first request.
+    const rawHistory = Array.isArray(body.history) ? body.history : []
+    if (rawHistory.length > INLINE_EDIT_MAX_TURNS) {
+      return fail('bad-request', 'Слишком много уточнений — начните правку заново.')
+    }
+    const history = []
+    let historyChars = 0
+    for (const turn of rawHistory) {
+      const priorInstruction = typeof turn?.instruction === 'string' ? turn.instruction.trim() : ''
+      const priorAnswer = typeof turn?.answer === 'string' ? turn.answer : ''
+      if (
+        priorInstruction === '' ||
+        priorInstruction.length > INLINE_EDIT_MAX_INSTRUCTION ||
+        priorAnswer.trim() === '' ||
+        priorAnswer.length > INLINE_EDIT_MAX_ANSWER
+      ) {
+        return fail('bad-request', 'История уточнений повреждена — начните правку заново.')
+      }
+      historyChars += priorInstruction.length + priorAnswer.length
+      history.push({ instruction: priorInstruction, answer: priorAnswer })
+    }
+    if (historyChars > INLINE_EDIT_MAX_HISTORY) {
+      return fail('context-too-large', 'История уточнений слишком велика — начните правку заново.')
+    }
+    const messages = []
+    for (const turn of history) {
+      messages.push({ role: 'user', content: [{ type: 'text', text: requestTextFor(turn.instruction) }] })
+      messages.push({ role: 'assistant', content: [{ type: 'text', text: turn.answer }] })
+    }
+    messages.push({ role: 'user', content: [{ type: 'text', text: requestText }] })
 
     const deadline = AbortSignal.timeout(INLINE_EDIT_DEADLINE_MS)
     const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    const discovered = await discoverRules({ root: document.workspaceRoot, target: document.target.path })
+    const ignoredRules = discovered.rules.filter((rule) => ignore.blocked(rule.path))
+    const rules = chooseRules(discovered.rules.filter((rule) => !ignore.blocked(rule.path)))
+    const rulesAppendix = rulePrompt(rules)
+    const system = rulesAppendix === '' ? INLINE_EDIT_SYSTEM_PROMPT : `${INLINE_EDIT_SYSTEM_PROMPT}\n\n${rulesAppendix}`
     const startedAt = Date.now()
     let buffer = ''
     let streamError = ''
     const iterator = ctx.llm.stream({
       provider,
       model,
-      system: INLINE_EDIT_SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: [{ type: 'text', text: requestText }] }],
+      system,
+      messages,
       temperature: 0.2,
       signal: combined,
       sessionId: document.sessionId,
@@ -1202,8 +1384,16 @@ export function apply(ctx, config) {
       model,
       durationMs: Date.now() - startedAt,
       conversation: preferences.fullTrace === true
-        ? { system: INLINE_EDIT_SYSTEM_PROMPT, message: requestText, answer: buffer }
+        ? { system, message: requestText, answer: buffer }
         : undefined,
+      rules: {
+        applied: rules.filter((rule) => rule.applied).map((rule) => rule.path),
+        skipped: [
+          ...rules.filter((rule) => !rule.applied).map((rule) => ({ path: rule.path, reason: rule.reason })),
+          ...ignoredRules.map((rule) => ({ path: rule.path, reason: 'ignored' })),
+        ],
+        truncated: discovered.truncated,
+      },
       trace: {
         kind: 'inline-edit',
         explicit: true,
@@ -1218,16 +1408,22 @@ export function apply(ctx, config) {
   // ----------------------------------------------------------------- search
 
   /**
-   * Literal text search over the session workspace. It is local: no model is
-   * asked and the Tab opt-in does not gate it, because neither the query nor the
-   * matches travel anywhere — the scan happens on the machine running the Host.
+   * Text search over the session workspace. The query is a literal substring or
+   * a one-line regular expression, optionally restricted to whole words. It is
+   * local: no model is asked and the Tab opt-in does not gate it, because
+   * neither the query nor the matches travel anywhere — the scan happens on the
+   * machine running the Host.
    */
   async function searchText(body, signal) {
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — поиск недоступен.')
-    const query = typeof body.query === 'string' ? body.query.trim() : ''
+    const raw = typeof body.query === 'string' ? body.query : ''
+    const regex = body.regex === true
+    // A literal query has always ignored surrounding spaces. In a pattern they
+    // are meaningful (for example `^  const`), so only the emptiness check trims.
+    const query = regex ? raw : raw.trim()
     // An empty query never walks the tree: it is not «everything matches».
-    if (query === '') return { query, matches: [], truncated: false, scanned: 0, bytes: 0 }
+    if (query.trim() === '') return { query, matches: [], truncated: false, scanned: 0, bytes: 0 }
     if (query.length > SEARCH_MAX_QUERY) {
       return fail('bad-request', `Строка поиска длиннее ${SEARCH_MAX_QUERY} символов.`)
     }
@@ -1235,14 +1431,369 @@ export function apply(ctx, config) {
     const limit = Number.isFinite(requested) && requested > 0
       ? Math.min(200, Math.floor(requested))
       : SEARCH_DEFAULT_LIMIT
+    const ignore = await loadIgnore(scope.cwd)
     const result = await searchWorkspace(ctx, {
       cwd: scope.cwd,
       query,
+      regex,
+      wholeWord: body.wholeWord === true,
       limit,
       hidden: body.hidden === true,
+      skip: ignore.skipped,
       signal,
     })
     return { query, ...result }
+  }
+
+  function exploreTerms(question) {
+    const words = String(question).toLowerCase().match(/[\p{L}\p{N}_$]{3,}/gu) ?? []
+    const terms = []
+    for (const word of words) {
+      if (EXPLORE_STOPWORDS.has(word) || terms.includes(word)) continue
+      terms.push(word)
+      if (terms.length >= EXPLORE_MAX_TERMS) break
+    }
+    return terms
+  }
+
+  function exploreSources(answer, excerpts) {
+    const known = new Map(excerpts.map((item) => [`${item.path}:${item.line}`, item]))
+    const sources = []
+    const pattern = /([\w./\\-]+\.[A-Za-z0-9]{1,8}):(\d+)/g
+    for (const match of String(answer).matchAll(pattern)) {
+      const path = match[1].replace(/\\/g, '/').replace(/^\.\//, '')
+      const key = `${path}:${Number(match[2])}`
+      const item = known.get(key)
+      if (item === undefined) continue
+      if (sources.some((source) => source.path === item.path && source.line === item.line)) continue
+      sources.push({ path: item.path, line: item.line, text: item.text })
+      if (sources.length >= 20) break
+    }
+    return sources
+  }
+
+  /**
+   * Natural-language explore: local keyword search first, then one bounded
+   * answer over the matching lines. Sending those lines is the explicit action
+   * of pressing «Спросить»; `.cursorignore` and secret-looking paths are
+   * filtered before the model is called.
+   */
+  async function exploreRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — вопрос о проекте недоступен.')
+    const question = typeof body.question === 'string' ? body.question.trim() : ''
+    if (question === '') return fail('bad-request', 'Вопрос пуст.')
+    if (question.length > EXPLORE_MAX_QUESTION) {
+      return fail('bad-request', `Вопрос длиннее ${EXPLORE_MAX_QUESTION} символов.`)
+    }
+    const terms = exploreTerms(question)
+    if (terms.length === 0) return fail('bad-request', 'В вопросе нет слов для поиска по проекту.')
+    const ignore = await loadIgnore(scope.cwd)
+    const excerpts = []
+    const seen = new Set()
+    let truncated = false
+    for (const term of terms) {
+      const found = await searchWorkspace(ctx, {
+        cwd: scope.cwd,
+        query: term,
+        limit: 12,
+        skip: ignore.skipped,
+        signal,
+      })
+      if (found.truncated) truncated = true
+      for (const match of found.matches) {
+        if (completionExcluded(match.path)) continue
+        const key = `${match.path}:${match.line}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        excerpts.push({ path: match.path, line: match.line, text: match.preview })
+        if (excerpts.length >= EXPLORE_MAX_EXCERPTS) break
+      }
+      if (excerpts.length >= EXPLORE_MAX_EXCERPTS) {
+        truncated = true
+        break
+      }
+    }
+    const files = [...new Set(excerpts.map((item) => item.path))]
+    if (excerpts.length === 0) {
+      return {
+        question,
+        answer: `В рабочей папке не нашлось строк по словам: ${terms.join(', ')}.`,
+        sources: [],
+        files: [],
+        truncated,
+        provider: '',
+        model: '',
+        durationMs: 0,
+      }
+    }
+    const requestText = [
+      `Вопрос: ${question}`,
+      '',
+      'Строки рабочей папки:',
+      ...excerpts.map((item) => `${item.path}:${item.line}: ${item.text.slice(0, 200)}`),
+    ].join('\n')
+    const startedAt = Date.now()
+    const answer = await scmAnswer({
+      sessionId: scope.id,
+      system: EXPLORE_SYSTEM_PROMPT,
+      text: requestText,
+      purpose: 'code-editor-explore',
+      signal,
+      maxChars: EXPLORE_MAX_ANSWER_CHARS,
+    })
+    if (answer.error !== undefined) return answer.error
+    const text = answer.text.trim()
+    if (text === '') return fail('bad-answer', 'Модель вернула пустой ответ.')
+    return {
+      question,
+      answer: text,
+      sources: exploreSources(text, excerpts),
+      files,
+      truncated,
+      provider: answer.provider,
+      model: answer.model,
+      durationMs: Date.now() - startedAt,
+    }
+  }
+
+  /**
+   * Find an earlier conversation by its text. The Host's `sessionQuery` service
+   * runs the full-text search over its own index; the IDE passes the open
+   * workspace as a `cwd` filter and never forwards a whole conversation.
+   */
+  async function sessionSearchRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — поиск по разговорам недоступен.')
+    const query = typeof body.query === 'string' ? body.query.trim() : ''
+    if (query === '') return fail('bad-request', 'Запрос пуст.')
+    if (query.length > SESSION_SEARCH_MAX_QUERY) {
+      return fail('bad-request', `Запрос длиннее ${SESSION_SEARCH_MAX_QUERY} символов.`)
+    }
+    const service = ctx.sessionQuery
+    if (service === undefined || typeof service.searchSessions !== 'function') {
+      return fail('unavailable', 'Поиск по разговорам недоступен: Host не подключил сервис sessionQuery.')
+    }
+    let page
+    try {
+      page = await service.searchSessions({
+        query,
+        sessionFilters: [{ kind: 'cwd', values: [scope.cwd] }],
+        eventFilters: [
+          { kind: 'type', values: ['user/message', 'assistant/message'] },
+          { kind: 'surface', values: ['current'] },
+        ],
+        limit: SESSION_SEARCH_LIMIT,
+      }, { signal })
+    } catch (error) {
+      if (signal !== undefined && signal.aborted) return fail('cancelled', 'Поиск отменён.')
+      const message = error instanceof Error ? error.message : String(error)
+      return fail(error?.code ?? 'session-search-failed', `Поиск по разговорам не удался: ${message}`)
+    }
+    const items = []
+    for (const hit of Array.isArray(page?.items) ? page.items : []) {
+      const header = hit?.header ?? {}
+      const match = hit?.bestMatch ?? {}
+      const sessionId = typeof header.id === 'string' ? header.id : typeof match.sessionId === 'string' ? match.sessionId : ''
+      if (sessionId === '') continue
+      const rawSnippet = typeof match.snippet === 'string' ? match.snippet : ''
+      items.push({
+        sessionId,
+        title: typeof header.title === 'string' ? header.title : typeof header.displayTitle === 'string' ? header.displayTitle : '',
+        snippet: rawSnippet.replace(/<\/?mark>/g, '').slice(0, 400),
+        seq: Number.isInteger(match.seq) ? match.seq : undefined,
+        time: Number.isFinite(match.time) ? match.time : undefined,
+        type: typeof match.type === 'string' ? match.type : '',
+      })
+    }
+    return { query, items, hasMore: page?.hasMore === true, limit: SESSION_SEARCH_LIMIT }
+  }
+
+  function sessionEventText(event) {
+    const data = event?.data ?? {}
+    const parts = []
+    if (Array.isArray(data.content)) {
+      for (const part of data.content) {
+        if (part && part.type === 'text' && typeof part.text === 'string') parts.push(part.text)
+      }
+    }
+    if (parts.length === 0 && typeof data.text === 'string') parts.push(data.text)
+    if (parts.length === 0 && typeof data.message === 'string') parts.push(data.message)
+    return parts.join('\n\n').trim()
+  }
+
+  /**
+   * Return one earlier conversation turn as a bounded excerpt. Only the chosen
+   * event travels to the composer; the rest of that conversation stays out of
+   * this session.
+   */
+  async function sessionExcerptRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена.')
+    const target = typeof body.target === 'string' ? body.target.trim() : ''
+    const seq = Number.isInteger(body.seq) ? body.seq : -1
+    if (target === '' || seq < 0) {
+      return fail('bad-request', 'Выберите найденный фрагмент разговора.')
+    }
+    const service = ctx.sessionQuery
+    if (service === undefined || typeof service.readEvent !== 'function') {
+      return fail('unavailable', 'Чтение разговоров недоступно: Host не подключил сервис sessionQuery.')
+    }
+    let result
+    try {
+      result = await service.readEvent({ sessionId: target, seq, before: 0, after: 0 }, { signal })
+    } catch (error) {
+      if (signal !== undefined && signal.aborted) return fail('cancelled', 'Чтение отменено.')
+      if (error?.code === 'SESSION_QUERY_EVENT_NOT_FOUND') {
+        return fail('not-found', 'Этот ход больше не найден в разговоре.')
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      return fail(error?.code ?? 'session-excerpt-failed', `Не удалось прочитать разговор: ${message}`)
+    }
+    const header = result?.session ?? {}
+    const event = result?.target
+    const full = sessionEventText(event)
+    if (full === '') {
+      return fail('no-text', 'В этом ходе нет текста — приложить нечего.')
+    }
+    const text = full.slice(0, SESSION_EXCERPT_MAX_CHARS)
+    return {
+      sessionId: target,
+      title: typeof header.title === 'string' ? header.title : typeof header.displayTitle === 'string' ? header.displayTitle : '',
+      seq,
+      time: Number.isFinite(event?.time) ? event.time : undefined,
+      type: typeof event?.type === 'string' ? event.type : '',
+      text,
+      chars: full.length,
+      truncated: full.length > text.length,
+    }
+  }
+
+  async function sideChatRoute(body, signal) {
+    const document = documents.get(body.id)
+    if (document === undefined) return fail('no-document', 'Документ не открыт.')
+    if (body.sessionId !== document.sessionId) {
+      return fail('wrong-session', 'Документ принадлежит другой сессии.')
+    }
+    const question = typeof body.question === 'string' ? body.question.trim() : ''
+    if (question === '') return fail('bad-request', 'Вопрос пуст.')
+    if (question.length > SIDE_CHAT_MAX_QUESTION) {
+      return fail('bad-request', `Вопрос длиннее ${SIDE_CHAT_MAX_QUESTION} символов.`)
+    }
+    const start = Number.isInteger(body.start) ? body.start : -1
+    const end = Number.isInteger(body.end) ? body.end : -1
+    if (start < 0 || end <= start) {
+      return fail('bad-request', 'Выделите фрагмент файла — побочный вопрос задаётся по выделению.')
+    }
+    const selection = typeof body.selection === 'string' ? body.selection : ''
+    if (selection === '') {
+      return fail('bad-request', 'Выделите фрагмент файла — побочный вопрос задаётся по выделению.')
+    }
+    if (selection.length > SIDE_CHAT_MAX_SELECTION) {
+      return fail('bad-request', `Выделение длиннее ${SIDE_CHAT_MAX_SELECTION} символов.`)
+    }
+    const ignore = await loadIgnore(document.workspaceRoot)
+    const relative = relativePath(document.workspaceRoot, document.target.path)
+    if (ignore.blocked(relative)) {
+      return fail('ignored-file', 'Файл исключён правилами рабочей папки (.cursorignore) — модель его не получит.')
+    }
+    if (completionExcluded(relative)) {
+      return fail('excluded-file', 'Файл похож на секрет — побочный вопрос его не отправляет.')
+    }
+    const history = []
+    if (Array.isArray(body.history)) {
+      if (body.history.length > SIDE_CHAT_MAX_TURNS) {
+        return fail('bad-request', `В истории больше ${SIDE_CHAT_MAX_TURNS} обменов.`)
+      }
+      for (const turn of body.history) {
+        const priorQuestion = typeof turn?.question === 'string' ? turn.question.trim() : ''
+        const priorAnswer = typeof turn?.answer === 'string' ? turn.answer.trim() : ''
+        if (priorQuestion === '' || priorAnswer === '') {
+          return fail('bad-request', 'История побочного вопроса повреждена.')
+        }
+        history.push({
+          question: priorQuestion.slice(0, SIDE_CHAT_MAX_QUESTION),
+          answer: priorAnswer.slice(0, SIDE_CHAT_MAX_ANSWER_CHARS),
+        })
+      }
+    }
+    const parts = [
+      `Файл: ${relative}`,
+      `Выделение (${start}–${end}):`,
+      '```',
+      selection,
+      '```',
+    ]
+    if (history.length > 0) {
+      parts.push('', 'Предыдущие обмены:')
+      for (const turn of history) {
+        parts.push(`Вопрос: ${turn.question}`, `Ответ: ${turn.answer}`)
+      }
+    }
+    parts.push('', `Текущий вопрос: ${question}`)
+    const answer = await scmAnswer({
+      sessionId: document.sessionId,
+      system: SIDE_CHAT_SYSTEM_PROMPT,
+      text: parts.join('\n'),
+      purpose: 'code-editor-side-chat',
+      signal,
+      maxChars: SIDE_CHAT_MAX_ANSWER_CHARS,
+    })
+    if (answer.error !== undefined) return answer.error
+    const text = answer.text.trim()
+    if (text === '') return fail('bad-answer', 'Модель вернула пустой ответ.')
+    return {
+      answer: text,
+      path: relative,
+      start,
+      end,
+      chars: selection.length,
+      provider: answer.provider,
+      model: answer.model,
+    }
+  }
+
+  /**
+   * The rule chain for one open document. Reading is local and never asks a
+   * model; `applied` says which files the next Inline Edit would actually
+   * include, not merely which files exist on disk.
+   */
+  async function rulesRoute(body) {
+    const document = documents.get(body.id)
+    if (document === undefined) return fail('no-document', 'Документ не открыт.')
+    if (body.sessionId !== document.sessionId) return fail('wrong-session', 'Документ принадлежит другой сессии.')
+    try {
+      const ignore = await loadIgnore(document.workspaceRoot)
+      const discovered = await discoverRules({ root: document.workspaceRoot, target: document.target.path })
+      const ignored = discovered.rules.filter((rule) => ignore.blocked(rule.path))
+      const rules = chooseRules(discovered.rules.filter((rule) => !ignore.blocked(rule.path)))
+      return {
+        file: discovered.file,
+        truncated: discovered.truncated,
+        rules: [
+          ...ignored.map((rule) => ({
+            path: rule.path,
+            dir: rule.dir,
+            name: rule.name,
+            bytes: rule.bytes,
+            applied: false,
+            reason: 'ignored',
+            preview: '',
+          })),
+          ...rules.map((rule) => ({
+            path: rule.path,
+            dir: rule.dir,
+            name: rule.name,
+            bytes: rule.bytes,
+            applied: rule.applied,
+            reason: rule.reason,
+            preview: rule.applied ? rule.text.slice(0, 600) : '',
+          })),
+        ],
+      }
+    } catch (error) {
+      return fail(error.code ?? 'rules-failed', error.message ?? 'Не удалось прочитать правила проекта.')
+    }
   }
 
   // ------------------------------------------------------ assistant changes
@@ -1426,6 +1977,19 @@ export function apply(ctx, config) {
     'branch-unmerged',
     'branch-current',
     'switch-conflict',
+    'worktree-exists',
+    'worktree-branch',
+    'worktree-dirty',
+    'worktree-main',
+    'outside-workspace',
+    'read-only',
+    'bad-answer',
+    'no-model',
+    'context-too-large',
+    'excluded-file',
+    'not-conflict',
+    'binary',
+    'too-large',
   ])
 
   function scmFailure(error) {
@@ -1455,8 +2019,181 @@ export function apply(ctx, config) {
     return segments.join('/')
   }
 
-  function scmGroup(value) {
-    return value === 'staged' || value === 'changes' || value === 'conflicts' ? value : undefined
+  // The worktree path is a real directory, not a target handle: compare it
+  // lexically against the resolved workspace root.
+  function scmInside(directory, candidate) {
+    const relative = path.relative(directory, candidate)
+    return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative)
+  }
+
+  function scmGroup(value) {    return value === 'staged' || value === 'changes' || value === 'conflicts' ? value : undefined
+  }
+
+  function parseTestFailures(output, display) {
+    const failures = []
+    let current
+    for (const line of output.split(/\r?\n/)) {
+      const head = /^not ok \d+ - (.*)$/.exec(line)
+      if (head !== null) {
+        current = { name: head[1].trim(), file: '', line: 0, column: 0 }
+        failures.push(current)
+        continue
+      }
+      if (current === undefined) continue
+      const location = /location:\s*(['"])(.+?)\1/.exec(line)
+      if (location !== null && current.file === '') {
+        const parts = /(.+?):(\d+):(\d+)$/.exec(location[2])
+        if (parts === null) continue
+        const relative = path.relative(display, parts[1])
+        current.file = relative.split(path.sep).join('/')
+        current.line = Number(parts[2])
+        current.column = Number(parts[3])
+        continue
+      }
+      const stack = /\((.+?):(\d+):(\d+)\)/.exec(line)
+      if (stack !== null && current.file === '' && !stack[1].startsWith('node:')) {
+        current.file = path.relative(display, stack[1]).split(path.sep).join('/')
+        current.line = Number(stack[2])
+        current.column = Number(stack[3])
+      }
+    }
+    return failures
+  }
+
+  async function runTestsRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — запуск тестов недоступен.')
+    let policy
+    try {
+      policy = ctx.sandboxPolicy.resolve({ session: scope.session })
+    } catch {
+      policy = undefined
+    }
+    if (policy === undefined || policy === null) return fail('read-only', 'Политика доступа к папке не подтверждена.')
+    if (policy.mode === 'read-only') return fail('read-only', 'Папка открыта только для чтения — запуск тестов запрещён.')
+    const root = await rootTarget(scope.cwd, signal)
+    const display = ctx.fs.processPath(root)
+    if (!isLocalDirectory(display)) return fail('not-local', 'Рабочая папка не является локальным каталогом.')
+
+    let manifest
+    try {
+      manifest = JSON.parse(await readFile(path.join(display, 'package.json'), 'utf8'))
+    } catch {
+      return fail('no-tests', 'В корне нет package.json — известных тестов нет.')
+    }
+    const scripts = manifest?.scripts !== null && typeof manifest?.scripts === 'object' ? manifest.scripts : {}
+    const requested = typeof body.script === 'string' && body.script !== '' ? body.script : 'test'
+    if (typeof scripts[requested] !== 'string' || !/^[A-Za-z0-9:_-]{1,64}$/.test(requested)) {
+      return fail('no-tests', `Скрипт «${requested}» не найден в package.json.`)
+    }
+
+    const started = Date.now()
+    const output = []
+    let bytes = 0
+    let truncated = false
+    const isWindows = process.platform === 'win32'
+    const child = isWindows
+      ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `npm run ${requested}`], {
+          cwd: display,
+          env: { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0' },
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+      : spawn('npm', ['run', requested], {
+          cwd: display,
+          env: { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0' },
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+
+    const collect = (chunk) => {
+      if (bytes >= TEST_RUN_OUTPUT_BYTES) {
+        truncated = true
+        return
+      }
+      const text = chunk.toString('utf8')
+      const room = TEST_RUN_OUTPUT_BYTES - bytes
+      output.push(text.slice(0, room))
+      bytes += Math.min(text.length, room)
+      if (text.length > room) truncated = true
+    }
+    child.stdout.on('data', collect)
+    child.stderr.on('data', collect)
+
+    const result = await new Promise((resolve) => {
+      let settled = false
+      const finish = (value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(value)
+      }
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM')
+        finish({ timedOut: true })
+      }, TEST_RUN_TIMEOUT_MS)
+      const cancel = () => {
+        child.kill('SIGTERM')
+        finish({ cancelled: true })
+      }
+      if (signal !== undefined) {
+        if (signal.aborted) cancel()
+        else signal.addEventListener('abort', cancel, { once: true })
+      }
+      child.on('error', (error) => finish({ error }))
+      child.on('close', (code, killSignal) => finish({ code, signal: killSignal }))
+    })
+
+    if (result.cancelled === true) return fail('cancelled', 'Запуск тестов отменён.')
+    if (result.timedOut === true) return fail('timeout', `Тесты не уложились в ${TEST_RUN_TIMEOUT_MS / 1000} с и были остановлены.`)
+    if (result.error !== undefined) return fail('test-failed', `Не удалось запустить тесты: ${result.error.message}`)
+
+    const text = output.join('')
+    return {
+      script: requested,
+      code: result.code ?? -1,
+      signal: result.signal ?? '',
+      durationMs: Date.now() - started,
+      truncated,
+      failures: parseTestFailures(text, display),
+      output: text.slice(-20000),
+    }
+  }
+
+  async function planSaveRoute(body) {
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+    if (sessionId === '') return fail('bad-request', 'Не указана сессия.')
+    try {
+      return await savePlan({
+        title: body.title,
+        text: body.text,
+        path: body.path,
+        from: body.from,
+        to: body.to,
+      })
+    } catch (error) {
+      return fail(error.code ?? 'plans-failed', error.message)
+    }
+  }
+
+  async function planListRoute(body) {
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+    if (sessionId === '') return fail('bad-request', 'Не указана сессия.')
+    try {
+      return { plans: await listPlans() }
+    } catch (error) {
+      return fail(error.code ?? 'plans-failed', error.message)
+    }
+  }
+
+  async function planReadRoute(body) {
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+    if (sessionId === '') return fail('bad-request', 'Не указана сессия.')
+    try {
+      return await readPlan(body.id)
+    } catch (error) {
+      return fail(error.code ?? 'plans-failed', error.message)
+    }
   }
 
   // Resolve the session folder, prove it is local, and prove it is the Git
@@ -1638,6 +2375,8 @@ export function apply(ctx, config) {
   }
 
   async function scmStageRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — подготовка файла недоступна.')
     const group = scmGroup(body.group)
@@ -1669,6 +2408,8 @@ export function apply(ctx, config) {
   }
 
   async function scmUnstageRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — снятие с подготовки недоступно.')
     if (scmGroup(body.group) !== 'staged') return fail('bad-request', 'Снять с подготовки можно только подготовленный файл.')
@@ -1694,6 +2435,8 @@ export function apply(ctx, config) {
   }
 
   async function scmCommitRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — фиксация недоступна.')
     const message = typeof body.message === 'string' ? body.message.trim() : ''
@@ -1779,7 +2522,22 @@ export function apply(ctx, config) {
     }
   }
 
+  async function scmCompareRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — сравнение веток недоступно.')
+    try {
+      const context = await scmContext(scope, signal)
+      const base = typeof body.base === 'string' ? body.base.trim() : ''
+      if (base === '') return fail('bad-request', 'Не указана ветка для сравнения.')
+      return await scm.compareBranch(context.git, base, { signal })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
   async function scmCreateBranchRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — создание ветки недоступно.')
     try {
@@ -1800,6 +2558,8 @@ export function apply(ctx, config) {
   }
 
   async function scmSwitchBranchRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — переключение ветки недоступно.')
     try {
@@ -1820,6 +2580,8 @@ export function apply(ctx, config) {
   }
 
   async function scmDeleteBranchRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — удаление ветки недоступно.')
     try {
@@ -1830,6 +2592,542 @@ export function apply(ctx, config) {
       return await scmSerialized(context, async () => {
         await scm.deleteBranch(context.git, body.name, { signal })
         return { branches: await scm.listBranches(context.git, { signal }) }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  // A worktree lives inside the workspace: the Host only writes where its
+  // policy allows, so the client sends a relative path like `.worktrees/task`.
+  async function scmWorktreesRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — рабочие копии недоступны.')
+    try {
+      const context = await scmContext(scope, signal)
+      return await scm.listWorktrees(context.git, { signal })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmCreateWorktreeRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — создание рабочей копии недоступно.')
+    const relative = scmTarget(body.path)
+    if (relative === undefined) return fail('bad-request', 'Путь рабочей копии должен быть относительным и без «..».')
+    try {
+      scm.branchName(body.branch)
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      const target = path.join(context.display, relative.split('/').join(path.sep))
+      if (!scmInside(context.display, target)) {
+        return fail('outside-workspace', 'Рабочая копия должна находиться внутри открытой рабочей папки.')
+      }
+      return await scmSerialized(context, async () => {
+        const created = await scm.addWorktree(context.git, target, body.branch, {
+          create: body.create === true,
+          signal,
+        })
+        return { ...created, ...(await scm.listWorktrees(context.git, { signal })) }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmRemoveWorktreeRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — удаление рабочей копии недоступно.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      const target = path.resolve(typeof body.path === 'string' ? body.path : '')
+      if (typeof body.path !== 'string' || !path.isAbsolute(body.path) || !scmInside(context.display, target)) {
+        return fail('outside-workspace', 'Удалять можно только рабочую копию внутри открытой рабочей папки.')
+      }
+      return await scmSerialized(context, async () => {
+        await scm.removeWorktree(context.git, target, { force: body.force === true, signal })
+        return { ...(await scm.listWorktrees(context.git, { signal })) }
+      })
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  // ------------------------------------------------------- chat and review
+  //
+  // Both features hand the exact index patch to a model or to the chat draft.
+  // The user starts each one explicitly; nothing runs on stage, on a timer or
+  // on focus. The patch is bounded in scm.js and the answer is validated before
+  // the browser sees it.
+
+  function patchReasonLabel(reason) {
+    switch (reason) {
+      case 'untracked':
+        return 'не в индексе'
+      case 'binary':
+        return 'двоичный файл'
+      case 'secret':
+        return 'похож на секрет — отправка запрещена'
+      case 'too-large':
+        return 'больше лимита'
+      case 'empty':
+        return 'нет текстового изменения'
+      case 'limit':
+        return 'не вошло в лимит файлов'
+      default:
+        return String(reason)
+    }
+  }
+
+  /** One prompt body: the file list, the skipped files, then the exact patch. */
+  function scmPatchText(patch) {
+    const lines = [`Файлы (${patch.files.length}):`]
+    for (const file of patch.files) lines.push(`- ${file.status} ${file.path} (${file.bytes} Б)`)
+    if (patch.skipped.length > 0) {
+      lines.push('', 'Пропущено (в diff не вошло):')
+      for (const item of patch.skipped) lines.push(`- ${item.path} — ${patchReasonLabel(item.reason)}`)
+    }
+    if (patch.truncated) lines.push('', 'Внимание: снимок усечён по лимиту.')
+    lines.push('', 'Diff:', '```diff', patch.patch.trimEnd(), '```')
+    return lines.join('\n')
+  }
+
+  /**
+   * One bounded model call for a Git answer.
+   *
+   * The stream contract is the same as inline edit: text arrives as
+   * `text-delta`, a transport failure arrives either as an `error` chunk or as
+   * `finish` with `reason.kind === "error"`. The caller decides what a valid
+   * body means; this helper only collects and classifies the transport.
+   */
+  async function scmAnswer({ sessionId, system, text, purpose, signal, maxChars = SCM_MAX_ANSWER_CHARS }) {
+    const selection = ctx.agentDefaultModel.currentSelection()
+    if (
+      selection === null ||
+      selection === undefined ||
+      typeof selection.provider !== 'string' ||
+      typeof selection.model !== 'string'
+    ) {
+      return { error: fail('no-model', 'Модель не выбрана — действие недоступно.') }
+    }
+    const deadline = AbortSignal.timeout(SCM_ANSWER_TIMEOUT_MS)
+    const combined = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    let buffer = ''
+    let streamError = ''
+    try {
+      const iterator = ctx.llm.stream({
+        provider: selection.provider,
+        model: selection.model,
+        system,
+        messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+        temperature: 0.2,
+        signal: combined,
+        sessionId,
+        purpose,
+      })[Symbol.asyncIterator]()
+      for (;;) {
+        const step = await iterator.next()
+        if (step.done) break
+        const chunk = step.value
+        if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') buffer += chunk.text
+        else if (chunk?.type === 'error') {
+          streamError = String(chunk.message ?? chunk.error?.message ?? chunk.error ?? 'unknown')
+        } else if (chunk?.type === 'finish' && chunk.reason?.kind === 'error' && streamError === '') {
+          streamError = String(chunk.reason.failure?.message ?? chunk.reason.failure?.code ?? 'unknown')
+        }
+        if (buffer.length > maxChars) break
+      }
+    } catch (error) {
+      if (error?.name === 'TimeoutError') return { error: fail('timeout', 'Модель не ответила вовремя.') }
+      if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+        return { error: fail('cancelled', 'Запрос отменён.') }
+      }
+      return { error: fail('git-failed', error instanceof Error ? error.message : String(error)) }
+    }
+    if (streamError !== '') return { error: fail('bad-answer', `Модель не ответила: ${streamError}`) }
+    return { text: buffer, provider: selection.provider, model: selection.model }
+  }
+
+  /**
+   * Validate a review answer against the patch that was actually sent.
+   *
+   * A line that is not on the new side of that file, a path that is not in the
+   * payload, a duplicate and a missing message are all dropped: a finding the
+   * user cannot open in the reviewed diff is worse than no finding. `undefined`
+   * means the answer was not JSON at all.
+   */
+  function parseFindings(answer, patch, maxFindings = 50) {
+    let text = String(answer).trim()
+    const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/.exec(text)
+    if (fenced !== null) text = fenced[1].trim()
+    const start = text.indexOf('{')
+    const end = text.lastIndexOf('}')
+    if (start === -1 || end <= start) return undefined
+    let parsed
+    try {
+      parsed = JSON.parse(text.slice(start, end + 1))
+    } catch {
+      return undefined
+    }
+    if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.findings)) return undefined
+    const allowed = new Map(patch.parts.map((part) => [part.path, scm.patchLineNumbers(part.patch)]))
+    const findings = []
+    const seen = new Set()
+    for (const item of parsed.findings) {
+      if (findings.length >= maxFindings) break
+      if (item === null || typeof item !== 'object') continue
+      const lines = allowed.get(item.path)
+      if (lines === undefined) continue
+      if (!Number.isSafeInteger(item.line) || !lines.has(item.line)) continue
+      const severity = item.severity === 'high' || item.severity === 'medium' || item.severity === 'low' ? item.severity : 'medium'
+      const raw = typeof item.message === 'string' ? item.message.trim() : ''
+      if (raw === '') continue
+      const message = raw.length > 500 ? `${raw.slice(0, 500)}…` : raw
+      const key = `${item.path}:${item.line}:${message}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      findings.push({ path: item.path, line: item.line, severity, message })
+    }
+    return findings
+  }
+
+  /** A message answer without fences and quotes; the first line stays short. */
+  function plainAnswer(value) {
+    const text = String(value).trim()
+    const fenced = /^```[a-zA-Z]*\s*([\s\S]*?)\s*```$/.exec(text)
+    const body = fenced === null ? text : fenced[1].trim()
+    return body.slice(0, SCM_MAX_MESSAGE_CHARS)
+  }
+
+  async function scmPatchRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — Git diff недоступен.')
+    const group = body.group === 'staged' ? 'staged' : body.group === 'changes' ? 'changes' : undefined
+    if (group === undefined) return fail('bad-request', 'Diff доступен для индекса и рабочей копии.')
+    let target
+    if (body.path !== undefined && body.path !== null && body.path !== '') {
+      target = scmTarget(body.path)
+      if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    }
+    try {
+      const context = await scmContext(scope, signal)
+      const snapshot = await scmSnapshot(scope, context, signal)
+      if (typeof body.revision === 'string' && body.revision !== snapshot.revision) {
+        return fail('stale', 'Список изменений обновился — обновите панель и повторите.')
+      }
+      const ignore = await loadIgnore(context.display)
+      const patch = await scm.loadPatch(context.git, snapshot, {
+        group,
+        skip: (file) => (completionExcluded(file) ? 'secret' : ignore.blocked(file) ? 'ignored' : false),
+        signal,
+      })
+      const parts = target === undefined ? patch.parts : patch.parts.filter((part) => part.path === target)
+      if (parts.length === 0) {
+        return fail(
+          group === 'staged' ? 'nothing-staged' : 'nothing-to-send',
+          group === 'staged'
+            ? 'Подготовленные файлы не дают текстового diff.'
+            : 'Изменения рабочей копии не дают текстового diff.',
+        )
+      }
+      const bytes = parts.reduce((sum, part) => sum + Buffer.byteLength(part.patch, 'utf8'), 0)
+      return {
+        group,
+        patch: parts.map((part) => part.patch).join(''),
+        files: patch.files.filter((file) => parts.some((part) => part.path === file.path)),
+        skipped: patch.skipped.filter((item) => target === undefined || item.path === target),
+        truncated: patch.truncated,
+        bytes,
+        revision: snapshot.revision,
+      }
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  /** Split the staged patch into bounded file groups for the deep pass. */
+  function reviewChunks(patch) {
+    const chunks = []
+    let current = []
+    let chars = 0
+    let truncated = false
+    for (const part of patch.parts) {
+      const size = part.patch.length
+      if (current.length > 0 && (chars + size > SCM_DEEP_CHUNK_CHARS || chunks.length + 1 >= SCM_DEEP_MAX_CALLS)) {
+        chunks.push(current)
+        current = []
+        chars = 0
+      }
+      if (chunks.length >= SCM_DEEP_MAX_CALLS) {
+        truncated = true
+        break
+      }
+      current.push(part)
+      chars += size
+    }
+    if (current.length > 0 && chunks.length < SCM_DEEP_MAX_CALLS) chunks.push(current)
+    return { chunks, truncated }
+  }
+
+  async function scmReviewRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — проверка индекса недоступна.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      const snapshot = await scmSnapshot(scope, context, signal)
+      if (!snapshot.entries.some((entry) => scm.groupsOf(entry).includes('staged'))) {
+        return fail('nothing-staged', 'Нет подготовленных изменений — проверять нечего.')
+      }
+      if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+        return fail('stale', 'Индекс изменился — проверьте снимок заново.')
+      }
+      const ignore = await loadIgnore(context.display)
+      const patch = await scm.loadPatch(context.git, snapshot, {
+        group: 'staged',
+        skip: (file) => (completionExcluded(file) ? 'secret' : ignore.blocked(file) ? 'ignored' : false),
+        signal,
+      })
+      if (patch.files.length === 0) {
+        return fail('nothing-staged', 'Подготовленные файлы не дают текстового diff для проверки.')
+      }
+      const depth = body.depth === 'deep' ? 'deep' : 'quick'
+      const startedAt = Date.now()
+      const findings = []
+      const seen = new Set()
+      let provider = ''
+      let model = ''
+      let calls = 0
+      let truncated = patch.truncated
+      const collect = (parsed) => {
+        for (const finding of parsed) {
+          const key = `${finding.path}:${finding.line}:${finding.message}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          findings.push(finding)
+          if (findings.length >= 50) return
+        }
+      }
+      if (depth === 'quick') {
+        const answer = await scmAnswer({
+          sessionId: scope.id,
+          system: SCM_REVIEW_SYSTEM_PROMPT,
+          text: scmPatchText(patch),
+          purpose: 'code-editor-scm-review',
+          signal,
+        })
+        if (answer.error !== undefined) return answer.error
+        if (answer.text.trim() === '') return fail('bad-answer', 'Модель вернула пустой ответ.')
+        const parsed = parseFindings(answer.text, patch)
+        if (parsed === undefined) {
+          return fail('bad-answer', 'Модель вернула ответ не в ожидаемом формате JSON.')
+        }
+        collect(parsed)
+        provider = answer.provider
+        model = answer.model
+        calls = 1
+      } else {
+        const { chunks, truncated: chunkLimit } = reviewChunks(patch)
+        if (chunkLimit) truncated = true
+        for (const parts of chunks) {
+          const chunk = {
+            parts,
+            patch: parts.map((part) => part.patch).join(''),
+            files: patch.files.filter((file) => parts.some((part) => part.path === file.path)),
+            skipped: [],
+            truncated: false,
+            bytes: parts.reduce((sum, part) => sum + Buffer.byteLength(part.patch, 'utf8'), 0),
+          }
+          const answer = await scmAnswer({
+            sessionId: scope.id,
+            system: SCM_REVIEW_SYSTEM_PROMPT,
+            text: scmPatchText(chunk),
+            purpose: 'code-editor-scm-review',
+            signal,
+          })
+          if (answer.error !== undefined) return answer.error
+          if (answer.text.trim() === '') return fail('bad-answer', 'Модель вернула пустой ответ.')
+          const parsed = parseFindings(answer.text, chunk)
+          if (parsed === undefined) {
+            return fail('bad-answer', 'Модель вернула ответ не в ожидаемом формате JSON.')
+          }
+          collect(parsed)
+          provider = answer.provider
+          model = answer.model
+          calls += 1
+        }
+      }
+      return {
+        depth,
+        calls,
+        durationMs: Date.now() - startedAt,
+        revision: snapshot.revision,
+        files: patch.files,
+        skipped: patch.skipped,
+        truncated,
+        bytes: patch.bytes,
+        provider,
+        model,
+        findings,
+      }
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmDraftMessageRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — черновик сообщения недоступен.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      const snapshot = await scmSnapshot(scope, context, signal)
+      if (!snapshot.entries.some((entry) => scm.groupsOf(entry).includes('staged'))) {
+        return fail('nothing-staged', 'Нет подготовленных изменений — черновик не нужен.')
+      }
+      if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+        return fail('stale', 'Индекс изменился — обновите панель и повторите.')
+      }
+      const ignore = await loadIgnore(context.display)
+      const patch = await scm.loadPatch(context.git, snapshot, {
+        group: 'staged',
+        skip: (file) => (completionExcluded(file) ? 'secret' : ignore.blocked(file) ? 'ignored' : false),
+        signal,
+      })
+      if (patch.files.length === 0) {
+        return fail('nothing-staged', 'Подготовленные файлы не дают текстового diff для черновика.')
+      }
+      const answer = await scmAnswer({
+        sessionId: scope.id,
+        system: SCM_MESSAGE_SYSTEM_PROMPT,
+        text: scmPatchText(patch),
+        purpose: 'code-editor-scm-message',
+        signal,
+      })
+      if (answer.error !== undefined) return answer.error
+      const message = plainAnswer(answer.text)
+      if (message === '') return fail('bad-answer', 'Модель вернула пустое сообщение.')
+      return {
+        message,
+        revision: snapshot.revision,
+        files: patch.files,
+        skipped: patch.skipped,
+        truncated: patch.truncated,
+        bytes: patch.bytes,
+        provider: answer.provider,
+        model: answer.model,
+      }
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmConflictRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — конфликты Git недоступны.')
+    const target = scmTarget(body.path)
+    if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    try {
+      const context = await scmContext(scope, signal)
+      const snapshot = await scmSnapshot(scope, context, signal)
+      if (typeof body.revision === 'string' && body.revision !== snapshot.revision) {
+        return fail('stale', 'Список изменений обновился — откройте файл заново.')
+      }
+      const conflict = await scm.loadConflict(context.git, snapshot, target, { signal })
+      return { conflict, revision: snapshot.revision }
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmResolveRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — разрешение конфликта недоступно.')
+    const target = scmTarget(body.path)
+    if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      const snapshot = await scmSnapshot(scope, context, signal)
+      if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+        return fail('stale', 'Список изменений обновился — обновите панель и повторите.')
+      }
+      const conflict = await scm.loadConflict(context.git, snapshot, target, { signal })
+      const text = [
+        `Файл: ${target}`,
+        conflict.hasBase ? `--- base ---\n${conflict.base}` : '--- base отсутствует: файл добавлен с двух сторон ---',
+        conflict.hasOurs ? `--- ours ---\n${conflict.ours}` : '--- ours отсутствует: сторона удалила файл ---',
+        conflict.hasTheirs ? `--- theirs ---\n${conflict.theirs}` : '--- theirs отсутствует: сторона удалила файл ---',
+      ].join('\n')
+      if (text.length > SCM_RESOLVE_MAX_CHARS * 2) {
+        return fail('context-too-large', 'Стороны конфликта слишком велики для модели.')
+      }
+      const answer = await scmAnswer({
+        sessionId: scope.id,
+        system: SCM_CONFLICT_SYSTEM_PROMPT,
+        text,
+        purpose: 'code-editor-scm-resolve',
+        maxChars: SCM_RESOLVE_MAX_CHARS,
+        signal,
+      })
+      if (answer.error !== undefined) return answer.error
+      const resolution = plainAnswer(answer.text)
+      if (resolution === '' && conflict.ours === '' && conflict.theirs === '') {
+        return fail('bad-answer', 'Модель вернула пустое разрешение.')
+      }
+      return {
+        path: target,
+        resolution,
+        revision: snapshot.revision,
+        files: [target],
+        skipped: [],
+        bytes: conflict.bytes,
+        provider: answer.provider,
+        model: answer.model,
+      }
+    } catch (error) {
+      return scmFailure(error)
+    }
+  }
+
+  async function scmResolveApplyRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — запись разрешения недоступна.')
+    const target = scmTarget(body.path)
+    if (target === undefined) return fail('bad-request', 'Некорректный путь файла.')
+    if (typeof body.text !== 'string') return fail('bad-request', 'Не передано разрешённое содержимое.')
+    if (body.text.length > 1024 * 1024) return fail('bad-request', 'Разрешённый текст слишком велик.')
+    try {
+      const context = await scmContext(scope, signal)
+      const refusal = scmWriteRefusal(context)
+      if (refusal !== undefined) return refusal
+      return await scmSerialized(context, async () => {
+        const snapshot = await scmSnapshot(scope, context, signal)
+        if (typeof body.revision !== 'string' || body.revision !== snapshot.revision) {
+          return fail('stale', 'Индекс изменился с момента предложения — повторите разрешение.')
+        }
+        if (scm.findRow(snapshot, 'conflicts', target) === undefined) {
+          return fail('not-conflict', 'Файл больше не находится в конфликте.')
+        }
+        const outcome = await scm.resolveConflict(context.git, target, body.text, { signal })
+        return {
+          path: target,
+          oid: outcome.oid,
+          status: await scmSnapshot(scope, context, signal),
+        }
       })
     } catch (error) {
       return scmFailure(error)
@@ -1923,6 +3221,8 @@ export function apply(ctx, config) {
   }
 
   async function mkdirRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
     const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
@@ -1943,6 +3243,8 @@ export function apply(ctx, config) {
   }
 
   async function renameRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
     const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode
@@ -1973,6 +3275,8 @@ export function apply(ctx, config) {
   }
 
   async function removeRoute(body, signal) {
+    const ask = await askRefusal()
+    if (ask !== undefined) return ask
     const scope = sessionOf(body)
     if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте папку из активной сессии.')
     const mode = ctx.sandboxPolicy.resolve({ session: scope.session }).mode

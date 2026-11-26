@@ -465,6 +465,10 @@ window.__ModuleLoader__.load({
 
     let monacoPromise
 
+    // Menus follow the page language. Unsupported or missing locales use Russian.
+    const menuLanguage = () => /^en(?:-|$)/i.test(document.documentElement?.lang || '') ? 'en' : 'ru'
+    const menuText = (ru, en) => menuLanguage() === 'en' ? en : ru
+
     function loadMonaco() {
       if (monacoPromise) return monacoPromise
       monacoPromise = new Promise((resolve, reject) => {
@@ -483,7 +487,14 @@ window.__ModuleLoader__.load({
             return
           }
           amd.config({ paths: { vs: ASSET_BASE } })
-          amd(['vs/editor/editor.main'], () => resolve(window.monaco), (error) => reject(error))
+          const start = () => amd(['vs/editor/editor.main'], () => resolve(window.monaco), reject)
+          if (menuLanguage() === 'en') return start()
+          // The vendored language pack sets globals; it is not an AMD module.
+          const locale = document.createElement('script')
+          locale.src = `${ASSET_BASE}/nls/lang/ru.js`
+          locale.onload = start
+          locale.onerror = () => reject(new Error('Не удалось загрузить русский перевод Monaco'))
+          document.head.appendChild(locale)
         })
         script.addEventListener('error', () => reject(new Error('Не удалось загрузить Monaco из /ide/vs')))
         document.head.appendChild(script)
@@ -767,7 +778,318 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function describeScmError(cause) {
+    function fileExtension(filePath) {
+  const name = String(filePath ?? '').split(/[\\/]/).pop() ?? ''
+  const dot = name.lastIndexOf('.')
+  if (dot <= 0 || dot === name.length - 1) return ''
+  return name.slice(dot + 1).toLowerCase()
+}
+
+function splitCandidate(tabs, activeKey) {
+  return tabs.find((candidate) => candidate.key !== activeKey)
+}
+
+function crossFileCandidate(tabs, activeKey, insertedText, beforeText) {
+  const known = new Set(String(beforeText ?? '').match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? [])
+  const words = new Set(String(insertedText ?? '').match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? [])
+  for (const word of words) {
+    if (known.has(word)) continue
+    const other = tabs.find(
+      (candidate) =>
+        candidate.key !== activeKey &&
+        typeof candidate.text === 'string' &&
+        new RegExp(`(^|[^A-Za-z0-9_])${word}([^A-Za-z0-9_]|$)`).test(candidate.text),
+    )
+    if (other !== undefined) return { key: other.key, path: other.path, token: word }
+  }
+  return undefined
+}
+
+function diagnosticContext(markers, position, limit = 5) {
+  if (!Array.isArray(markers) || position === null || position === undefined) return []
+  const near = markers.filter(
+    (marker) =>
+      marker !== null &&
+      typeof marker === 'object' &&
+      typeof marker.message === 'string' &&
+      marker.message.trim() !== '' &&
+      (marker.severity === 8 || marker.severity === 4) &&
+      Number.isFinite(marker.startLineNumber) &&
+      Math.abs(marker.startLineNumber - position.lineNumber) <= 3,
+  )
+  return near.slice(0, limit).map((marker) => ({
+    line: marker.startLineNumber,
+    column: marker.startColumn,
+    endLine: Number.isFinite(marker.endLineNumber) ? marker.endLineNumber : marker.startLineNumber,
+    endColumn: Number.isFinite(marker.endColumn) ? marker.endColumn : marker.startColumn,
+    severity: marker.severity === 8 ? 'error' : 'warning',
+    message: marker.message.replace(/\s+/g, ' ').trim().slice(0, 300),
+  }))
+}
+
+function wordAt(text, offset) {
+  const source = String(text ?? '')
+  const at = Math.max(0, Math.min(Number(offset) || 0, source.length))
+  const token = /[A-Za-z_$][A-Za-z0-9_$]*/g
+  let match
+  while ((match = token.exec(source)) !== null) {
+    if (match.index <= at && at <= match.index + match[0].length) return match[0]
+  }
+  return ''
+}
+
+function symbolReferences(tabs, word, limit = 100) {
+  if (typeof word !== 'string' || word === '') return []
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const whole = new RegExp(`(^|[^A-Za-z0-9_$])(${escaped})(?=[^A-Za-z0-9_$]|$)`, 'g')
+  const definitionPatterns = [
+    new RegExp(`\\b(?:function|class|const|let|var|interface|type|enum|namespace|module)\\s+${escaped}\\b`),
+    new RegExp(`\\b${escaped}\\s*[:=]\\s*(?:async\\s*)?(?:function\\b|\\()`),
+  ]
+  const rows = []
+  for (const tab of tabs) {
+    if (typeof tab.text !== 'string') continue
+    if (!/\.(?:[cm]?[jt]sx?)$/i.test(tab.path ?? '')) continue
+    const lines = tab.text.split('\n')
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index]
+      whole.lastIndex = 0
+      let hit
+      while ((hit = whole.exec(line)) !== null) {
+        const column = hit.index + hit[1].length + 1
+        if (rows.length < limit) {
+          const definition = definitionPatterns.some((pattern) => pattern.test(line))
+          rows.push({
+            key: tab.key,
+            path: tab.path,
+            line: index + 1,
+            column,
+            kind: definition ? 'definition' : 'reference',
+            text: line.trim().slice(0, 200),
+          })
+        }
+        whole.lastIndex = hit.index + hit[0].length
+      }
+    }
+  }
+  return rows.sort((left, right) => {
+    if (left.kind !== right.kind) return left.kind === 'definition' ? -1 : 1
+    if (left.path !== right.path) return left.path.localeCompare(right.path)
+    return left.line - right.line
+  })
+}
+
+function renamePlan(tabs, word, next) {
+  if (typeof word !== 'string' || word === '') return { ok: false, reason: 'Нет имени под курсором.' }
+  if (typeof next !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(next)) {
+    return { ok: false, reason: 'Новое имя должно быть одним идентификатором: буквы, цифры, _ или $.' }
+  }
+  if (next === word) return { ok: false, reason: 'Имя не изменилось.' }
+  const whole = new RegExp(`(^|[^A-Za-z0-9_$])${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=[^A-Za-z0-9_$]|$)`, 'g')
+  const files = []
+  for (const tab of tabs) {
+    if (typeof tab.text !== 'string' || !/\.(?:[cm]?[jt]sx?)$/i.test(tab.path ?? '')) continue
+    const lines = tab.text.split('\n')
+    const edits = []
+    const nextLines = lines.map((line, index) => {
+      whole.lastIndex = 0
+      let replaced = ''
+      let consumed = 0
+      let hit
+      while ((hit = whole.exec(line)) !== null) {
+        const start = hit.index + hit[1].length
+        replaced += line.slice(consumed, start) + next
+        consumed = start + word.length
+        edits.push({ line: index + 1, column: start + 1 })
+        whole.lastIndex = start + word.length
+      }
+      return edits.length === 0 ? line : replaced + line.slice(consumed)
+    })
+    if (edits.length === 0) continue
+    files.push({
+      key: tab.key,
+      path: tab.path,
+      count: edits.length,
+      edits: edits.slice(0, 50),
+      before: lines.slice(Math.max(0, edits[0].line - 1), edits[0].line).join(''),
+      after: nextLines.slice(Math.max(0, edits[0].line - 1), edits[0].line).join(''),
+      text: nextLines.join('\n'),
+    })
+  }
+  return { ok: true, files, total: files.reduce((sum, file) => sum + file.count, 0) }
+}
+
+function tabExtensionDisabled(preferences, filePath) {
+  const extension = fileExtension(filePath)
+  if (extension === '') return false
+  const disabled = preferences === undefined || preferences === null ? undefined : preferences.tabDisabledExtensions
+  return Array.isArray(disabled) && disabled.includes(extension)
+}
+
+function snoozeLabel(until) {
+  if (!Number.isFinite(until) || until <= 0) return ''
+  const date = new Date(until)
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+
+const TERMINAL_CONTEXT_CHARS = 12000
+const DEBUG_FIELD_CHARS = 4000
+const DEBUG_TOTAL_CHARS = 16000
+const NOTES_MAX = 50
+const NOTE_MAX_CHARS = 1000
+const NOTES_TOTAL_CHARS = 16000
+
+function lineAttribution(records, path, line) {
+  if (!Array.isArray(records) || typeof path !== 'string' || !Number.isSafeInteger(line) || line < 1) return []
+  const want = path.replace(/\\/g, '/').replace(/^\.\//, '')
+  return records.filter((record) => {
+    if (record === null || typeof record !== 'object' || typeof record.path !== 'string') return false
+    const recordPath = record.path.replace(/\\/g, '/').replace(/^\.\//, '')
+    if (recordPath !== want) return false
+    if (!Number.isSafeInteger(record.startLine) || !Number.isSafeInteger(record.endLine)) return false
+    return record.startLine <= line && line <= record.endLine
+  })
+}
+
+// A review notes pack: numbered remarks, optionally anchored to a file and
+// line. The chat gets one agreed list, not a stream of separate quotes.
+function notesBlock(input) {
+  const list = Array.isArray(input) ? input : []
+  const lines = []
+  let chars = 0
+  let truncated = false
+  let number = 0
+  for (const item of list) {
+    if (list.length > NOTES_MAX && number >= NOTES_MAX) {
+      truncated = true
+      break
+    }
+    const note = item !== null && typeof item === 'object' ? item : {}
+    const text = typeof note.text === 'string' ? note.text.trim().replace(/\s+/g, ' ') : ''
+    if (text === '') continue
+    const clipped = text.length > NOTE_MAX_CHARS ? text.slice(0, NOTE_MAX_CHARS) : text
+    if (clipped.length !== text.length) truncated = true
+    const where = typeof note.path === 'string' && note.path.trim() !== ''
+      ? `${normalPath(note.path)}${Number.isSafeInteger(note.line) && note.line > 0 ? `:${note.line}` : ''} — `
+      : ''
+    const rendered = `${where}${clipped}`
+    if (chars + rendered.length + 8 > NOTES_TOTAL_CHARS) {
+      truncated = true
+      break
+    }
+    number += 1
+    lines.push(`${number}. ${rendered}`)
+    chars += rendered.length + 8
+  }
+  if (lines.length === 0) return { text: '', chars: 0, count: 0, truncated: false }
+  const body = ['Замечания:', ...lines]
+  let text = body.join('\n') + '\n'
+  if (text.length > NOTES_TOTAL_CHARS) {
+    text = text.slice(0, NOTES_TOTAL_CHARS) + '\n(список обрезан)\n'
+    truncated = true
+  }
+  return { text, chars: text.length, count: lines.length, truncated }
+}
+
+// A local code tour: an ordered list of file/line stops with short notes.
+// Nothing is written to the repository and no model is involved; the panel is
+// the only holder of the route.
+const TOUR_MAX_STEPS = 40
+const TOUR_NOTE_CHARS = 240
+
+function tourStep(input) {
+  if (input === null || typeof input !== 'object' || typeof input.path !== 'string') return undefined
+  const path = input.path
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/^\/+/, '')
+  if (path === '') return undefined
+  const line = Number.isSafeInteger(input.line) && input.line > 0 ? input.line : 1
+  const note = typeof input.note === 'string'
+    ? input.note.trim().replace(/\s+/g, ' ').slice(0, TOUR_NOTE_CHARS)
+    : ''
+  return { path, line, note }
+}
+
+function tourAdd(steps, input) {
+  const list = Array.isArray(steps) ? steps : []
+  const step = tourStep(input)
+  if (step === undefined || list.length >= TOUR_MAX_STEPS) return list
+  return [...list, step]
+}
+
+function tourMove(steps, index, delta) {
+  if (!Array.isArray(steps)) return []
+  const from = Number.isSafeInteger(index) ? index : -1
+  const to = from + (Number.isSafeInteger(delta) ? delta : 0)
+  if (from < 0 || from >= steps.length || to < 0 || to >= steps.length) return steps
+  const next = steps.slice()
+  const [moved] = next.splice(from, 1)
+  next.splice(to, 0, moved)
+  return next
+}
+
+function tourRemove(steps, index) {
+  if (!Array.isArray(steps) || !Number.isSafeInteger(index) || index < 0 || index >= steps.length) {
+    return Array.isArray(steps) ? steps : []
+  }
+  return steps.filter((_, at) => at !== index)
+}
+
+function tourProgress(index, total) {
+  if (!Number.isSafeInteger(total) || total <= 0) return '0/0'
+  const at = Number.isSafeInteger(index) ? Math.min(Math.max(index, 0), total - 1) : 0
+  return `${at + 1}/${total}`
+}
+
+function terminalBlock(command, code, output) {
+  const text = typeof output === 'string' ? output : ''
+  const kept = text.length > TERMINAL_CONTEXT_CHARS ? text.slice(0, TERMINAL_CONTEXT_CHARS) : text
+  const truncated = kept.length !== text.length
+  const typedCommand = typeof command === 'string' ? command.trim() : ''
+  const exitCode = typeof code === 'string' ? code.trim() : ''
+  const body = []
+  body.push(typedCommand === '' ? 'Запуск в терминале' : `Запуск в терминале: ${typedCommand}`)
+  if (exitCode !== '') body.push(`Код выхода: ${exitCode}`)
+  if (kept.trim() !== '') body.push('Вывод:', '```', kept.replace(/\s+$/, ''), '```')
+  if (truncated) body.push(`(вывод обрезан до ${TERMINAL_CONTEXT_CHARS} символов)`)
+  const result = body.join('\n') + '\n'
+  return { text: result, chars: result.length, lines: result.split('\n').length - 1, truncated, outputChars: kept.length }
+}
+
+// A local debug journal: hypothesis, reproduction steps, two runs and the
+// cleanup state of temporary logs. It is deliberately not a debugger — no
+// breakpoints, no process control — only a bounded block for the chat.
+function debugBlock(input) {
+  const fields = input !== null && typeof input === 'object' ? input : {}
+  const clip = (value) => {
+    if (typeof value !== 'string') return ''
+    const text = value.trim()
+    return text.length > DEBUG_FIELD_CHARS ? text.slice(0, DEBUG_FIELD_CHARS) : text
+  }
+  const hypothesis = clip(fields.hypothesis)
+  const steps = clip(fields.steps)
+  const runA = clip(fields.runA)
+  const runB = clip(fields.runB)
+  const logs = clip(fields.logs)
+  const cleaned = fields.cleaned === true
+  const body = [`Debug${hypothesis === '' ? '' : `: ${hypothesis}`}`]
+  if (steps !== '') body.push('', 'Шаги:', steps)
+  if (runA !== '' || runB !== '') {
+    body.push('', 'Прогон A:', runA === '' ? '(не записан)' : runA, '', 'Прогон B:', runB === '' ? '(не записан)' : runB)
+  }
+  if (logs !== '' || cleaned) {
+    body.push('', `Временные логи: ${logs === '' ? '(путь не указан)' : logs}`)
+    body.push(cleaned ? 'Очистка временных логов: подтверждена.' : 'Очистка временных логов: НЕ подтверждена.')
+  }
+  let text = body.join('\n') + '\n'
+  const truncated = text.length > DEBUG_TOTAL_CHARS
+  if (truncated) text = text.slice(0, DEBUG_TOTAL_CHARS) + '\n(журнал обрезан до 16000 символов)\n'
+  return { text, chars: text.length, truncated }
+}
+
+function describeScmError(cause) {
       const code = cause !== null && typeof cause === 'object' ? cause.code : undefined
       if (code === 'git-unavailable') return 'Git недоступен: политика сессии не подтверждена.'
       if (code === 'git-not-found') return 'Git не найден на компьютере.'
@@ -796,7 +1118,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function ScmRow({ row, active, unsaved, busy, onOpen, onStage, onUnstage }) {
+    function ScmRow({ row, active, unsaved, busy, onOpen, onStage, onUnstage, onResolve }) {
       const letter = scmLetter(row)
       const label = scmLetterLabel(letter)
       const name = baseName(row.entry.path)
@@ -836,7 +1158,21 @@ window.__ModuleLoader__.load({
           ),
         ),
         action === null
-          ? h('span', { className: 'dsh-ide-scm-conflict-note' }, 'решите вне панели')
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-scm-resolve-action',
+                title: 'Собрать обе стороны конфликта и предложить разрешение',
+                'aria-label': `Разрешить конфликт: ${row.entry.path}`,
+                disabled: busy,
+                onClick: (event) => {
+                  event.stopPropagation()
+                  if (typeof onResolve === 'function') onResolve(row)
+                },
+              },
+              'Разрешить',
+            )
           : h(
               'button',
               {
@@ -938,7 +1274,7 @@ window.__ModuleLoader__.load({
     // A Git comparison reuses the single Monaco diff editor of the assistant
     // review; only the shell around it differs: side labels, change navigation
     // and a visible way back to the list.
-    function GitDiff({ view, dirty, onClose, onOpenFile, onPrevious, onNext, containerRef }) {
+    function GitDiff({ view, dirty, onClose, onOpenFile, onPrevious, onNext, onSendPatch, patching, containerRef }) {
       const ready = view.phase === 'ready'
       const textual = ready && (view.kind === undefined || view.kind === 'text')
       const reason =
@@ -1005,6 +1341,19 @@ window.__ModuleLoader__.load({
                   'Открыть файл',
                 )
               : null,
+            (view.group === 'staged' || view.group === 'changes') && typeof onSendPatch === 'function'
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dsh-ide-diffview-action dsh-ide-gitdiff-chat',
+                    title: 'Вставить точный Git diff этого файла в чат',
+                    disabled: patching === true || !textual,
+                    onClick: () => onSendPatch(view.group, view.path),
+                  },
+                  patching === true ? '…' : 'В чат',
+                )
+              : null,
           ),
         ),
         h(
@@ -1046,6 +1395,160 @@ window.__ModuleLoader__.load({
       const historySeq = React.useRef(0)
       const commitSeq = React.useRef(0)
       const branchSeq = React.useRef(0)
+
+      // Review is an explicit, cancellable request for the staged snapshot.
+      // `revision` is kept with the answer: if the index moves afterwards the
+      // findings stay readable but are marked as belonging to an older snapshot.
+      const [review, setReview] = React.useState({ phase: 'idle', findings: [], files: [], skipped: [], bytes: 0, revision: '', depth: 'quick', calls: 0, durationMs: 0, error: '' })
+      const [reviewDepth, setReviewDepth] = React.useState('quick')
+      const [drafting, setDrafting] = React.useState(false)
+      const [draftError, setDraftError] = React.useState('')
+      const reviewAbort = React.useRef(undefined)
+      const [conflictView, setConflictView] = React.useState(undefined)
+      const [conflictBusy, setConflictBusy] = React.useState(false)
+      const conflictSeq = React.useRef(0)
+      const [compareDraft, setCompareDraft] = React.useState('main')
+      const [compare, setCompare] = React.useState({ phase: 'idle', base: '', data: undefined, error: '' })
+      const kilobytes = (bytes) => `${Math.max(1, Math.round((Number.isFinite(bytes) ? bytes : 0) / 1024))} КиБ`
+      const skipReason = (reason) => {
+        switch (reason) {
+          case 'untracked':
+            return 'не в индексе'
+          case 'binary':
+            return 'двоичный'
+          case 'secret':
+            return 'похож на секрет'
+          case 'ignored':
+            return 'исключено .cursorignore'
+          case 'too-large':
+            return 'больше лимита'
+          case 'empty':
+            return 'нет текста'
+          case 'limit':
+            return 'не вошло в лимит'
+          default:
+            return String(reason)
+        }
+      }
+
+      const runCompare = async () => {
+        const base = compareDraft.trim()
+        if (sessionId === '' || base === '' || compare.phase === 'running') return
+        setCompare({ phase: 'running', base, data: compare.data, error: '' })
+        try {
+          const payload = await call('scmCompare', { sessionId, base })
+          setCompare({ phase: 'ready', base, data: payload, error: '' })
+        } catch (cause) {
+          setCompare({ phase: 'failed', base, data: undefined, error: describeScmError(cause) })
+        }
+      }
+
+      const startReview = async () => {
+        if (sessionId === '' || snapshot === undefined || stagedCount === 0 || review.phase === 'running' || readOnly) return
+        reviewAbort.current?.abort()
+        const controller = new AbortController()
+        reviewAbort.current = controller
+        setReview((previous) => ({ ...previous, phase: 'running', error: '' }))
+        try {
+          const payload = await call('scmReview', { sessionId, revision: snapshot.revision, depth: reviewDepth }, controller.signal)
+          if (controller.signal.aborted) return
+          setReview({
+            phase: 'ready',
+            findings: Array.isArray(payload?.findings) ? payload.findings : [],
+            files: Array.isArray(payload?.files) ? payload.files : [],
+            skipped: Array.isArray(payload?.skipped) ? payload.skipped : [],
+            bytes: Number.isFinite(payload?.bytes) ? payload.bytes : 0,
+            revision: typeof payload?.revision === 'string' ? payload.revision : '',
+            depth: payload?.depth === 'deep' ? 'deep' : 'quick',
+            calls: Number.isFinite(payload?.calls) ? payload.calls : 1,
+            durationMs: Number.isFinite(payload?.durationMs) ? payload.durationMs : 0,
+            error: '',
+          })
+        } catch (cause) {
+          if (cause?.code === 'cancelled') {
+            setReview((previous) => ({ ...previous, phase: 'idle' }))
+            return
+          }
+          setReview((previous) => ({ ...previous, phase: 'failed', error: describeScmError(cause) }))
+        }
+      }
+
+      const cancelReview = () => {
+        reviewAbort.current?.abort()
+        setReview((previous) => ({ ...previous, phase: 'idle' }))
+      }
+
+      const draftMessage = async () => {
+        setDraftError('')
+        if (sessionId === '' || snapshot === undefined || stagedCount === 0 || drafting || readOnly) return
+        if (message.trim() !== '' && typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          if (!window.confirm('Заменить текущее сообщение черновиком модели?')) return
+        }
+        setDrafting(true)
+        try {
+          const payload = await call('scmDraftMessage', { sessionId, revision: snapshot.revision })
+          if (typeof payload?.message === 'string' && payload.message !== '') props.onMessage(payload.message)
+        } catch (cause) {
+          setDraftError(describeScmError(cause))
+        } finally {
+          setDrafting(false)
+        }
+      }
+
+      // A conflict is resolved locally: the model only proposes text, and the
+      // file plus the index change when the user applies that text.
+      const generateConflict = async (path) => {
+        if (sessionId === '' || snapshot === undefined || readOnly) return
+        const seq = (conflictSeq.current += 1)
+        setConflictView({ phase: 'loading', path, resolution: '', revision: '', error: '' })
+        try {
+          const payload = await call('scmResolve', { sessionId, path, revision: snapshot.revision })
+          if (seq !== conflictSeq.current) return
+          setConflictView({
+            phase: 'ready',
+            path,
+            resolution: typeof payload?.resolution === 'string' ? payload.resolution : '',
+            revision: typeof payload?.revision === 'string' ? payload.revision : '',
+            error: '',
+          })
+        } catch (cause) {
+          if (seq !== conflictSeq.current) return
+          setConflictView({ phase: 'failed', path, resolution: '', revision: '', error: describeScmError(cause) })
+        }
+      }
+
+      const applyConflict = async () => {
+        if (conflictView === undefined || conflictView.phase !== 'ready' || conflictBusy) return
+        setConflictBusy(true)
+        try {
+          await call('scmResolveApply', {
+            sessionId,
+            path: conflictView.path,
+            text: conflictView.resolution,
+            revision: conflictView.revision,
+          })
+          setConflictView(undefined)
+          if (typeof props.onRefresh === 'function') props.onRefresh()
+        } catch (cause) {
+          setConflictView((previous) =>
+            previous === undefined ? previous : { ...previous, error: describeScmError(cause) },
+          )
+        } finally {
+          setConflictBusy(false)
+        }
+      }
+
+      const cancelConflict = () => {
+        conflictSeq.current += 1
+        setConflictView(undefined)
+      }
+
+      React.useEffect(
+        () => () => {
+          reviewAbort.current?.abort()
+        },
+        [],
+      )
 
       React.useEffect(() => {
         if (!branchOpen || sessionId === '') return undefined
@@ -1267,12 +1770,293 @@ window.__ModuleLoader__.load({
           { className: 'dsh-ide-scm-hint' },
           stagedCount === 0 ? 'Отметьте «+» файлы, которые войдут в коммит.' : `В коммит войдут подготовленные файлы: ${stagedCount}.`,
         ),
+        h(
+          'div',
+          { className: 'dsh-ide-scm-actions' },
+          h(
+            'div',
+            { className: 'dsh-ide-scm-depth', role: 'group', 'aria-label': 'Глубина проверки' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-scm-depth-button',
+                'aria-pressed': reviewDepth === 'quick',
+                disabled: review.phase === 'running',
+                title: 'Один запрос по всему индексу',
+                onClick: () => setReviewDepth('quick'),
+              },
+              'Быстро',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-scm-depth-button',
+                'aria-pressed': reviewDepth === 'deep',
+                disabled: review.phase === 'running',
+                title: 'До четырёх запросов по группам файлов — дольше, но каждый видит меньше diff',
+                onClick: () => setReviewDepth('deep'),
+              },
+              'Глубоко',
+            ),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-button dsh-ide-scm-review-button',
+              disabled: readOnly || (stagedCount === 0 && review.phase !== 'running'),
+              title:
+                review.phase === 'running'
+                  ? 'Отменить проверку'
+                  : stagedCount === 0
+                    ? 'Сначала подготовьте изменения кнопкой «+»'
+                    : 'Отправить точный diff индекса модели на проверку',
+              onClick: () => {
+                if (review.phase === 'running') cancelReview()
+                else void startReview()
+              },
+            },
+            review.phase === 'running' ? 'Отменить' : 'Проверить индекс',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-ide-button dsh-ide-scm-draft-button',
+              disabled: readOnly || stagedCount === 0 || drafting || review.phase === 'running',
+              title: stagedCount === 0 ? 'Сначала подготовьте изменения кнопкой «+»' : 'Составить сообщение по diff индекса',
+              onClick: () => {
+                void draftMessage()
+              },
+            },
+            drafting ? 'Пишу…' : 'Черновик',
+          ),
+          review.phase === 'ready'
+            ? h(
+                'span',
+                { className: 'dsh-ide-scm-review-note' },
+                `${review.depth === 'deep' ? 'Глубоко' : 'Быстро'} · ${review.calls} вызов(а) · ${(review.durationMs / 1000).toFixed(1)} с · ${review.files.length} файл(ов) · ${kilobytes(review.bytes)}`,
+              )
+            : null,
+        ),
+        h(
+          'div',
+          { className: 'dsh-ide-scm-compare' },
+          h('div', { className: 'dsh-ide-scm-compare-head' }, 'Сравнить с базой'),
+          h(
+            'div',
+            { className: 'dsh-ide-scm-compare-form' },
+            h('input', {
+              className: 'dsh-ide-scm-compare-input',
+              value: compareDraft,
+              placeholder: 'main',
+              onChange: (event) => setCompareDraft(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key === 'Enter') void runCompare()
+              },
+            }),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-button',
+                disabled: compare.phase === 'running' || compareDraft.trim() === '',
+                onClick: () => void runCompare(),
+              },
+              compare.phase === 'running' ? 'Сравниваю…' : 'Сравнить',
+            ),
+          ),
+          compare.phase === 'failed' ? h('div', { className: 'dsh-ide-scm-error' }, compare.error) : null,
+          compare.phase === 'ready' && compare.data !== undefined
+            ? h(
+                'div',
+                { className: 'dsh-ide-scm-compare-result' },
+                h(
+                  'div',
+                  { className: 'dsh-ide-scm-compare-note' },
+                  `${compare.data.base} · точка ветвления ${String(compare.data.mergeBase).slice(0, 7)} · впереди ${compare.data.ahead}, позади ${compare.data.behind}`,
+                ),
+                h(
+                  'div',
+                  { className: 'dsh-ide-scm-compare-files' },
+                  compare.data.files.map((file) =>
+                    h(
+                      'div',
+                      { className: 'dsh-ide-scm-compare-file', key: `${file.status}:${file.path}`, title: file.oldPath ?? file.path },
+                      h('span', { className: 'dsh-ide-scm-compare-status' }, String(file.status).slice(0, 1)),
+                      h('span', { className: 'dsh-ide-scm-compare-path' }, file.path),
+                    ),
+                  ),
+                ),
+                compare.data.truncated
+                  ? h('div', { className: 'dsh-ide-scm-compare-note' }, `Показано ${compare.data.files.length} из ${compare.data.total}.`)
+                  : null,
+              )
+            : null,
+        ),
+        draftError === '' ? null : h('div', { className: 'dsh-ide-scm-error', role: 'status' }, draftError),
       )
+
+      const reviewPanel =
+        review.phase === 'idle'
+          ? null
+          : h(
+              'div',
+              { className: 'dsh-ide-scm-review', 'data-phase': review.phase, role: 'status' },
+              review.phase === 'running'
+                ? h('div', { className: 'dsh-ide-scm-review-note' }, 'Проверяю подготовленный diff…')
+                : null,
+              review.phase === 'failed'
+                ? h(
+                    'div',
+                    { className: 'dsh-ide-scm-error' },
+                    review.error,
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-ide-scm-link',
+                        onClick: () => {
+                          void startReview()
+                        },
+                      },
+                      'Повторить',
+                    ),
+                  )
+                : null,
+              review.phase === 'ready'
+                ? h(
+                    'div',
+                    { className: 'dsh-ide-scm-review-body' },
+                    review.revision !== '' && snapshot !== undefined && snapshot.revision !== review.revision
+                      ? h(
+                          'div',
+                          { className: 'dsh-ide-scm-review-stale' },
+                          'Проверка устарела: индекс изменился.',
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-ide-scm-link',
+                              onClick: () => {
+                                void startReview()
+                              },
+                            },
+                            'Проверить заново',
+                          ),
+                        )
+                      : null,
+                    review.skipped.length === 0
+                      ? null
+                      : h(
+                          'div',
+                          { className: 'dsh-ide-scm-review-note' },
+                          `Пропущено: ${review.skipped.map((item) => `${item.path} (${skipReason(item.reason)})`).join(', ')}`,
+                        ),
+                    review.findings.length === 0
+                      ? h('div', { className: 'dsh-ide-scm-review-note' }, 'Замечаний не найдено.')
+                      : h(
+                          'div',
+                          { className: 'dsh-ide-scm-findings' },
+                          review.findings.map((finding, index) =>
+                            h(
+                              'button',
+                              {
+                                key: `${finding.path}:${finding.line}:${index}`,
+                                type: 'button',
+                                className: `dsh-ide-scm-finding dsh-ide-scm-finding-${finding.severity}`,
+                                title: `${finding.path}:${finding.line} — открыть в сравнении`,
+                                onClick: () => {
+                                  if (typeof props.onOpenFinding === 'function') props.onOpenFinding(finding)
+                                },
+                              },
+                              h('span', { className: 'dsh-ide-scm-finding-where' }, `${finding.path}:${finding.line}`),
+                              h('span', { className: 'dsh-ide-scm-finding-message' }, finding.message),
+                            ),
+                          ),
+                        ),
+                  )
+                : null,
+            )
+
+      const conflictPanel =
+        conflictView === undefined
+          ? null
+          : h(
+              'div',
+              { className: 'dsh-ide-scm-resolve', 'data-phase': conflictView.phase, role: 'group', 'aria-label': 'Разрешение конфликта' },
+              h(
+                'div',
+                { className: 'dsh-ide-scm-section-head' },
+                h('span', { className: 'dsh-ide-scm-section-title' }, 'Разрешение конфликта'),
+                h('span', { className: 'dsh-ide-scm-resolve-path', title: conflictView.path }, conflictView.path),
+                h('button', { type: 'button', className: 'dsh-ide-scm-link', onClick: cancelConflict }, 'Закрыть'),
+              ),
+              conflictView.phase === 'loading'
+                ? h('div', { className: 'dsh-ide-scm-review-note' }, 'Собираю стороны конфликта и предложение модели…')
+                : null,
+              conflictView.phase === 'failed'
+                ? h(
+                    'div',
+                    { className: 'dsh-ide-scm-error', role: 'status' },
+                    conflictView.error,
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-ide-scm-link',
+                        onClick: () => {
+                          void generateConflict(conflictView.path)
+                        },
+                      },
+                      'Повторить',
+                    ),
+                  )
+                : null,
+              conflictView.phase === 'ready'
+                ? h(
+                    'div',
+                    { className: 'dsh-ide-scm-resolve-body' },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-scm-review-note' },
+                      'Проверьте текст: «Применить» запишет его в файл и в индекс. Git-состояние изменится только по этой кнопке.',
+                    ),
+                    h('textarea', {
+                      className: 'dsh-ide-scm-resolve-text',
+                      value: conflictView.resolution,
+                      spellCheck: false,
+                      'aria-label': 'Предложенное разрешение конфликта',
+                      onChange: (event) => {
+                        const resolution = event.target.value
+                        setConflictView((previous) => (previous === undefined ? previous : { ...previous, resolution, error: '' }))
+                      },
+                    }),
+                    conflictView.error === ''
+                      ? null
+                      : h('div', { className: 'dsh-ide-scm-error', role: 'status' }, conflictView.error),
+                    h(
+                      'div',
+                      { className: 'dsh-ide-scm-resolve-actions' },
+                      h(
+                        'button',
+                        { type: 'button', className: 'dsh-ide-button', disabled: conflictBusy, onClick: () => { void applyConflict() } },
+                        conflictBusy ? 'Записываю…' : 'Применить',
+                      ),
+                      h('button', { type: 'button', className: 'dsh-ide-scm-link', disabled: conflictBusy, onClick: cancelConflict }, 'Отмена'),
+                    ),
+                  )
+                : null,
+            )
 
       const workingSections = h(
         'div',
         { className: 'dsh-ide-scm-working' },
         composer,
+        reviewPanel,
+        conflictPanel,
         sections.length === 0
           ? h('div', { className: 'dsh-ide-scm-clean' }, 'Рабочая папка чиста.')
           : sections.map((section) =>
@@ -1284,6 +2068,21 @@ window.__ModuleLoader__.load({
                   { className: 'dsh-ide-scm-section-head' },
                   h('span', { className: 'dsh-ide-scm-section-title' }, section.title),
                   h('span', { className: 'dsh-ide-scm-section-count' }, String(section.rows.length)),
+                  section.id === 'conflicts'
+                    ? null
+                    : h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-scm-chat',
+                          title: 'Вставить точный Git diff этой группы в чат',
+                          disabled: props.patching === true || section.rows.length === 0,
+                          onClick: () => {
+                            if (typeof props.onSendPatch === 'function') props.onSendPatch(section.id, undefined)
+                          },
+                        },
+                        props.patching === true ? '…' : 'В чат',
+                      ),
                 ),
                 section.rows.map((row) =>
                   h(ScmRow, {
@@ -1298,6 +2097,9 @@ window.__ModuleLoader__.load({
                     onOpen: (target) => props.onOpenRow(target),
                     onStage: (target) => props.onStageRow(target),
                     onUnstage: (target) => props.onUnstageRow(target),
+                    onResolve: (target) => {
+                      void generateConflict(target.entry.path)
+                    },
                   }),
                 ),
               ),
@@ -1713,6 +2515,8 @@ window.__ModuleLoader__.load({
       // File content search: the panel owns its query and results, the explorer
       // only decides whether to show it instead of the tree.
       const [searchQuery, setSearchQuery] = React.useState('')
+      const [searchRegex, setSearchRegex] = React.useState(false)
+      const [searchWholeWord, setSearchWholeWord] = React.useState(false)
       const [searchResult, setSearchResult] = React.useState({ phase: 'idle', matches: [], truncated: false, error: '' })
       const searchInputRef = React.useRef(undefined)
       const expandedRef = React.useRef(new Set())
@@ -1728,7 +2532,8 @@ window.__ModuleLoader__.load({
       // a slow folder cannot answer a query the user already replaced.
       React.useEffect(() => {
         if (!searchOpen) return undefined
-        const needle = searchQuery.trim()
+        // A literal query ignores surrounding spaces; a pattern keeps them.
+        const needle = searchRegex ? searchQuery : searchQuery.trim()
         if (needle === '' || typeof sessionId !== 'string' || sessionId === '') {
           setSearchResult({ phase: 'idle', matches: [], truncated: false, error: '' })
           return undefined
@@ -1736,7 +2541,13 @@ window.__ModuleLoader__.load({
         const controller = new AbortController()
         const timer = window.setTimeout(() => {
           setSearchResult((previous) => ({ ...previous, phase: 'pending', error: '' }))
-          void call('searchText', { sessionId, query: needle, limit: 50 }, controller.signal)
+          void call('searchText', {
+            sessionId,
+            query: needle,
+            limit: 50,
+            regex: searchRegex,
+            wholeWord: searchWholeWord,
+          }, controller.signal)
             .then((payload) => {
               if (controller.signal.aborted) return
               const matches = payload !== null && Array.isArray(payload.matches) ? payload.matches : []
@@ -1752,7 +2563,7 @@ window.__ModuleLoader__.load({
           window.clearTimeout(timer)
           controller.abort()
         }
-      }, [searchOpen, searchQuery, sessionId])
+      }, [searchOpen, searchQuery, searchRegex, searchWholeWord, sessionId])
       React.useEffect(() => {
         if (!searchOpen) return undefined
         const timer = window.setTimeout(() => searchInputRef.current?.focus(), 0)
@@ -1789,53 +2600,52 @@ window.__ModuleLoader__.load({
         if (target === undefined) return []
         const items = []
         if (target.type === 'directory') {
-          items.push({ id: 'toggle', label: expanded.has(target.path) ? 'Свернуть' : 'Развернуть', run: () => toggle(target.path, cache.has(target.path)) })
-          items.push({ id: 'new-file', label: 'Новый файл…', run: () => props.onNewFile(target.path) })
-          items.push({ id: 'new-folder', label: 'Новая папка…', run: () => props.onNewFolder(target.path) })
+          items.push({ id: 'toggle', label: (target.path === '' ? rootOpen : expanded.has(target.path)) ? menuText('Свернуть', 'Collapse') : menuText('Развернуть', 'Expand'), run: () => target.path === '' ? setRootOpen(!rootOpen) : toggle(target.path, cache.has(target.path)) })
+          items.push({ id: 'new-file', label: menuText('Новый файл…', 'New file…'), run: () => props.onNewFile(target.path) })
+          items.push({ id: 'new-folder', label: menuText('Новая папка…', 'New folder…'), run: () => props.onNewFolder(target.path) })
           if (typeof props.onQuoteFile === 'function') {
-            items.push({ id: 'quote', label: 'Добавить в чат', key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, true) })
+            items.push({ id: 'quote', label: menuText('Добавить в чат', 'Add to chat'), key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, true) })
           }
           items.push({ separator: true })
         } else {
-          items.push({ id: 'open', label: 'Открыть', run: () => onOpenFile(target.path) })
+          items.push({ id: 'open', label: menuText('Открыть', 'Open'), run: () => onOpenFile(target.path) })
           if (typeof props.onQuoteFile === 'function') {
-            items.push({ id: 'quote', label: 'Добавить в чат', key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, false) })
+            items.push({ id: 'quote', label: menuText('Добавить в чат', 'Add to chat'), key: ADD_TO_CHAT_KEY, run: () => props.onQuoteFile(target.path, false) })
           }
           if (typeof props.onQuoteLines === 'function') {
-            items.push({ id: 'quote-lines', label: 'Добавить строки в чат…', run: () => props.onQuoteLines(target.path) })
+            items.push({ id: 'quote-lines', label: menuText('Добавить строки в чат…', 'Quote lines in chat…'), run: () => props.onQuoteLines(target.path) })
           }
           items.push({ separator: true })
         }
         items.push({
           id: 'copy-path',
-          label: 'Копировать путь',
+          label: menuText('Копировать путь', 'Copy path'),
           run: () => copy(workspaceRoot === '' ? target.path : `${workspaceRoot.replace(/[\\/]+$/, '')}/${target.path}`),
         })
-        items.push({ id: 'copy-relative', label: 'Копировать относительный путь', run: () => copy(target.path) })
+        items.push({ id: 'copy-relative', label: menuText('Копировать относительный путь', 'Copy relative path'), run: () => copy(target.path) })
         items.push({
           id: 'reveal',
-          label: 'Показать в проводнике ОС',
+          label: menuText('Показать в проводнике ОС', 'Reveal in file manager'),
           run: () => {
             void call('reveal', { sessionId, path: target.path }).catch((cause) => setError(describeError(cause)))
           },
         })
+        if (target.path === '') return items
         items.push({ separator: true })
-        items.push({ id: 'rename', label: 'Переименовать…', key: 'F2', run: () => props.onRename(target.path, target.name, target.type) })
-        items.push({ id: 'delete', label: 'Удалить', key: 'Delete', run: () => props.onDelete(target.path, target.name, target.type) })
-        items.push({ separator: true })
-        items.push({ id: 'terminal', label: 'Открыть во встроенном терминале', disabled: true, hint: 'Встроенного терминала в IDE нет: плагин не получает PTY.' })
+        items.push({ id: 'rename', label: menuText('Переименовать…', 'Rename…'), key: 'F2', run: () => props.onRename(target.path, target.name, target.type) })
+        items.push({ id: 'delete', label: menuText('Удалить', 'Delete'), key: 'Delete', run: () => props.onDelete(target.path, target.name, target.type) })
         return items
       }
 
       const moreMenuItems = [
-        { id: 'new-file', label: 'Новый файл…', run: () => props.onNewFile('') },
-        { id: 'new-folder', label: 'Новая папка…', run: () => props.onNewFolder('') },
+        { id: 'new-file', label: menuText('Новый файл…', 'New file…'), run: () => props.onNewFile('') },
+        { id: 'new-folder', label: menuText('Новая папка…', 'New folder…'), run: () => props.onNewFolder('') },
         { separator: true },
-        { id: 'refresh', label: 'Обновить дерево', run: () => setReloadKey((value) => value + 1) },
-        { id: 'collapse', label: 'Свернуть все папки', run: () => setExpanded(new Set()) },
-        { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показать скрытые файлы', run: () => onToggleHidden(!hidden) },
+        { id: 'refresh', label: menuText('Обновить дерево', 'Refresh explorer'), run: () => setReloadKey((value) => value + 1) },
+        { id: 'collapse', label: menuText('Свернуть все папки', 'Collapse all folders'), run: () => setExpanded(new Set()) },
+        { id: 'hidden', label: hidden ? menuText('Скрыть скрытые файлы', 'Hide hidden files') : menuText('Показать скрытые файлы', 'Show hidden files'), run: () => onToggleHidden(!hidden) },
         workspaceRoot === '' ? null : { separator: true },
-        workspaceRoot === '' ? null : { id: 'copy-root', label: 'Копировать путь рабочей папки', run: () => copy(workspaceRoot) },
+        workspaceRoot === '' ? null : { id: 'copy-root', label: menuText('Копировать путь рабочей папки', 'Copy workspace path'), run: () => copy(workspaceRoot) },
         // Touch devices have no reliable hover, so the actions that normally live
         // in a row's context menu are repeated here for the selected row.
         selected === undefined || typeof selected.path !== 'string' || selected.path === ''
@@ -1845,14 +2655,14 @@ window.__ModuleLoader__.load({
           ? null
           : {
               id: 'rename-selected',
-              label: `Переименовать «${baseName(selected.path)}»…`,
+              label: menuText(`Переименовать «${baseName(selected.path)}»…`, `Rename “${baseName(selected.path)}”…`),
               run: () => props.onRename(selected.path, baseName(selected.path), selected.type),
             },
         selected === undefined || typeof selected.path !== 'string' || selected.path === ''
           ? null
           : {
               id: 'delete-selected',
-              label: `Удалить «${baseName(selected.path)}»`,
+              label: menuText(`Удалить «${baseName(selected.path)}»`, `Delete “${baseName(selected.path)}”`),
               run: () => props.onDelete(selected.path, baseName(selected.path), selected.type),
             },
       ].filter(Boolean)
@@ -2533,7 +3343,7 @@ window.__ModuleLoader__.load({
               className: 'dsh-ide-search-input',
               type: 'search',
               value: searchQuery,
-              placeholder: 'Текст для поиска',
+              placeholder: searchRegex ? 'Регулярное выражение' : 'Текст для поиска',
               'aria-label': 'Поиск по содержимому файлов',
               onChange: (event) => setSearchQuery(event.target.value),
               onKeyDown: (event) => {
@@ -2542,6 +3352,30 @@ window.__ModuleLoader__.load({
                 else if (typeof onCloseSearch === 'function') onCloseSearch()
               },
             }),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-search-toggle',
+                'aria-pressed': searchRegex,
+                'aria-label': 'Регулярное выражение',
+                title: 'Регулярное выражение',
+                onClick: () => setSearchRegex((value) => !value),
+              },
+              '.*',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-search-toggle',
+                'aria-pressed': searchWholeWord,
+                'aria-label': 'Слово целиком',
+                title: 'Слово целиком',
+                onClick: () => setSearchWholeWord((value) => !value),
+              },
+              'ab',
+            ),
           ),
           h('div', { className: 'dsh-ide-search-status' }, statusText),
           h('div', { className: 'dsh-ide-tree dsh-ide-search-results', role: 'list' }, rows),
@@ -2737,7 +3571,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Compact stand-in for the menu bar. Seven menus with dropdowns do not fit
+     * Compact stand-in for the menu bar. Desktop menus with dropdowns do not fit
      * a phone width, so the whole command set moves into one scrollable sheet.
      * Commands the bundle cannot honour are already disabled on the desktop and
      * stay out here: on a phone they would only be noise.
@@ -2771,14 +3605,14 @@ window.__ModuleLoader__.load({
             className: 'dsh-ide-sheet-card',
             role: 'dialog',
             'aria-modal': 'true',
-            'aria-label': 'Меню IDE',
+            'aria-label': menuText('Меню IDE', 'IDE menu'),
             onClick: (event) => event.stopPropagation(),
           },
           h(
             'div',
             { className: 'dsh-ide-sheet-head' },
-            h('span', { className: 'dsh-ide-sheet-title' }, 'Меню'),
-            h('button', { type: 'button', className: 'dsh-ide-sheet-close', title: 'Закрыть', onClick: onClose }, '✕'),
+            h('span', { className: 'dsh-ide-sheet-title' }, menuText('Меню', 'Menu')),
+            h('button', { type: 'button', className: 'dsh-ide-sheet-close', title: menuText('Закрыть', 'Close'), onClick: onClose }, '✕'),
           ),
           h(
             'div',
@@ -2862,7 +3696,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dsh-ide-modal-actions' },
-            h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: onClose }, 'Закрыть'),
+            h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: onClose }, menuText('Закрыть', 'Close')),
           ),
         ),
       )
@@ -3025,10 +3859,10 @@ window.__ModuleLoader__.load({
             className: 'dsh-ide-palette-input',
             type: 'text',
             autoFocus: true,
-            placeholder: 'Команда…',
+            placeholder: menuText('Команда…', 'Command…'),
             spellCheck: false,
             value: query,
-            'aria-label': 'Палитра команд',
+            'aria-label': menuText('Палитра команд', 'Command palette'),
             onChange: (event) => setQuery(event.target.value),
             onKeyDown: (event) => {
               if (event.key === 'Escape') {
@@ -3047,7 +3881,7 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dsh-ide-palette-list', role: 'list' },
             visible.length === 0
-              ? h('div', { className: 'dsh-ide-palette-empty' }, 'Ничего не найдено')
+              ? h('div', { className: 'dsh-ide-palette-empty' }, menuText('Ничего не найдено', 'No matches'))
               : visible.map((entry) =>
                   h(
                     'button',
@@ -3056,7 +3890,7 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       className: `dsh-ide-palette-item${entry.disabled === true ? ' dsh-ide-palette-item-off' : ''}`,
                       disabled: entry.disabled === true,
-                      title: entry.disabled === true ? 'Недоступно' : entry.label,
+                      title: entry.disabled === true ? menuText('Недоступно', 'Unavailable') : entry.label,
                       onClick: () => run(entry),
                     },
                     h('span', { className: 'dsh-ide-palette-label' }, entry.label),
@@ -4001,7 +4835,1001 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function ConfirmDialog({ dialog, onSave, onDiscard, onCancel }) {
+    /**
+     * The rule chain is shown as a read-only report: what exists on disk, and
+     * which part of it the next Inline Edit would actually send. Chat and Tab
+     * do not receive these files, so the panel says so instead of implying a
+     * global policy.
+     */
+    function RulesPanel({ tab, sessionId, onClose }) {
+      const [view, setView] = React.useState({ phase: 'loading', rules: [], file: '', truncated: false, error: '' })
+      const [reload, setReload] = React.useState(0)
+      React.useEffect(() => {
+        let alive = true
+        setView({ phase: 'loading', rules: [], file: '', truncated: false, error: '' })
+        void (async () => {
+          try {
+            const payload = await call('rules', { id: tab.hostId, sessionId })
+            if (!alive) return
+            setView({
+              phase: 'ready',
+              rules: Array.isArray(payload.rules) ? payload.rules : [],
+              file: typeof payload.file === 'string' ? payload.file : '',
+              truncated: payload.truncated === true,
+              error: '',
+            })
+          } catch (cause) {
+            if (!alive) return
+            setView({ phase: 'failed', rules: [], file: '', truncated: false, error: describeError(cause) })
+          }
+        })()
+        return () => {
+          alive = false
+        }
+      }, [tab.hostId, sessionId, reload])
+      const reasonLabel = (rule) =>
+        rule.reason === 'limit'
+          ? 'пропущено: общий лимит'
+          : rule.reason === 'ignored'
+            ? 'исключено .cursorignore'
+            : 'пропущено: больше 32 КиБ'
+      return h(
+        'div',
+        { className: 'dsh-ide-modal' },
+        h(
+          'div',
+          { className: 'dsh-ide-modal-card dsh-ide-rules-card' },
+          h(
+            'div',
+            { className: 'dsh-ide-rules-head' },
+            h('div', { className: 'dsh-ide-modal-title' }, 'Правила проекта'),
+            h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
+          ),
+          h('div', { className: 'dsh-ide-modal-text' }, `Для файла ${tab.path} — от корня к его папке.`),
+          view.phase === 'loading' ? h('div', { className: 'dsh-ide-rules-note' }, 'Читаю правила…') : null,
+          view.phase === 'failed'
+            ? h(
+                'div',
+                { className: 'dsh-ide-rules-failed' },
+                h('div', { className: 'dsh-ide-rules-note' }, view.error),
+                h('button', { type: 'button', className: 'dsh-ide-button', onClick: () => setReload((value) => value + 1) }, 'Повторить'),
+              )
+            : null,
+          view.phase === 'ready' && view.rules.length === 0
+            ? h('div', { className: 'dsh-ide-rules-note' }, 'Правил не найдено: AGENTS.md, CLAUDE.md, .cursorrules и .cursor/rules/*.mdc отсутствуют на пути к файлу.')
+            : null,
+          view.phase === 'ready' && view.rules.length > 0
+            ? h(
+                'div',
+                { className: 'dsh-ide-rules-list' },
+                view.rules.map((rule) =>
+                  h(
+                    'div',
+                    { key: rule.path, className: 'dsh-ide-rules-row' },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-rules-row-head' },
+                      h('span', { className: 'dsh-ide-rules-path' }, rule.path),
+                      h(
+                        'span',
+                        { className: `dsh-ide-rules-badge${rule.applied ? ' dsh-ide-rules-badge-on' : ''}` },
+                        rule.applied ? 'применяется' : reasonLabel(rule),
+                      ),
+                    ),
+                    h(
+                      'div',
+                      { className: 'dsh-ide-rules-meta' },
+                      `${rule.dir === '.' ? 'корень' : rule.dir} · ${Math.max(1, Math.round(rule.bytes / 1024))} КиБ`,
+                    ),
+                    rule.preview === '' ? null : h('pre', { className: 'dsh-ide-rules-preview' }, rule.preview),
+                  ),
+                ),
+              )
+            : null,
+          view.truncated ? h('div', { className: 'dsh-ide-rules-note' }, 'Показаны не все правила: сработал предел в 16 файлов.') : null,
+          h('div', { className: 'dsh-ide-rules-foot' }, 'Применяются только к «Изменить выделение»; Tab и чат эти файлы не получают.'),
+        ),
+      )
+    }
+
+    /** Saved plan drafts, reopened into this composer or another open session. */
+    function PlansPanel({ sessionId, onClose, onOpen, onTransfer }) {
+      const [view, setView] = React.useState({ phase: 'loading', plans: [], error: '' })
+      const [reload, setReload] = React.useState(0)
+      React.useEffect(() => {
+        let alive = true
+        setView({ phase: 'loading', plans: [], error: '' })
+        void (async () => {
+          try {
+            const result = await call('planList', { sessionId })
+            if (alive) setView({ phase: 'ready', plans: Array.isArray(result.plans) ? result.plans : [], error: '' })
+          } catch (cause) {
+            if (alive) setView({ phase: 'failed', plans: [], error: messageOf(cause) })
+          }
+        })()
+        return () => {
+          alive = false
+        }
+      }, [sessionId, reload])
+      const stamp = (value) => {
+        const date = new Date(value)
+        return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
+      }
+      return h(
+        'div',
+        { className: 'dsh-ide-modal-card dsh-ide-plans-card', role: 'region', 'aria-label': 'Сохранённые планы' },
+        h(
+          'div',
+          { className: 'dsh-ide-plans-head' },
+          h('strong', null, 'Сохранённые планы'),
+          h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
+        ),
+        view.phase === 'loading' ? h('div', { className: 'dsh-ide-plans-note' }, 'Читаю…') : null,
+        view.phase === 'failed'
+          ? h(
+              'div',
+              { className: 'dsh-ide-plans-failed' },
+              h('div', null, view.error),
+              h('button', { type: 'button', className: 'dsh-ide-button', onClick: () => setReload((value) => value + 1) }, 'Повторить'),
+            )
+          : null,
+        view.phase === 'ready' && view.plans.length === 0
+          ? h('div', { className: 'dsh-ide-plans-note' }, 'Сохранённых планов нет: «Файл → Подготовить план…», затем «Сохранить план…».')
+          : null,
+        view.phase === 'ready' && view.plans.length > 0
+          ? h(
+              'div',
+              { className: 'dsh-ide-plans-list' },
+              view.plans.map((plan) =>
+                h(
+                  'div',
+                  { key: plan.id, className: 'dsh-ide-plans-row' },
+                  h('div', { className: 'dsh-ide-plans-title' }, plan.title),
+                  h('div', { className: 'dsh-ide-plans-meta' }, `${stamp(plan.createdAt)} · ${plan.chars} символов`),
+                  h(
+                    'div',
+                    { className: 'dsh-ide-plans-actions' },
+                    h('button', { type: 'button', className: 'dsh-ide-button', onClick: () => onOpen(plan.id) }, 'В поле ввода'),
+                    h('button', { type: 'button', className: 'dsh-ide-button', onClick: () => onTransfer(plan) }, 'В сессию…'),
+                  ),
+                ),
+              ),
+            )
+          : null,
+        h('div', { className: 'dsh-ide-plans-foot' }, 'Планы хранятся локально; передача в другую сессию только заполняет её поле ввода.'),
+      )
+    }
+
+    function TerminalContextPanel({ onClose, onInsert }) {
+  const [command, setCommand] = React.useState('')
+  const [code, setCode] = React.useState('')
+  const [output, setOutput] = React.useState('')
+  const composed = terminalBlock(command, code, output)
+  const empty = command.trim() === '' && code.trim() === '' && output.trim() === ''
+  return h(
+    'div',
+    { className: 'dsh-ide-modal-card dsh-ide-terminal-card', role: 'region', 'aria-label': 'Запуск терминала в чат' },
+    h(
+      'div',
+      { className: 'dsh-ide-terminal-head' },
+      h('strong', null, 'Запуск терминала в чат'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
+    ),
+    h('div', { className: 'dsh-ide-terminal-note' }, 'Вставьте команду, код выхода и вывод. В чат попадёт только показанный ниже текст; запрос не отправляется.'),
+    h('label', { className: 'dsh-ide-terminal-field' }, 'Команда', h('input', {
+      className: 'dsh-ide-terminal-input',
+      value: command,
+      onChange: (event) => setCommand(event.currentTarget.value),
+      placeholder: 'npm test',
+    })),
+    h('label', { className: 'dsh-ide-terminal-field' }, 'Код выхода', h('input', {
+      className: 'dsh-ide-terminal-input dsh-ide-terminal-code',
+      value: code,
+      onChange: (event) => setCode(event.currentTarget.value),
+      placeholder: '0',
+    })),
+    h('label', { className: 'dsh-ide-terminal-field' }, 'Вывод', h('textarea', {
+      className: 'dsh-ide-terminal-output',
+      value: output,
+      rows: 7,
+      onChange: (event) => setOutput(event.currentTarget.value),
+      placeholder: 'Вставьте вывод команды',
+    })),
+    h('div', { className: 'dsh-ide-terminal-meta' },
+      empty ? 'Пока нечего вставлять' : `Вставится ${composed.chars} символов в ${composed.lines} строк` +
+        (composed.truncated ? ` · вывод обрезан до ${TERMINAL_CONTEXT_CHARS} символов` : '')),
+    h('pre', { className: 'dsh-ide-terminal-preview' }, empty ? 'Предпросмотр появится здесь.' : composed.text),
+    h('div', { className: 'dsh-ide-terminal-actions' },
+      h('button', {
+        type: 'button',
+        className: 'dsh-ide-button dsh-ide-button-primary',
+        disabled: empty,
+        onClick: () => {
+          if (onInsert(composed.text) === true) onClose()
+        },
+      }, 'Вставить в чат'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Отмена')),
+  )
+}
+
+function WorktreesPanel({ sessionId, call, onClose }) {
+  const callRef = React.useRef(call)
+  callRef.current = call
+  const [view, setView] = React.useState({ phase: 'loading' })
+  const [path, setPath] = React.useState('.worktrees/task')
+  const [branch, setBranch] = React.useState('task')
+  const [create, setCreate] = React.useState(true)
+  const [busy, setBusy] = React.useState(false)
+  const load = async () => {
+    try {
+      const payload = await callRef.current('scmWorktrees', { sessionId })
+      if (payload.error) throw new Error(payload.error.message ?? 'Не удалось получить рабочие копии')
+      setView({ phase: 'ready', items: payload.worktrees ?? [] })
+    } catch (error) {
+      setView({ phase: 'failed', error: messageOf(error) })
+    }
+  }
+  React.useEffect(() => {
+    void load()
+  }, [sessionId])
+  const submit = async (action) => {
+    if (busy) return
+    setBusy(true)
+    try {
+      const payload = action()
+      const answer = await payload
+      if (answer.error) throw new Error(answer.error.message ?? 'Операция не удалась')
+      setView({ phase: 'ready', items: answer.worktrees ?? [] })
+    } catch (error) {
+      setView({ phase: 'failed', error: messageOf(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+  return h(
+    'div',
+    { className: 'dsh-ide-modal-card dsh-ide-worktree-card', role: 'region', 'aria-label': 'Рабочие копии' },
+    h('div', { className: 'dsh-ide-worktree-head' },
+      h('strong', null, 'Рабочие копии'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть')),
+    h('div', { className: 'dsh-ide-worktree-note' },
+      'Изолированная копия репозитория на отдельной ветке. Создаётся только внутри открытой рабочей папки; основную копию удалить нельзя.'),
+    view.phase === 'loading' ? h('div', { className: 'dsh-ide-worktree-note' }, 'Читаю список…') : null,
+    view.phase === 'failed' ? h('div', { className: 'dsh-ide-worktree-error' }, view.error) : null,
+    view.phase === 'ready'
+      ? h('div', { className: 'dsh-ide-worktree-list' },
+          view.items.length === 0
+            ? h('div', { className: 'dsh-ide-worktree-note' }, 'Git не вернул рабочих копий.')
+            : view.items.map((item) => h('div', { key: item.path, className: 'dsh-ide-worktree-row' },
+                h('div', { className: 'dsh-ide-worktree-main' },
+                  h('div', { className: 'dsh-ide-worktree-path' }, item.path),
+                  h('div', { className: 'dsh-ide-worktree-meta' },
+                    (item.branch || (item.detached ? 'detached' : '—')) +
+                      (item.current ? ' · текущая' : '') +
+                      (item.locked ? ' · заблокирована' : '') +
+                      (item.prunable ? ' · можно очистить' : ''))),
+                !item.current
+                  ? h('button', {
+                      type: 'button',
+                      className: 'dsh-ide-button',
+                      disabled: busy,
+                      onClick: () => {
+                        if (!window.confirm(`Удалить рабочую копию ${item.path}?`)) return
+                        void submit(() => callRef.current('scmRemoveWorktree', { sessionId, path: item.path }))
+                      },
+                    }, 'Удалить')
+                  : null)))
+      : null,
+    h('div', { className: 'dsh-ide-worktree-form' },
+      h('label', { className: 'dsh-ide-worktree-field' }, 'Ветка',
+        h('input', {
+          className: 'dsh-ide-debug-input',
+          value: branch,
+          onChange: (event) => setBranch(event.currentTarget.value),
+          placeholder: 'feature/task',
+        })),
+      h('label', { className: 'dsh-ide-worktree-field' }, 'Путь внутри рабочей папки',
+        h('input', {
+          className: 'dsh-ide-debug-input',
+          value: path,
+          onChange: (event) => setPath(event.currentTarget.value),
+          placeholder: '.worktrees/task',
+        })),
+      h('label', { className: 'dsh-ide-worktree-check' },
+        h('input', { type: 'checkbox', checked: create, onChange: (event) => setCreate(event.currentTarget.checked) }),
+        'Создать новую ветку от HEAD'),
+      h('button', {
+        type: 'button',
+        className: 'dsh-ide-button dsh-ide-button-primary',
+        disabled: busy || branch.trim() === '' || path.trim() === '',
+        onClick: () => void submit(() => callRef.current('scmCreateWorktree', {
+          sessionId,
+          path: path.trim(),
+          branch: branch.trim(),
+          create,
+        })),
+      }, busy ? 'Создаю…' : 'Создать копию')),
+  )
+}
+
+function NotesPackPanel({ onClose, onInsert, onCapture }) {
+  const [notes, setNotes] = React.useState([])
+  const [draft, setDraft] = React.useState('')
+  const composed = notesBlock(notes)
+  const add = (text, path, line) => {
+    const value = typeof text === 'string' ? text.trim() : ''
+    if (value === '' || notes.length >= NOTES_MAX) return
+    setNotes([...notes, { text: value, path, line }])
+  }
+  const capture = () => {
+    const taken = onCapture()
+    if (taken !== undefined) add(taken.text, taken.path, taken.line)
+  }
+  return h(
+    'div',
+    { className: 'dsh-ide-modal-card dsh-ide-notes-card', role: 'region', 'aria-label': 'Пакет заметок' },
+    h(
+      'div',
+      { className: 'dsh-ide-notes-head' },
+      h('strong', null, 'Пакет заметок'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
+    ),
+    h('div', { className: 'dsh-ide-notes-note' },
+      'Соберите пронумерованные замечания и отправьте один список. В чат попадёт только предпросмотр ниже; запрос не отправляется.'),
+    h('textarea', {
+      className: 'dsh-ide-notes-input',
+      value: draft,
+      rows: 2,
+      placeholder: 'Что исправить: текст, ожидаемое поведение, причина',
+      onChange: (event) => setDraft(event.currentTarget.value),
+      onKeyDown: (event) => {
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+          add(draft)
+          setDraft('')
+        }
+      },
+    }),
+    h('div', { className: 'dsh-ide-notes-actions' },
+      h('button', {
+        type: 'button',
+        className: 'dsh-ide-button dsh-ide-button-primary',
+        disabled: draft.trim() === '' || notes.length >= NOTES_MAX,
+        onClick: () => {
+          add(draft)
+          setDraft('')
+        },
+      }, 'Добавить'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: capture }, 'Из выделения'),
+      h('span', { className: 'dsh-ide-notes-meta' }, `Заметок: ${notes.length} из ${NOTES_MAX}`)),
+    notes.length > 0
+      ? h('ol', { className: 'dsh-ide-notes-list' },
+          notes.map((note, index) => h('li', { key: index, className: 'dsh-ide-notes-row' },
+            h('span', { className: 'dsh-ide-notes-where' },
+              note.path ? `${normalPath(note.path)}${note.line ? `:${note.line}` : ''}` : 'без файла'),
+            h('span', { className: 'dsh-ide-notes-text' }, note.text),
+            h('button', {
+              type: 'button',
+              className: 'dsh-ide-notes-remove',
+              title: 'Убрать заметку',
+              'aria-label': 'Убрать заметку',
+              onClick: () => setNotes(notes.filter((_, at) => at !== index)),
+            }, '×'))))
+      : h('div', { className: 'dsh-ide-notes-empty' }, 'Пока нет заметок.'),
+    h('div', { className: 'dsh-ide-notes-meta' },
+      composed.count === 0 ? 'Пока нечего вставлять' : `Вставится ${composed.count} заметок · ${composed.chars} символов${composed.truncated ? ' · список обрезан' : ''}`),
+    h('pre', { className: 'dsh-ide-notes-preview' }, composed.count === 0 ? 'Предпросмотр появится здесь.' : composed.text),
+    h('div', { className: 'dsh-ide-notes-footer' },
+      h('button', {
+        type: 'button',
+        className: 'dsh-ide-button dsh-ide-button-primary',
+        disabled: composed.count === 0,
+        onClick: () => {
+          if (onInsert(composed.text) === true) onClose()
+        },
+      }, 'Вставить в чат'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Отмена')),
+  )
+}
+
+function CodeTourPanel({ steps, index, onClose, onAdd, onMove, onRemove, onJump, onPrev, onNext }) {
+  const [note, setNote] = React.useState('')
+  const list = Array.isArray(steps) ? steps : []
+  return h(
+    'div',
+    { className: 'dsh-ide-modal-card dsh-ide-tour-card', role: 'region', 'aria-label': 'Экскурсия по коду' },
+    h(
+      'div',
+      { className: 'dsh-ide-tour-head' },
+      h('strong', null, 'Экскурсия по коду'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
+    ),
+    h('div', { className: 'dsh-ide-tour-note' },
+      'Маршрут ревью по файлам и строкам. Шаги живут только в этой панели; файлы не меняются, модель не вызывается.'),
+    h('div', { className: 'dsh-ide-tour-actions' },
+      h('input', {
+        className: 'dsh-ide-tour-input',
+        value: note,
+        placeholder: 'Пояснение к шагу (необязательно)',
+        onChange: (event) => setNote(event.currentTarget.value),
+        onKeyDown: (event) => {
+          if (event.key === 'Enter') {
+            onAdd(note)
+            setNote('')
+          }
+        },
+      }),
+      h('button', {
+        type: 'button',
+        className: 'dsh-ide-button dsh-ide-button-primary',
+        disabled: list.length >= TOUR_MAX_STEPS,
+        onClick: () => {
+          onAdd(note)
+          setNote('')
+        },
+      }, 'Добавить текущую строку')),
+    list.length > 0
+      ? h('ol', { className: 'dsh-ide-tour-list' },
+          list.map((step, at) => h('li', {
+            key: `${step.path}:${step.line}:${at}`,
+            className: `dsh-ide-tour-row${at === index ? ' dsh-ide-tour-row-current' : ''}`,
+          },
+          h('button', {
+            type: 'button',
+            className: 'dsh-ide-tour-open',
+            title: 'Открыть этот шаг',
+            onClick: () => onJump(step, at),
+          }, `${at + 1}. ${step.path}:${step.line}`),
+          h('span', { className: 'dsh-ide-tour-text' }, step.note === '' ? 'без пояснения' : step.note),
+          h('span', { className: 'dsh-ide-tour-row-actions' },
+            h('button', { type: 'button', className: 'dsh-ide-tour-move', disabled: at === 0, title: 'Выше', onClick: () => onMove(at, -1) }, '↑'),
+            h('button', { type: 'button', className: 'dsh-ide-tour-move', disabled: at === list.length - 1, title: 'Ниже', onClick: () => onMove(at, 1) }, '↓'),
+            h('button', { type: 'button', className: 'dsh-ide-tour-move', title: 'Убрать шаг', onClick: () => onRemove(at) }, '×')))))
+      : h('div', { className: 'dsh-ide-tour-empty' }, 'Пока нет шагов. Поставьте курсор в файле и добавьте строку.'),
+    h('div', { className: 'dsh-ide-tour-footer' },
+      h('span', { className: 'dsh-ide-tour-meta' }, `Шаг ${tourProgress(index, list.length)}`),
+      h('button', { type: 'button', className: 'dsh-ide-button', disabled: list.length === 0 || index <= 0, onClick: onPrev }, 'Назад'),
+      h('button', { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', disabled: list.length === 0 || index >= list.length - 1, onClick: onNext }, 'Далее')),
+  )
+}
+
+function DebugPanel({ onClose, onInsert }) {
+  const [hypothesis, setHypothesis] = React.useState('')
+  const [steps, setSteps] = React.useState('')
+  const [runA, setRunA] = React.useState('')
+  const [runB, setRunB] = React.useState('')
+  const [logs, setLogs] = React.useState('')
+  const [cleaned, setCleaned] = React.useState(false)
+  const composed = debugBlock({ hypothesis, steps, runA, runB, logs, cleaned })
+  const empty = [hypothesis, steps, runA, runB, logs].every((value) => value.trim() === '') && !cleaned
+  return h(
+    'div',
+    { className: 'dsh-ide-modal-card dsh-ide-debug-card', role: 'region', 'aria-label': 'Журнал отладки' },
+    h(
+      'div',
+      { className: 'dsh-ide-debug-head' },
+      h('strong', null, 'Журнал отладки'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Закрыть'),
+    ),
+    h('div', { className: 'dsh-ide-debug-note' },
+      'Это не отладчик: точки останова и процессы им не управляются. Журнал собирает гипотезу, шаги, два прогона и состояние временных логов, чтобы приложить их к чату одним блоком.'),
+    h('label', { className: 'dsh-ide-debug-field' }, 'Гипотеза', h('input', {
+      className: 'dsh-ide-debug-input',
+      value: hypothesis,
+      onChange: (event) => setHypothesis(event.currentTarget.value),
+      placeholder: 'Что, по-вашему, ломается и почему',
+    })),
+    h('label', { className: 'dsh-ide-debug-field' }, 'Шаги воспроизведения', h('textarea', {
+      className: 'dsh-ide-debug-text',
+      value: steps,
+      rows: 3,
+      onChange: (event) => setSteps(event.currentTarget.value),
+      placeholder: '1. … 2. …',
+    })),
+    h('div', { className: 'dsh-ide-debug-runs' },
+      h('label', { className: 'dsh-ide-debug-field' }, 'Прогон A', h('textarea', {
+        className: 'dsh-ide-debug-text',
+        value: runA,
+        rows: 3,
+        onChange: (event) => setRunA(event.currentTarget.value),
+        placeholder: 'Команда, вывод, результат',
+      })),
+      h('label', { className: 'dsh-ide-debug-field' }, 'Прогон B', h('textarea', {
+        className: 'dsh-ide-debug-text',
+        value: runB,
+        rows: 3,
+        onChange: (event) => setRunB(event.currentTarget.value),
+        placeholder: 'Повтор после изменения',
+      }))),
+    h('label', { className: 'dsh-ide-debug-field' }, 'Временные логи', h('input', {
+      className: 'dsh-ide-debug-input',
+      value: logs,
+      onChange: (event) => setLogs(event.currentTarget.value),
+      placeholder: 'Путь к логам, которые надо убрать',
+    })),
+    h('label', { className: 'dsh-ide-debug-check' },
+      h('input', {
+        type: 'checkbox',
+        checked: cleaned,
+        onChange: (event) => setCleaned(event.currentTarget.checked),
+      }),
+      'Временные логи убраны'),
+    !cleaned && logs.trim() !== ''
+      ? h('div', { className: 'dsh-ide-debug-warn' }, 'В блоке будет пометка, что логи ещё не убраны.')
+      : null,
+    h('div', { className: 'dsh-ide-debug-meta' },
+      empty ? 'Пока нечего вставлять' : `Вставится ${composed.chars} символов${composed.truncated ? ' · журнал обрезан' : ''}`),
+    h('pre', { className: 'dsh-ide-debug-preview' }, empty ? 'Предпросмотр появится здесь.' : composed.text),
+    h('div', { className: 'dsh-ide-debug-actions' },
+      h('button', {
+        type: 'button',
+        className: 'dsh-ide-button dsh-ide-button-primary',
+        disabled: empty,
+        onClick: () => {
+          if (onInsert(composed.text) === true) onClose()
+        },
+      }, 'Вставить в чат'),
+      h('button', { type: 'button', className: 'dsh-ide-button', onClick: onClose }, 'Отмена')),
+  )
+}
+
+function SplitEditor({ monaco, runtime, tab, dirty, onDirty, onSave, onActivate, onClose }) {
+  const host = React.useRef(null)
+  const callbacks = React.useRef({ onDirty, onSave })
+  callbacks.current = { onDirty, onSave }
+  React.useEffect(() => {
+    if (monaco === undefined || host.current === null) return undefined
+    let model = runtime.current.models.get(tab.key)
+    if (model === undefined) {
+      model = monaco.editor.createModel(
+        tab.text,
+        tab.language,
+        monaco.Uri.parse(`inmemory://dsh-ide/${encodeURIComponent(tab.key)}`),
+      )
+      runtime.current.models.set(tab.key, model)
+      runtime.current.modelTabs.set(model.uri.toString(), tab.key)
+    }
+    const editor = monaco.editor.create(host.current, {
+      model,
+      automaticLayout: true,
+      theme: themeName() === 'dark' ? 'vs-dark' : 'vs',
+      fontSize: 12,
+      lineHeight: 19,
+      minimap: { enabled: false },
+      tabSize: 2,
+      insertSpaces: true,
+      scrollBeyondLastLine: false,
+      wordBasedSuggestions: 'off',
+      renderLineHighlight: 'line',
+      smoothScrolling: true,
+      wordWrap: 'on',
+      readOnly: tab.readOnly === true,
+      glyphMargin: false,
+      padding: { top: 8, bottom: 16 },
+    })
+    const change = editor.onDidChangeModelContent(() => callbacks.current.onDirty(tab.key))
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void callbacks.current.onSave(tab.key))
+    return () => {
+      change.dispose()
+      editor.dispose()
+    }
+  }, [monaco, tab.key])
+  return h(
+    'div',
+    { className: 'dsh-ide-split' },
+    h(
+      'div',
+      { className: 'dsh-ide-split-head' },
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'dsh-ide-split-title',
+          title: 'Открыть этот файл в основной панели',
+          onClick: () => onActivate(tab.key),
+        },
+        tab.path === '' ? tab.name : tab.path,
+      ),
+      dirty ? h('span', { className: 'dsh-ide-split-dirty', title: 'Есть несохранённые правки' }, '●') : null,
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'dsh-ide-split-action',
+          title: 'Сохранить файл',
+          disabled: tab.readOnly === true,
+          onClick: () => void onSave(tab.key),
+        },
+        'Сохранить',
+      ),
+      h('button', { type: 'button', className: 'dsh-ide-split-action', title: 'Закрыть вторую панель', onClick: onClose }, '×'),
+    ),
+    h('div', { className: 'dsh-ide-split-stage', ref: host }),
+  )
+}
+
+function ExplorePanel({ onClose, onAsk, onOpen }) {
+  const [question, setQuestion] = React.useState('')
+  const [view, setView] = React.useState({ phase: 'idle' })
+  const inputRef = React.useRef(undefined)
+  React.useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+  const submit = async () => {
+    const value = question.trim()
+    if (value === '' || view.phase === 'running') return
+    setView({ phase: 'running' })
+    try {
+      const payload = await onAsk(value)
+      if (payload.error) throw new Error(payload.error.message ?? 'Не удалось получить ответ.')
+      setView({ phase: 'ready', ...payload })
+    } catch (error) {
+      setView({ phase: 'failed', error: messageOf(error) })
+    }
+  }
+  return h(
+    'div',
+    { className: 'dsh-ide-modal' },
+    h(
+      'div',
+      { className: 'dsh-ide-modal-card dsh-ide-explore-card' },
+      h(
+        'div',
+        { className: 'dsh-ide-explore-head' },
+        h('span', { className: 'dsh-ide-explore-title' }, 'Спросить о проекте'),
+        h(
+          'button',
+          { type: 'button', className: 'dsh-ide-explore-close', onClick: onClose, title: 'Закрыть', 'aria-label': 'Закрыть' },
+          '×',
+        ),
+      ),
+      h('input', {
+        ref: inputRef,
+        className: 'dsh-ide-explore-input',
+        value: question,
+        placeholder: 'Например: где считается ответ?',
+        onChange: (event) => setQuestion(event.target.value),
+        onKeyDown: (event) => {
+          if (event.key === 'Enter') void submit()
+          if (event.key === 'Escape') onClose()
+        },
+      }),
+      h(
+        'div',
+        { className: 'dsh-ide-explore-actions' },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dsh-ide-explore-ask',
+            disabled: question.trim() === '' || view.phase === 'running',
+            onClick: () => void submit(),
+          },
+          view.phase === 'running' ? 'Ищу…' : 'Спросить',
+        ),
+        h('span', { className: 'dsh-ide-explore-note' }, 'Поиск локальный; модели уходят только найденные строки.'),
+      ),
+      view.phase === 'failed'
+        ? h('div', { className: 'dsh-ide-explore-error' }, view.error)
+        : null,
+      view.phase === 'ready'
+        ? h(
+            'div',
+            { className: 'dsh-ide-explore-result' },
+            h('pre', { className: 'dsh-ide-explore-answer' }, view.answer),
+            view.sources.length > 0
+              ? h(
+                  'div',
+                  { className: 'dsh-ide-explore-sources' },
+                  h('div', { className: 'dsh-ide-explore-sources-head' }, 'Источники'),
+                  view.sources.map((source) =>
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        key: `${source.path}:${source.line}`,
+                        className: 'dsh-ide-explore-source',
+                        onClick: () => onOpen(source),
+                        title: source.text,
+                      },
+                      `${source.path}:${source.line}`,
+                    ),
+                  ),
+                )
+              : h('div', { className: 'dsh-ide-explore-note' }, 'Ссылок на найденные строки нет.'),
+            h(
+              'div',
+              { className: 'dsh-ide-explore-meta' },
+              `Просмотрено файлов: ${view.files.length}${view.truncated ? ' · список усечён' : ''}`,
+            ),
+          )
+        : null,
+      h(
+        'div',
+        { className: 'dsh-ide-explore-foot' },
+        'Ответ не меняет файлы. Нажмите источник, чтобы открыть строку.',
+      ),
+    ),
+  )
+}
+
+function ConversationSearchPanel({ onClose, onSearch, onOpen, onAttach }) {
+  const [query, setQuery] = React.useState('')
+  const [view, setView] = React.useState({ phase: 'idle' })
+  const inputRef = React.useRef(undefined)
+  React.useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+  const submit = async () => {
+    const value = query.trim()
+    if (value === '' || view.phase === 'running') return
+    setView({ phase: 'running' })
+    try {
+      const payload = await onSearch(value)
+      if (payload.error) throw new Error(payload.error.message ?? 'Поиск не удался.')
+      setView({ phase: 'ready', ...payload })
+    } catch (error) {
+      setView({ phase: 'failed', error: messageOf(error) })
+    }
+  }
+  return h(
+    'div',
+    { className: 'dsh-ide-modal' },
+    h(
+      'div',
+      { className: 'dsh-ide-modal-card dsh-ide-conv-card' },
+      h(
+        'div',
+        { className: 'dsh-ide-explore-head' },
+        h('span', { className: 'dsh-ide-explore-title' }, 'Найти в разговорах'),
+        h(
+          'button',
+          { type: 'button', className: 'dsh-ide-explore-close', onClick: onClose, title: 'Закрыть', 'aria-label': 'Закрыть' },
+          '×',
+        ),
+      ),
+      h('input', {
+        ref: inputRef,
+        className: 'dsh-ide-explore-input',
+        value: query,
+        placeholder: 'Например: как решили конфликт индекса?',
+        onChange: (event) => setQuery(event.target.value),
+        onKeyDown: (event) => {
+          if (event.key === 'Enter') void submit()
+          if (event.key === 'Escape') onClose()
+        },
+      }),
+      h(
+        'div',
+        { className: 'dsh-ide-explore-actions' },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dsh-ide-explore-ask',
+            disabled: query.trim() === '' || view.phase === 'running',
+            onClick: () => void submit(),
+          },
+          view.phase === 'running' ? 'Ищу…' : 'Найти',
+        ),
+        h('span', { className: 'dsh-ide-explore-note' }, 'Индекс разговоров этой рабочей папки; модель не вызывается.'),
+      ),
+      view.phase === 'failed' ? h('div', { className: 'dsh-ide-explore-error' }, view.error) : null,
+      view.phase === 'ready'
+        ? h(
+            'div',
+            { className: 'dsh-ide-conv-result' },
+            view.items.length === 0
+              ? h('div', { className: 'dsh-ide-explore-note' }, 'Ничего не найдено. Попробуйте другие слова.')
+              : h(
+                  'div',
+                  { className: 'dsh-ide-conv-list' },
+                  view.items.map((item) =>
+                    h(
+                      'div',
+                      { key: `${item.sessionId}:${item.seq ?? 0}`, className: 'dsh-ide-conv-row' },
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-conv-hit',
+                          onClick: () => onOpen(item),
+                        },
+                        h('span', { className: 'dsh-ide-conv-snippet' }, item.snippet || '(без фрагмента)'),
+                        h(
+                          'span',
+                          { className: 'dsh-ide-conv-meta' },
+                          `${item.title || item.sessionId}${item.time ? ` · ${new Date(item.time).toLocaleString('ru-RU')}` : ''}`,
+                        ),
+                      ),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-ide-conv-attach',
+                          disabled: !Number.isInteger(item.seq),
+                          title: Number.isInteger(item.seq) ? 'Приложить этот ход в поле ввода' : 'Ход без номера приложить нельзя',
+                          onClick: () => void onAttach(item),
+                        },
+                        'Приложить',
+                      ),
+                    ),
+                  ),
+                ),
+            h(
+              'div',
+              { className: 'dsh-ide-explore-meta' },
+              `Найдено: ${view.items.length}${view.hasMore ? ' · есть ещё' : ''}`,
+            ),
+          )
+        : null,
+      h(
+        'div',
+        { className: 'dsh-ide-explore-foot' },
+        'Результат открывается в своей сессии. Модель не вызывается, файлы не меняются.',
+      ),
+    ),
+  )
+}
+
+function ConversationSourcePanel({ source, onClose, onInsert }) {
+  const text = typeof source.text === 'string' ? source.text : ''
+  const preview = text.slice(0, 1200)
+  return h(
+    'div',
+    { className: 'dsh-ide-modal' },
+    h(
+      'div',
+      { className: 'dsh-ide-modal-card dsh-ide-conv-card' },
+      h(
+        'div',
+        { className: 'dsh-ide-explore-head' },
+        h('span', { className: 'dsh-ide-explore-title' }, 'Источник из разговора'),
+        h(
+          'button',
+          { type: 'button', className: 'dsh-ide-explore-close', onClick: onClose, title: 'Закрыть', 'aria-label': 'Закрыть' },
+          '×',
+        ),
+      ),
+      h('div', { className: 'dsh-ide-conv-source-title' }, source.title || source.sessionId),
+      h(
+        'div',
+        { className: 'dsh-ide-explore-meta' },
+        `${source.chars} символ(ов) · ${source.type === 'assistant/message' ? 'ответ' : 'вопрос'}${
+          source.time ? ` · ${new Date(source.time).toLocaleString('ru-RU')}` : ''
+        }${source.truncated ? ' · в чат попадёт только начало' : ''}`,
+      ),
+      h('pre', { className: 'dsh-ide-conv-source-text' }, preview),
+      text.length > preview.length ? h('div', { className: 'dsh-ide-explore-note' }, 'Показаны первые 1200 символов.') : null,
+      h(
+        'div',
+        { className: 'dsh-ide-explore-actions' },
+        h(
+          'button',
+          { type: 'button', className: 'dsh-ide-explore-ask', onClick: () => void onInsert() },
+          'Вставить в чат',
+        ),
+        h('button', { type: 'button', className: 'dsh-ide-explore-ask', onClick: onClose }, 'Отмена'),
+        h('span', { className: 'dsh-ide-explore-note' }, 'Вставляется только этот ход, не вся сессия.'),
+      ),
+    ),
+  )
+}
+
+function SideChatPanel({ context, onClose, onAsk }) {
+  const [question, setQuestion] = React.useState('')
+  const [turns, setTurns] = React.useState([])
+  const [view, setView] = React.useState({ phase: 'idle' })
+  const inputRef = React.useRef(undefined)
+  React.useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+  const running = view.phase === 'running'
+  const ask = async () => {
+    const value = question.trim()
+    if (value === '' || running) return
+    setView({ phase: 'running' })
+    try {
+      const payload = await onAsk({
+        id: context.id,
+        start: context.start,
+        end: context.end,
+        selection: context.text,
+        question: value,
+        history: turns.map((turn) => ({ question: turn.question, answer: turn.answer })),
+      })
+      if (payload.error) throw new Error(payload.error.message ?? 'Не удалось получить ответ.')
+      setTurns([...turns, { question: value, answer: payload.answer }])
+      setQuestion('')
+      setView({ phase: 'idle' })
+    } catch (error) {
+      setView({ phase: 'failed', error: messageOf(error) })
+    }
+  }
+  return h(
+    'div',
+    { className: 'dsh-ide-modal' },
+    h(
+      'div',
+      { className: 'dsh-ide-modal-card dsh-ide-side-card' },
+      h(
+        'div',
+        { className: 'dsh-ide-side-head' },
+        h('span', { className: 'dsh-ide-side-title' }, 'Побочный вопрос'),
+        h(
+          'button',
+          { type: 'button', className: 'dsh-ide-side-close', onClick: onClose, title: 'Закрыть', 'aria-label': 'Закрыть' },
+          '×',
+        ),
+      ),
+      h(
+        'div',
+        { className: 'dsh-ide-side-context' },
+        h('div', { className: 'dsh-ide-side-where' }, `${context.path}:${context.start + 1}–${context.end + 1}`),
+        h('pre', { className: 'dsh-ide-side-selection' }, context.text.length > 400 ? `${context.text.slice(0, 400)}…` : context.text),
+      ),
+      turns.length > 0
+        ? h(
+            'div',
+            { className: 'dsh-ide-side-turns' },
+            turns.map((turn, index) =>
+              h(
+                'div',
+                { key: index, className: 'dsh-ide-side-turn' },
+                h('div', { className: 'dsh-ide-side-question' }, turn.question),
+                h('div', { className: 'dsh-ide-side-answer' }, turn.answer),
+              ),
+            ),
+          )
+        : null,
+      view.phase === 'failed' ? h('div', { className: 'dsh-ide-side-error' }, view.error) : null,
+      h('input', {
+        ref: inputRef,
+        className: 'dsh-ide-side-input',
+        value: question,
+        placeholder: 'Спросить по выделению',
+        onChange: (event) => setQuestion(event.target.value),
+        onKeyDown: (event) => {
+          if (event.key === 'Enter') void ask()
+          if (event.key === 'Escape') onClose()
+        },
+      }),
+      h(
+        'div',
+        { className: 'dsh-ide-side-actions' },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dsh-ide-side-ask',
+            disabled: question.trim() === '' || running,
+            onClick: () => void ask(),
+          },
+          running ? 'Спрашиваю…' : 'Спросить',
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dsh-ide-side-new',
+            disabled: turns.length === 0 || running,
+            onClick: () => {
+              setTurns([])
+              setView({ phase: 'idle' })
+            },
+          },
+          'Новый вопрос',
+        ),
+      ),
+      h(
+        'div',
+        { className: 'dsh-ide-side-foot' },
+        'Этот разговор не попадает в основной чат. Выделение уходит модели только по кнопке; файл не меняется.',
+      ),
+    ),
+  )
+}
+
+function ConfirmDialog({ dialog, onSave, onDiscard, onCancel }) {
       if (dialog.mode === 'delete') {
         const kind = dialog.type === 'directory' ? 'папку' : 'файл'
         return h(
@@ -4466,7 +6294,7 @@ function matchChord(keymap, event) {
   return undefined
 }
 
-function OutputPanel({ panel, height, trace, showChat, onTab, onSelect, onAccept, onClose }) {
+function OutputPanel({ panel, height, trace, showChat, toolTabs, onTab, onSelect, onAccept, onClose }) {
   const [menu, setMenu] = React.useState(undefined)
   React.useEffect(() => {
     if (menu === undefined) return undefined
@@ -4491,6 +6319,7 @@ function OutputPanel({ panel, height, trace, showChat, onTab, onSelect, onAccept
   const system = conversation === undefined ? '' : conversation.system
   const message = conversation === undefined ? '' : conversation.message
   const answer = conversation === undefined ? '' : conversation.answer
+  const toolActive = toolTabs.some((tool) => tool.id === panel.tab)
   const chatOpen = showChat !== false && panel.tab === 'chat'
   return h(
     'div',
@@ -4502,10 +6331,10 @@ function OutputPanel({ panel, height, trace, showChat, onTab, onSelect, onAccept
         'button',
         {
           type: 'button',
-          className: !chatOpen ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
+          className: !chatOpen && !toolActive ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
           onClick: () => onTab('trajectory'),
         },
-        'Траектория',
+        menuText('Траектория', 'Trajectory'),
       ),
       showChat === false ? null : h(
         'button',
@@ -4514,15 +6343,20 @@ function OutputPanel({ panel, height, trace, showChat, onTab, onSelect, onAccept
           className: chatOpen ? 'dsh-ide-panel-tab dsh-ide-panel-tab-active' : 'dsh-ide-panel-tab',
           onClick: () => onTab('chat'),
         },
-        'Чат',
+        menuText('Чат', 'Chat'),
       ),
+      toolTabs.map(({ id, label }) => h('button', { key: id, type: 'button',
+        className: `dsh-ide-panel-tab${panel.tab === id ? ' dsh-ide-panel-tab-active' : ''}`,
+        onClick: () => onTab(id),
+      }, label)),
       h('span', { className: 'dsh-ide-panel-spacer' }),
-      h('span', { className: 'dsh-ide-panel-hint' }, trace.length === 0 ? 'пока пусто' : `запросов: ${trace.length}`),
+      toolActive ? null : h('span', { className: 'dsh-ide-panel-hint' }, trace.length === 0 ? 'пока пусто' : `запросов: ${trace.length}`),
       showChat === false
         ? h('button', { type: 'button', className: 'dsh-ide-panel-close', title: 'Закрыть панель', onClick: onClose }, '×')
         : null,
     ),
-    !chatOpen
+    toolTabs.map(({ id, body }) => h('div', { key: id, hidden: panel.tab !== id, className: 'dsh-ide-panel-tool' }, body)),
+    toolActive ? null : !chatOpen
       ? h(
           'div',
           { className: 'dsh-ide-panel-body' },
@@ -4619,7 +6453,7 @@ function OutputPanel({ panel, height, trace, showChat, onTab, onSelect, onAccept
                 onAccept(row)
               },
             },
-            'Принять правку',
+            menuText('Принять правку', 'Accept edit'),
           ),
         ),
   )
@@ -4654,6 +6488,7 @@ function IdeBody(props) {
         // Inline Edit: one selection, one instruction, one reviewable
         // replacement. The payload never contains Monaco objects.
         inlineEdit: undefined,
+        attribution: [],
         inlineSeq: 0,
         changeSeq: 0,
         // The last non-empty selection, kept because a touch on a menu (or a
@@ -4759,13 +6594,49 @@ function IdeBody(props) {
       const scmSeq = React.useRef(0)
       const scmAbort = React.useRef(undefined)
       const scmDiffSeq = React.useRef(0)
+      // «В чат» sends one exact patch, not the whole panel: the pending answer
+      // disables the button instead of letting two quotes race the composer.
+      const [scmPatching, setScmPatching] = React.useState(false)
+      /** `{path, line}` the next ready Git comparison should reveal. */
+      const scmReveal = React.useRef(undefined)
       const [paletteOpen, setPaletteOpen] = React.useState(false)
       const [explorerSide, setExplorerSide] = React.useState('left')
       const [hidden, setHidden] = React.useState(false)
       const [preferences, setPreferences] = React.useState(undefined)
       const [promptDefault, setPromptDefault] = React.useState('')
       const [settingsOpen, setSettingsOpen] = React.useState(false)
+      const [rulesOpen, setRulesOpen] = React.useState(false)
+      const [plansOpen, setPlansOpen] = React.useState(false)
+      const [terminalOpen, setTerminalOpen] = React.useState(false)
+      const [snoozeUntil, setSnoozeUntil] = React.useState(0)
+      const [splitKey, setSplitKey] = React.useState('')
+  const [crossFile, setCrossFile] = React.useState(undefined)
+  const [symbolView, setSymbolView] = React.useState(undefined)
+  const [blameView, setBlameView] = React.useState(undefined)
+  const [exploreOpen, setExploreOpen] = React.useState(false)
+  const [convSearchOpen, setConvSearchOpen] = React.useState(false)
+  const [convSource, setConvSource] = React.useState(undefined)
+  const [debugOpen, setDebugOpen] = React.useState(false)
+  const [notesPackOpen, setNotesPackOpen] = React.useState(false)
+  const [tourOpen, setTourOpen] = React.useState(false)
+  const [tourSteps, setTourSteps] = React.useState([])
+  const [tourIndex, setTourIndex] = React.useState(0)
+  const [worktreesOpen, setWorktreesOpen] = React.useState(false)
+  const [sideChat, setSideChat] = React.useState(undefined)
+  const [renameView, setRenameView] = React.useState(undefined)
+  const [testsView, setTestsView] = React.useState(undefined)
+  const testsAbort = React.useRef(undefined)
+      const [planPicker, setPlanPicker] = React.useState(undefined)
       const [modelDialog, setModelDialog] = React.useState(false)
+      React.useEffect(() => {
+        if (snoozeUntil === 0) return undefined
+        const delay = Math.max(0, snoozeUntil - Date.now())
+        const timer = window.setTimeout(() => {
+          runtime.current.tab.snoozeUntil = 0
+          setSnoozeUntil(0)
+        }, delay + 25)
+        return () => window.clearTimeout(timer)
+      }, [snoozeUntil])
       const [createRequest, setCreateRequest] = React.useState(undefined)
       const [catalog, setCatalog] = React.useState(undefined)
       const [tabMenu, setTabMenu] = React.useState(undefined)
@@ -4972,8 +6843,165 @@ function IdeBody(props) {
           setStatus({ kind: 'error', message: messageOf(cause) })
           return false
         }
+        if (kind === 'plan') {
+          runtime.current.planDraft = { text: draft, path, from, to, title: `${path}:${from}–${to}` }
+        }
         setStatus({ kind: 'ok', message: 'Черновик запроса в поле ввода — проверьте и отправьте сами.' })
         return true
+      }
+
+      /** Save the plan draft last put into the composer; nothing is sent. */
+      const savePlanDraft = async () => {
+        const draft = runtime.current.planDraft
+        if (draft === undefined) {
+          setStatus({ kind: 'error', message: 'Сначала нажмите «Подготовить план…»' })
+          return false
+        }
+        try {
+          const saved = await call('planSave', {
+            sessionId,
+            title: draft.title,
+            text: draft.text,
+            path: draft.path,
+            from: draft.from,
+            to: draft.to,
+          })
+          setStatus({ kind: 'ok', message: `План сохранён: ${saved.title}` })
+          return true
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
+      }
+
+      /** Sessions that already hold a retained client binding and can take a draft. */
+      const planTargets = () => {
+        try {
+          const ctx = services.ctx
+          const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+          if (sessions === undefined || sessions === null) return []
+          const snapshot = sessions.list.getSnapshot()
+          const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : []
+          return ids
+            .filter((id) => id !== sessionId)
+            .filter((id) => sessions.binding(id) !== undefined)
+            .map((id) => ({ id, title: snapshot.byId?.[id]?.displayTitle ?? id }))
+        } catch {
+          return []
+        }
+      }
+
+
+      const openSavedPlan = async (id) => {
+        const actions = props && props.inputActions
+        if (!actions || typeof actions.insertText !== 'function') {
+          setStatus({ kind: 'error', message: 'Чат недоступен в этой панели' })
+          return false
+        }
+        try {
+          const plan = await call('planRead', { sessionId, id })
+          const span = typeof actions.captureInsertion === 'function' ? actions.captureInsertion() : undefined
+          actions.insertText(plan.text, span)
+          setPlansOpen(false)
+          setStatus({ kind: 'ok', message: `План открыт: ${plan.title}` })
+          return true
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
+      }
+
+      /**
+       * Hand a saved plan to another retained session. The DSH client exposes
+       * draft initialization only for a retained binding, so the picker lists
+       * sessions that are already open; no text is sent and the target
+       * session's existing draft is preserved.
+       */
+      const transferSavedPlan = async (plan, targetId) => {
+        const ctx = services.ctx
+        let sessions
+        let conversation
+        let workspace
+        try {
+          sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+          conversation = typeof ctx.get === 'function' ? ctx.get('conversation') : undefined
+          workspace = typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : undefined
+        } catch {
+          sessions = undefined
+        }
+        const binding = sessions && typeof sessions.binding === 'function' ? sessions.binding(targetId) : undefined
+        if (binding === undefined || binding === null || !conversation || !conversation.input) {
+          setStatus({ kind: 'error', message: 'Эта сессия ещё не открыта — откройте её и повторите' })
+          return false
+        }
+        try {
+          const outcome = conversation.input.requestDraftInitialization(binding, {
+            prompt: plan.text,
+            whenDraftExists: 'preserve',
+          })
+          if (outcome === 'applied') {
+            if (workspace && typeof workspace.openSession === 'function') workspace.openSession(targetId)
+            setPlanPicker(undefined)
+            setStatus({ kind: 'ok', message: `План передан: ${plan.title}` })
+            return true
+          }
+          setStatus({
+            kind: 'error',
+            message: outcome === 'preserved'
+              ? 'В целевой сессии уже есть черновик — план не передан'
+              : 'Целевая сессия занята — план не передан',
+          })
+          return false
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
+      }
+
+      const openConversationSession = (sessionId) => {
+        let workspace
+        try {
+          workspace = services.ctx.get('uiWorkspace')
+        } catch {
+          workspace = undefined
+        }
+        if (!workspace || typeof workspace.openSession !== 'function') {
+          setStatus({ kind: 'error', message: 'Не удалось открыть сессию: рабочая область недоступна' })
+          return false
+        }
+        workspace.openSession(sessionId)
+        setConvSearchOpen(false)
+        setStatus({ kind: 'ok', message: 'Открываю сессию с найденным фрагментом' })
+        return true
+      }
+
+      // Fetch exactly one turn from another conversation and show its size
+      // before anything reaches the composer. The whole conversation is never
+      // attached, and the model stays untouched.
+      const attachConversation = async (item) => {
+        if (!item || typeof item.sessionId !== 'string' || item.sessionId === '' || !Number.isInteger(item.seq)) {
+          setStatus({ kind: 'error', message: 'У этого фрагмента нет номера хода' })
+          return false
+        }
+        setStatus({ kind: 'busy', message: 'Читаю выбранный ход…' })
+        try {
+          const payload = await call('sessionExcerpt', {
+            sessionId: stateRef.current.sessionId,
+            target: item.sessionId,
+            seq: item.seq,
+          })
+          if (payload.error) {
+            setStatus({ kind: 'error', message: payload.error.message ?? 'Не удалось прочитать разговор' })
+            return false
+          }
+          setConvSource({ ...payload, title: payload.title || item.title || item.sessionId })
+          setConvSearchOpen(false)
+          setStatus(undefined)
+          return true
+        } catch (cause) {
+          setStatus({ kind: 'error', message: messageOf(cause) })
+          return false
+        }
       }
 
       // Quote the current selection (or the current line when nothing is
@@ -5919,6 +7947,10 @@ function IdeBody(props) {
               modelVersion: version,
               rejections,
               revertions,
+              diagnostics:
+                monaco?.editor?.getModelMarkers === undefined
+                  ? undefined
+                  : diagnosticContext(monaco.editor.getModelMarkers({ resource: model.uri }), position),
             },
             signal,
           )
@@ -6218,6 +8250,14 @@ function IdeBody(props) {
         clearGhost()
         if (!edited) return false
         recordChange(tabKey, pathOfTab(tabKey), textBefore, textAfter)
+        setCrossFile(
+          crossFileCandidate(
+            stateRef.current.tabs,
+            tabKey,
+            operations.map((operation) => operation.text).join('\n'),
+            textBefore,
+          ),
+        )
         pushTrace({
           at: new Date().toLocaleTimeString('ru-RU'),
           path: entry === undefined ? '' : entry.path,
@@ -6402,6 +8442,7 @@ function IdeBody(props) {
                 phase: st.phase,
                 key: st.key,
                 instruction: st.instruction,
+                history: st.history === undefined ? 0 : st.history.length,
                 error: st.error,
                 proposal: st.proposal,
                 addedLines: st.proposal === undefined ? 0 : st.proposal.addedLines,
@@ -6512,6 +8553,7 @@ function IdeBody(props) {
           oldText: text.slice(start, end),
           text,
           instruction: '',
+          history: [],
           error: '',
           controller: undefined,
           decorations: undefined,
@@ -6625,12 +8667,25 @@ function IdeBody(props) {
               end: st.end,
               text: st.text,
               instruction,
+              history: st.history !== undefined && st.history.length > 0 ? st.history : undefined,
             },
             controller.signal,
           )
           if (inlineState() !== st || st.requestId !== requestId) return
           st.controller = undefined
           st.proposal = payload.proposal
+          st.provider = typeof payload.provider === 'string' ? payload.provider : '—'
+          st.model = typeof payload.model === 'string' ? payload.model : '—'
+          const nextText = payload.proposal?.changes?.[0]?.newText
+          // The next refinement is sent with the exchange it refers to. An empty
+          // replacement still needs a non-empty answer, so keep the JSON shape.
+          st.history = [
+            ...(st.history ?? []),
+            {
+              instruction,
+              answer: typeof nextText === 'string' && nextText !== '' ? nextText : '{"replacement":""}',
+            },
+          ].slice(-4)
           st.phase = 'preview'
           const change = payload.proposal?.changes?.[0]
           const replacement = change !== undefined && typeof change.newText === 'string' ? change.newText : ''
@@ -6657,6 +8712,7 @@ function IdeBody(props) {
                   answer: replacement,
                 }
               : undefined
+          st.conversation = conversation
           settleInlineTrace(st, {
             ok: true,
             provider: typeof payload.provider === 'string' ? payload.provider : '—',
@@ -6707,7 +8763,10 @@ function IdeBody(props) {
         st.phase = 'input'
         st.error = ''
         publishInline()
-        window.setTimeout(() => inlineInputRef.current?.focus(), 0)
+        window.setTimeout(() => {
+          inlineInputRef.current?.focus()
+          inlineInputRef.current?.select?.()
+        }, 0)
       }
 
       const allowInlineEdit = async () => {
@@ -6755,6 +8814,8 @@ function IdeBody(props) {
         }
         const startPosition = model.getPositionAt(change.start)
         const endPosition = model.getPositionAt(change.end)
+        const firstLine = startPosition.lineNumber
+        const addedLines = Math.max(1, String(change.newText).split('\n').length)
         const range = new monaco.Range(
           startPosition.lineNumber,
           startPosition.column,
@@ -6772,6 +8833,19 @@ function IdeBody(props) {
           runtime.current.tab.internalEdit = false
         }
         recordChange(st.key, pathOfTab(st.key), textBefore, model.getValue())
+        runtime.current.attribution = [
+          ...runtime.current.attribution,
+          {
+            path: st.path,
+            startLine: firstLine,
+            endLine: firstLine + addedLines - 1,
+            provider: st.provider ?? '—',
+            model: st.model ?? '—',
+            instruction: st.instruction,
+            at: Date.now(),
+            conversation: st.conversation,
+          },
+        ].slice(-50)
         setStatus({ kind: 'ok', message: 'Правка применена. Ctrl+Z — отменить.' })
         editor.focus()
         return true
@@ -6807,6 +8881,8 @@ function IdeBody(props) {
         const editor = runtime.current.editor
         if (editor === undefined) return
         if (kind !== 'explicit' && kind !== 'refetch' && Date.now() < runtime.current.tab.snoozeUntil) return
+        const activePath = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)?.path
+        if (kind !== 'explicit' && kind !== 'refetch' && tabExtensionDisabled(prefsRef.current, activePath)) return
         if (kind === 'auto' && runtime.current.tab.plan !== undefined) return
         // A staged block lives in the buffer; the request must describe the file
         // the user actually has, not the proposal it is still deciding about.
@@ -6914,6 +8990,249 @@ function IdeBody(props) {
         runtime.current.ghostTimer = window.setTimeout(() => {
           void requestGhost(kind, triggerAt)
         }, Number.isFinite(delay) ? Math.max(0, delay) : 500)
+      }
+
+      const snoozeTab = (ms) => {
+        const until = Date.now() + ms
+        runtime.current.tab.snoozeUntil = until
+        setSnoozeUntil(until)
+        cancelGhostRequest()
+        clearGhost()
+        setStatus({ kind: 'ok', message: `Tab на паузе до ${snoozeLabel(until)} — автоподсказки не запрашиваются` })
+      }
+
+      const toggleSplit = () => {
+        if (splitKey !== '') {
+          setSplitKey('')
+          return
+        }
+        const other = splitCandidate(stateRef.current.tabs, stateRef.current.activeKey)
+        if (other === undefined) {
+          setStatus({ kind: 'error', message: 'Откройте второй файл, чтобы разделить редактор' })
+          return
+        }
+        setSplitKey(other.key)
+      }
+
+      const runProjectTests = async () => {
+        if (testsView?.phase === 'running') return
+        const controller = new AbortController()
+        testsAbort.current = controller
+        setTestsView({ phase: 'running' })
+        try {
+          const result = await call('runTests', { sessionId }, controller.signal)
+          setTestsView({ phase: 'ready', result })
+        } catch (cause) {
+          setTestsView({ phase: 'failed', error: describeError(cause) })
+        } finally {
+          if (testsAbort.current === controller) testsAbort.current = undefined
+        }
+      }
+
+      const stopProjectTests = () => {
+        testsAbort.current?.abort()
+        testsAbort.current = undefined
+      }
+
+      const startRename = () => {
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        const position = editor === undefined ? null : editor.getPosition()
+        if (model === null || position === null) {
+          setStatus('Поставьте курсор на имя символа')
+          return
+        }
+        const word = wordAt(model.getValue(), model.getOffsetAt(position))
+        if (word === '') {
+          setStatus('Под курсором нет имени')
+          return
+        }
+        setRenameView({ word, next: word, plan: undefined })
+      }
+
+      const applyRename = () => {
+        const plan = renameView?.plan
+        if (plan === undefined || plan.ok !== true) return
+        const replacement = new Map(plan.files.map((file) => [file.key, file.text]))
+        setTabs((previous) =>
+          previous.map((tab) =>
+            replacement.has(tab.key) ? { ...tab, text: replacement.get(tab.key), dirty: true } : tab,
+          ),
+        )
+        for (const [uri, key] of runtime.current.modelTabs) {
+          const model = runtime.current.models.get(uri)
+          if (model !== undefined && replacement.has(key)) model.setValue(replacement.get(key))
+        }
+        setRenameView(undefined)
+        setStatus({ kind: 'ok', message: `Переименовано: ${plan.total} в ${plan.files.length} файл(ах). Сохраните вручную.` })
+      }
+
+      const findSymbol = () => {
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        const position = editor === undefined ? null : editor.getPosition()
+        if (model === null || position === null) {
+          setStatus('Поставьте курсор в файл с кодом')
+          return
+        }
+        const word = wordAt(model.getValue(), model.getOffsetAt(position))
+        if (word === '') {
+          setStatus('Под курсором нет имени')
+          return
+        }
+        const rows = symbolReferences(stateRef.current.tabs, word)
+        if (rows.length === 0) {
+          setStatus(`«${word}» не найдено в открытых файлах`)
+          return
+        }
+        setSymbolView({ word, rows })
+      }
+
+      const openBlame = () => {
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        const position = editor === undefined ? null : editor.getPosition()
+        const tab = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (model === null || position === null || tab === undefined) {
+          setStatus('Поставьте курсор в открытый файл')
+          return
+        }
+        const line = position.lineNumber
+        setBlameView({
+          path: tab.path,
+          line,
+          records: lineAttribution(runtime.current.attribution, tab.path, line),
+        })
+      }
+
+      const openSideChat = () => {
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        const selection = editor === undefined ? null : editor.getSelection()
+        const tab = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (model === null || selection === null || selection.isEmpty() || tab === undefined) {
+          setStatus('Выделите фрагмент в открытом файле')
+          return
+        }
+        if (typeof tab.hostId !== 'string') {
+          setStatus('Файл ещё не открыт в Host — побочный вопрос недоступен')
+          return
+        }
+        setSideChat({
+          id: tab.hostId,
+          path: normalPath(tab.path),
+          start: model.getOffsetAt(selection.getStartPosition()),
+          end: model.getOffsetAt(selection.getEndPosition()),
+          text: model.getValueInRange(selection),
+        })
+      }
+
+      const askSideChat = (request) =>
+        call('sideChat', {
+          id: request.id,
+          sessionId: stateRef.current.sessionId,
+          start: request.start,
+          end: request.end,
+          selection: request.selection,
+          question: request.question,
+          history: request.history,
+        })
+
+      const captureNote = () => {
+        const editor = runtime.current.editor
+        const model = editor === undefined ? null : editor.getModel()
+        const selection = editor === undefined ? null : editor.getSelection()
+        const tab = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        if (model === null || selection === null || tab === undefined) {
+          setStatus('Откройте файл и поставьте курсор или выделение')
+          return undefined
+        }
+        const empty = selection.isEmpty()
+        const text = (empty ? model.getLineContent(selection.getPosition().lineNumber) : model.getValueInRange(selection))
+          .replace(/\s+/g, ' ')
+          .trim()
+        if (text === '') {
+          setStatus('Нечего добавить: строка пуста')
+          return undefined
+        }
+        return {
+          text: text.slice(0, NOTE_MAX_CHARS),
+          path: tab.path,
+          line: selection.getStartPosition().lineNumber,
+        }
+      }
+
+      const tourCursor = () => {
+        const editor = runtime.current.editor
+        const tab = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        const position = editor === undefined || editor === null ? null : editor.getPosition()
+        if (tab === undefined || position === null || position === undefined) return undefined
+        return { path: tab.path, line: position.lineNumber }
+      }
+
+      const addTourStep = (note) => {
+        const cursor = tourCursor()
+        if (cursor === undefined) {
+          setStatus('Откройте файл и поставьте курсор на нужную строку')
+          return
+        }
+        setTourSteps((previous) => {
+          const next = tourAdd(previous, { ...cursor, note })
+          return next
+        })
+      }
+
+      const jumpTour = (step, at) => {
+        runtime.current.pendingReveal = { path: normalPath(step.path), line: step.line }
+        setTourIndex(at)
+        void openFile(step.path, { activate: true })
+      }
+
+      const splitTab = splitKey === '' ? undefined : tabs.find((candidate) => candidate.key === splitKey)
+
+      React.useEffect(() => {
+        if (splitKey !== '' && !tabs.some((candidate) => candidate.key === splitKey)) setSplitKey('')
+      }, [tabs, splitKey])
+
+      const markTabDirty = (key) => {
+        setTabs((previous) =>
+          previous.map((candidate) => (candidate.key === key && !candidate.dirty ? { ...candidate, dirty: true } : candidate)),
+        )
+      }
+
+      const resumeTab = () => {
+        runtime.current.tab.snoozeUntil = 0
+        setSnoozeUntil(0)
+        setStatus({ kind: 'ok', message: 'Автоподсказки Tab снова включены' })
+      }
+
+      const toggleTabExtension = async () => {
+        const active = stateRef.current.tabs.find((candidate) => candidate.key === stateRef.current.activeKey)
+        const extension = active === undefined ? '' : fileExtension(active.path)
+        if (extension === '') {
+          setStatus({ kind: 'error', message: 'У файла нет расширения — отключать нечего' })
+          return
+        }
+        const current = Array.isArray(prefsRef.current?.tabDisabledExtensions) ? prefsRef.current.tabDisabledExtensions : []
+        const wasDisabled = current.includes(extension)
+        const next = wasDisabled ? current.filter((entry) => entry !== extension) : [...current, extension]
+        await saveSettings({ tabDisabledExtensions: next })
+        setStatus({
+          kind: 'ok',
+          message: wasDisabled ? `Tab для .${extension} снова включён` : `Автоподсказки Tab для .${extension} выключены`,
+        })
+      }
+
+      const askModeOn = preferences?.askMode === true
+
+      const toggleAskMode = async () => {
+        const next = !askModeOn
+        try {
+          await saveSettings({ askMode: next })
+          setStatus({ kind: 'ok', message: next ? 'Режим вопросов: запись в рабочую папку запрещена' : 'Режим вопросов выключен — запись снова разрешена' })
+        } catch (cause) {
+          setStatus({ kind: 'error', message: describeError(cause) })
+        }
       }
 
       const enableSuggestions = async () => {
@@ -7251,7 +9570,7 @@ function IdeBody(props) {
         // own context menu.
         editor.addAction({
           id: 'dsh-ide.inline-edit',
-          label: 'Изменить выделение…',
+          label: menuText('Изменить выделение…', 'Edit selection…'),
           contextMenuGroupId: '1_modification',
           contextMenuOrder: 1,
           // No `editorTextFocus` guard: on touch the editor loses focus while
@@ -7263,7 +9582,7 @@ function IdeBody(props) {
         // Monaco's own context menu; the chord is dispatched from the keymap.
         editor.addAction({
           id: 'dsh-ide.add-to-chat',
-          label: 'Добавить в чат',
+          label: menuText('Добавить в чат', 'Add to chat'),
           contextMenuGroupId: '1_modification',
           contextMenuOrder: 0.5,
           run: () => handlersRef.current.addToChat?.(),
@@ -7822,6 +10141,43 @@ function IdeBody(props) {
         }
       }
 
+      // The exact `git diff` of one group or one file, inserted into the chat
+      // draft as a quote. The Host bounds the payload; the status line shows the
+      // size before the user sends it, and nothing is sent automatically.
+      const sendScmPatch = async (group, path) => {
+        if (scmPatching || scmStatus === undefined) return
+        if (group !== 'staged' && group !== 'changes') return
+        setScmPatching(true)
+        try {
+          const payload = await call('scmPatch', {
+            sessionId,
+            group,
+            ...(typeof path === 'string' && path !== '' ? { path } : {}),
+            revision: scmStatus.revision,
+          })
+          const where = group === 'staged' ? 'индекс' : 'рабочая копия'
+          const label = `Git diff · ${where}${typeof path === 'string' && path !== '' ? ` · ${path}` : ''}`
+          const bytes = Number.isFinite(payload?.bytes) ? payload.bytes : 0
+          insertQuote(
+            `${label}\n\n\`\`\`diff\n${String(payload?.patch ?? '')}\n\`\`\`\n`,
+            `${label} · ${Math.max(1, Math.round(bytes / 1024))} КиБ`,
+          )
+        } catch (cause) {
+          setStatus({ kind: 'error', message: describeScmError(cause) })
+          if (cause?.code === 'stale') setScmReload((value) => value + 1)
+        } finally {
+          setScmPatching(false)
+        }
+      }
+
+      const openScmFinding = (finding) => {
+        if (finding === undefined || finding === null || scmStatus === undefined) return
+        if (typeof finding.path !== 'string' || finding.path === '') return
+        const line = Number.isSafeInteger(finding.line) ? finding.line : 1
+        scmReveal.current = { path: finding.path, line }
+        void openScmRow({ group: 'staged', path: finding.path })
+      }
+
       const jumpDiff = (direction) => {
         const info = runtime.current.diffEditor
         if (info === undefined || info === null) return
@@ -7898,6 +10254,24 @@ function IdeBody(props) {
         }
       }, [monaco, diffKey, compact])
 
+      // A review finding points at a line of the patch that was actually sent.
+      // Once that comparison is ready, reveal the line in its modified side and
+      // drop the request, so an ordinary later diff does not jump anywhere.
+      React.useEffect(() => {
+        const pending = scmReveal.current
+        if (pending === undefined || scmDiff === undefined || scmDiff.phase !== 'ready' || scmDiff.path !== pending.path) return
+        const info = runtime.current.diffEditor
+        if (info === undefined || info === null) return
+        const modified = info.editor.getModifiedEditor()
+        const model = modified?.getModel?.()
+        if (modified === undefined || model === null || model === undefined) return
+        scmReveal.current = undefined
+        const line = Math.max(1, Math.min(pending.line, model.getLineCount()))
+        modified.revealLineInCenter(line)
+        modified.setPosition({ lineNumber: line, column: 1 })
+        modified.focus()
+      }, [scmDiff])
+
       // A search hit opens the file and then puts the caret on the matched line.
       // The reveal waits until the tab really owns the editor model, otherwise the
       // caret would land in the previous file while the new tab is still loading.
@@ -7925,7 +10299,7 @@ function IdeBody(props) {
         }
         setCursor({ line, column: 1 })
         editor.focus()
-      }, [activeKey, tabs])
+      }, [activeKey, tabs, symbolView, testsView])
 
       React.useEffect(() => {
         if (tab === undefined || typeof tab.id !== 'string') return
@@ -8290,8 +10664,6 @@ function IdeBody(props) {
 
       const createDirectory = (directory) => beginCreate('directory', directory === undefined ? selectionDirectory() : directory)
 
-      // The same top-level arrangement as VS Code. Commands the IDE cannot honour
-      // are disabled with the reason in their tooltip instead of being hidden.
       // Menu labels follow the live keymap: a remapped chord must not keep the
       // old default printed next to the command.
       const menuChords = resolveKeymap(keybindingsOf(preferences))
@@ -8300,106 +10672,153 @@ function IdeBody(props) {
         return chord === undefined ? undefined : chordText(chord)
       }
 
+      const selectPanelTab = (tab) => setPanel((current) => ({ tab, index: current?.index ?? 0 }))
+      const toolTabs = [
+        plansOpen && { id: 'plans', label: menuText('Планы', 'Plans'), body: h(PlansPanel, {
+              sessionId: stateRef.current.sessionId,
+              onClose: () => setPlansOpen(false),
+              onOpen: (id) => void openSavedPlan(id),
+              onTransfer: (plan) => {
+                setPlansOpen(false)
+                setPlanPicker(plan)
+              },
+            }) },
+        terminalOpen && { id: 'terminal', label: menuText('Терминал', 'Terminal'), body: h(TerminalContextPanel, {
+              onClose: () => setTerminalOpen(false),
+              onInsert: (text) => insertQuote(text, 'Запуск терминала'),
+            }) },
+        debugOpen && { id: 'debug', label: menuText('Журнал отладки', 'Debug journal'), body: h(DebugPanel, {
+              onClose: () => setDebugOpen(false),
+              onInsert: (text) => insertQuote(text, menuText('Журнал отладки', 'Debug journal')),
+            }) },
+        notesPackOpen && { id: 'notesPack', label: menuText('Пакет заметок', 'Note bundle'), body: h(NotesPackPanel, {
+              onClose: () => setNotesPackOpen(false),
+              onInsert: (text) => insertQuote(text, menuText('Пакет заметок', 'Note bundle')),
+              onCapture: captureNote,
+            }) },
+        tourOpen && { id: 'tour', label: menuText('Экскурсия по коду', 'Code tour'), body: h(CodeTourPanel, {
+              steps: tourSteps,
+              index: tourIndex,
+              onClose: () => setTourOpen(false),
+              onAdd: addTourStep,
+              onMove: (at, delta) => setTourSteps((previous) => tourMove(previous, at, delta)),
+              onRemove: (at) => setTourSteps((previous) => tourRemove(previous, at)),
+              onJump: jumpTour,
+              onPrev: () => {
+                const at = Math.max(0, tourIndex - 1)
+                if (tourSteps[at] !== undefined) jumpTour(tourSteps[at], at)
+              },
+              onNext: () => {
+                const at = Math.min(tourSteps.length - 1, tourIndex + 1)
+                if (tourSteps[at] !== undefined) jumpTour(tourSteps[at], at)
+              },
+            }) },
+        worktreesOpen && { id: 'worktrees', label: menuText('Рабочие копии', 'Worktrees'), body: h(WorktreesPanel, {
+              sessionId,
+              call,
+              onClose: () => setWorktreesOpen(false),
+            }) },
+      ].filter(Boolean)
+
+      const menuActiveTab = tabs.find((candidate) => candidate.key === activeKey)
+      const menuExtension = menuActiveTab === undefined ? '' : fileExtension(menuActiveTab.path)
+      const menuExtensionOff = menuActiveTab !== undefined && tabExtensionDisabled(preferences, menuActiveTab.path)
       const menus = [
         {
           id: 'file',
-          label: 'Файл',
+          label: menuText('Файл', 'File'),
           items: [
-            { id: 'new', label: 'Новый файл…', run: () => createFile() },
-            { id: 'new-folder', label: 'Новая папка…', run: () => createDirectory() },
-            { id: 'open', label: 'Открыть файл…', key: chordLabel('quick-open'), run: openQuick },
+            { id: 'new', label: menuText('Новый файл…', 'New file…'), run: () => createFile() },
+            { id: 'new-folder', label: menuText('Новая папка…', 'New folder…'), run: () => createDirectory() },
+            { id: 'open', label: menuText('Открыть файл…', 'Open file…'), key: chordLabel('quick-open'), run: openQuick },
             { separator: true },
-            { id: 'save', label: 'Сохранить', key: chordLabel('save'), run: () => void saveActive() },
-            { id: 'save-all', label: 'Сохранить всё', key: chordLabel('save-all'), run: () => void saveAll() },
+            { id: 'save', label: menuText('Сохранить', 'Save'), key: chordLabel('save'), run: () => void saveActive() },
+            { id: 'save-all', label: menuText('Сохранить всё', 'Save all'), key: chordLabel('save-all'), run: () => void saveAll() },
             { separator: true },
-            { id: 'explain', label: 'Объяснить выделенное…', run: () => draftQuestion('explain') },
-            { id: 'prepare-plan', label: 'Подготовить план…', run: () => draftQuestion('plan') },
-            { id: 'add-to-chat', label: 'Файл в чат', key: chordLabel('add-to-chat'), run: () => handlersRef.current.addToChat?.() },
+            { id: 'close', label: menuText('Закрыть вкладку', 'Close tab'), key: chordLabel('close-tab'), run: closeActive },
+            { id: 'close-all', label: menuText('Закрыть все вкладки', 'Close all tabs'), run: closeAllTabs },
             { separator: true },
-            { id: 'close', label: 'Закрыть вкладку', key: chordLabel('close-tab'), run: closeActive },
-            { id: 'close-all', label: 'Закрыть все вкладки', run: closeAllTabs },
-            { separator: true },
-            { id: 'refresh', label: 'Обновить дерево', run: () => setReloadSignal((previous) => previous + 1) },
-            { id: 'toggle-tree', label: showTree ? 'Скрыть проводник' : 'Показать проводник', run: () => setShowTree(!showTree) },
-            {
-              id: 'swap-explorer',
-              label: explorerSide === 'left' ? 'Проводник справа' : 'Проводник слева',
-              run: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
-            },
-            { separator: true },
-            { id: 'settings', label: 'Настройки IDE…', key: chordLabel('settings'), run: openSettings },
-            { id: 'open-folder', label: 'Открыть папку…', disabled: true, hint: 'Рабочая папка задаётся сессией DSH; другая папка открывается только в новой сессии.' },
+            { id: 'settings', label: menuText('Настройки IDE…', 'IDE settings…'), key: chordLabel('settings'), run: openSettings },
           ],
         },
         {
           id: 'edit',
-          label: 'Правка',
+          label: menuText('Правка', 'Edit'),
           items: [
-            { id: 'undo', label: 'Отменить', key: 'Ctrl+Z', run: () => runAction('undo') },
-            { id: 'redo', label: 'Повторить', key: 'Ctrl+Y', run: () => runAction('redo') },
+            { id: 'undo', label: menuText('Отменить', 'Undo'), key: 'Ctrl+Z', run: () => runAction('undo') },
+            { id: 'redo', label: menuText('Повторить', 'Redo'), key: 'Ctrl+Y', run: () => runAction('redo') },
             { separator: true },
-            { id: 'cut', label: 'Вырезать', key: 'Ctrl+X', run: () => runAction('editor.action.clipboardCutAction') },
-            { id: 'copy', label: 'Копировать', key: 'Ctrl+C', run: () => runAction('editor.action.clipboardCopyAction') },
-            { id: 'paste', label: 'Вставить', key: 'Ctrl+V', run: () => runAction('editor.action.clipboardPasteAction') },
+            { id: 'cut', label: menuText('Вырезать', 'Cut'), key: 'Ctrl+X', run: () => runAction('editor.action.clipboardCutAction') },
+            { id: 'copy', label: menuText('Копировать', 'Copy'), key: 'Ctrl+C', run: () => runAction('editor.action.clipboardCopyAction') },
+            { id: 'paste', label: menuText('Вставить', 'Paste'), key: 'Ctrl+V', run: () => runAction('editor.action.clipboardPasteAction') },
             { separator: true },
-            { id: 'find', label: 'Найти', key: 'Ctrl+F', run: () => runAction('actions.find') },
-            { id: 'replace', label: 'Заменить', key: 'Ctrl+H', run: () => runAction('editor.action.startFindReplaceAction') },
-            { id: 'format', label: 'Форматировать документ', disabled: true, hint: 'Форматирование требует языкового сервиса, которого нет в бандле.' },
-          ],
-        },
-        {
-          id: 'selection',
-          label: 'Выделение',
-          items: [
-            { id: 'select-all', label: 'Выделить всё', key: 'Ctrl+A', run: () => runAction('editor.action.selectAll') },
-            { id: 'select-line', label: 'Выделить строку', run: () => runAction('expandLineSelection') },
+            { id: 'find', label: menuText('Найти', 'Find'), key: 'Ctrl+F', run: () => runAction('actions.find') },
+            { id: 'replace', label: menuText('Заменить', 'Replace'), key: 'Ctrl+H', run: () => runAction('editor.action.startFindReplaceAction') },
             { separator: true },
-            { id: 'expand', label: 'Расширить выделение', key: 'Shift+Alt+→', run: () => runAction('editor.action.smartSelect.expand') },
-            { id: 'shrink', label: 'Сузить выделение', key: 'Shift+Alt+←', run: () => runAction('editor.action.smartSelect.shrink') },
+            { id: 'inline-edit', label: menuText('Изменить выделение…', 'Edit selection…'), key: chordLabel('inline-edit'), run: () => handlersRef.current.openInlineEdit?.() },
+            {
+              id: 'rename-symbol',
+              label: menuText('Переименовать символ…', 'Rename symbol…'),
+              disabled: tabs.length === 0,
+              run: startRename,
+            },
             { separator: true },
-            { id: 'quote', label: 'Строки в чат', key: chordLabel('quote'), run: () => handlersRef.current.quoteSelection?.() },
-            { id: 'inline-edit', label: 'Изменить выделение…', key: chordLabel('inline-edit'), run: () => handlersRef.current.openInlineEdit?.() },
+            { id: 'select-all', label: menuText('Выделить всё', 'Select all'), key: 'Ctrl+A', run: () => runAction('editor.action.selectAll') },
+            { id: 'select-line', label: menuText('Выделить строку', 'Select line'), run: () => runAction('expandLineSelection') },
+            { separator: true },
+            { id: 'expand', label: menuText('Расширить выделение', 'Expand selection'), key: 'Shift+Alt+→', run: () => runAction('editor.action.smartSelect.expand') },
+            { id: 'shrink', label: menuText('Сузить выделение', 'Shrink selection'), key: 'Shift+Alt+←', run: () => runAction('editor.action.smartSelect.shrink') },
           ],
         },
         {
           id: 'view',
-          label: 'Вид',
+          label: menuText('Вид', 'View'),
           items: [
-            { id: 'word-wrap', label: wordWrap ? 'Отключить перенос по словам' : 'Включить перенос по словам', run: toggleWordWrap },
-            { id: 'palette', label: 'Палитра команд…', key: chordLabel('command-palette'), run: () => setPaletteOpen(true) },
-            { id: 'hidden', label: hidden ? 'Скрыть скрытые файлы' : 'Показывать скрытые файлы', run: () => setHidden(!hidden) },
+            { id: 'palette', label: menuText('Палитра команд…', 'Command palette…'), key: chordLabel('command-palette'), run: () => setPaletteOpen(true) },
             { separator: true },
-            { id: 'zoom-in', label: 'Увеличить шрифт', key: 'Ctrl+=', run: () => zoom(1) },
-            { id: 'zoom-out', label: 'Уменьшить шрифт', key: 'Ctrl+-', run: () => zoom(-1) },
-            { id: 'zoom-reset', label: 'Сбросить размер шрифта', key: 'Ctrl+0', run: resetFont },
+            { id: 'refresh', label: menuText('Обновить дерево', 'Refresh explorer'), run: () => setReloadSignal((previous) => previous + 1) },
+            { id: 'toggle-tree', label: showTree ? menuText('Скрыть проводник', 'Hide explorer') : menuText('Показать проводник', 'Show explorer'), run: () => setShowTree(!showTree) },
+            {
+              id: 'swap-explorer',
+              label: explorerSide === 'left' ? menuText('Проводник справа', 'Move explorer right') : menuText('Проводник слева', 'Move explorer left'),
+              run: () => setExplorerSide(explorerSide === 'left' ? 'right' : 'left'),
+            },
+            { id: 'hidden', label: hidden ? menuText('Скрыть скрытые файлы', 'Hide hidden files') : menuText('Показывать скрытые файлы', 'Show hidden files'), run: () => setHidden(!hidden) },
             { separator: true },
             {
+              id: 'split-editor',
+              label: splitKey === '' ? menuText('Разделить редактор', 'Split editor') : menuText('Закрыть вторую панель', 'Close split editor'),
+              disabled: compact || (splitKey === '' && tabs.length < 2),
+              run: toggleSplit,
+            },
+            {
               id: 'output',
-              label: panel === undefined ? 'Показать панель вывода' : 'Скрыть панель вывода',
+              label: showChat ? menuText('Перейти в чат', 'Show chat') : panel === undefined ? menuText('Показать панель вывода', 'Show output panel') : menuText('Скрыть панель вывода', 'Hide output panel'),
               key: chordLabel('output'),
               run: toggleOutput,
             },
             { separator: true },
-            { id: 'connect-model', label: 'Подключить модель…', run: () => setModelDialog(true) },
-            { id: 'problems', label: 'Проблемы', disabled: true, hint: 'Диагностика требует языковых сервисов — их в бандле нет.' },
+            { id: 'word-wrap', label: wordWrap ? menuText('Отключить перенос по словам', 'Disable word wrap') : menuText('Включить перенос по словам', 'Enable word wrap'), run: toggleWordWrap },
+            { id: 'zoom-in', label: menuText('Увеличить шрифт', 'Increase font size'), key: 'Ctrl+=', run: () => zoom(1) },
+            { id: 'zoom-out', label: menuText('Уменьшить шрифт', 'Decrease font size'), key: 'Ctrl+-', run: () => zoom(-1) },
+            { id: 'zoom-reset', label: menuText('Сбросить размер шрифта', 'Reset font size'), key: 'Ctrl+0', run: resetFont },
           ],
         },
         {
           id: 'go',
-          label: 'Переход',
+          label: menuText('Переход', 'Go'),
           items: [
-            { id: 'goto-file', label: 'Перейти к файлу…', key: chordLabel('quick-open'), run: openQuick },
-            { id: 'goto-line', label: 'Перейти к строке…', key: 'Ctrl+G', run: () => runAction('editor.action.gotoLine') },
+            { id: 'goto-line', label: menuText('Перейти к строке…', 'Go to line…'), key: 'Ctrl+G', run: () => runAction('editor.action.gotoLine') },
             { separator: true },
             {
               id: 'file-start',
-              label: 'В начало файла',
+              label: menuText('В начало файла', 'Go to start of file'),
               key: 'Ctrl+Home',
               run: () => withEditor((editor) => editor.setPosition({ lineNumber: 1, column: 1 })),
             },
             {
               id: 'file-end',
-              label: 'В конец файла',
+              label: menuText('В конец файла', 'Go to end of file'),
               key: 'Ctrl+End',
               run: () =>
                 withEditor((editor) => {
@@ -8409,47 +10828,118 @@ function IdeBody(props) {
                   editor.setPosition({ lineNumber, column: model.getLineMaxColumn(lineNumber) })
                 }),
             },
-            { separator: true },
-            { id: 'next-tab', label: 'Следующая вкладка', key: 'Ctrl+Tab', run: () => cycleTab(1) },
-            { id: 'prev-tab', label: 'Предыдущая вкладка', key: 'Ctrl+Shift+Tab', run: () => cycleTab(-1) },
-            { separator: true },
-            { id: 'definition', label: 'Перейти к определению', disabled: true, hint: 'Нужен языковой сервис (LSP), его в бандле нет; подсказку даёт только модель.' },
-          ],
-        },
-        {
-          id: 'run',
-          label: 'Запуск',
-          items: [
             {
-              id: 'run-no-debug',
-              label: 'Запуск без отладки',
-              disabled: true,
-              hint: 'Запуск кода в DSH выполняют терминал и инструменты агента; у IDE нет доступа к PTY.',
+              id: 'find-symbol',
+              label: menuText('Символ под курсором', 'Symbol at cursor'),
+              disabled: tabs.length === 0,
+              run: findSymbol,
             },
-            { id: 'run-start', label: 'Запуск с отладкой', disabled: true, hint: 'Отладчика в бандле нет.' },
             { separator: true },
-            { id: 'run-config', label: 'Открыть launch.json', disabled: true, hint: 'Конфигурации запуска VS Code к IDE не применимы.' },
+            { id: 'next-tab', label: menuText('Следующая вкладка', 'Next tab'), key: 'Ctrl+Tab', run: () => cycleTab(1) },
+            { id: 'prev-tab', label: menuText('Предыдущая вкладка', 'Previous tab'), key: 'Ctrl+Shift+Tab', run: () => cycleTab(-1) },
           ],
         },
         {
-          id: 'terminal',
-          label: 'Терминал',
+          id: 'chat',
+          label: menuText('Чат', 'Chat'),
+          items: [
+            { id: 'add-to-chat', label: menuText('Файл в чат', 'Add file to chat'), key: chordLabel('add-to-chat'), run: () => handlersRef.current.addToChat?.() },
+            { id: 'quote', label: menuText('Строки в чат', 'Quote lines in chat'), key: chordLabel('quote'), run: () => handlersRef.current.quoteSelection?.() },
+            { id: 'explain', label: menuText('Объяснить выделенное…', 'Explain selection…'), run: () => draftQuestion('explain') },
+            {
+              id: 'side-chat',
+              label: menuText('Побочный вопрос по выделению…', 'Ask about selection…'),
+              run: openSideChat,
+            },
+            { separator: true },
+            {
+              id: 'ask-mode',
+              label: askModeOn ? menuText('Выключить режим вопросов', 'Disable read-only questions') : menuText('Режим вопросов (без записи)', 'Enable read-only questions'),
+              run: toggleAskMode,
+            },
+            {
+              id: 'explore-project',
+              label: menuText('Спросить о проекте…', 'Ask about project…'),
+              run: () => setExploreOpen(true),
+            },
+            {
+              id: 'conversation-search',
+              label: menuText('Найти в разговорах…', 'Search conversations…'),
+              run: () => setConvSearchOpen(true),
+            },
+            { separator: true },
+            { id: 'prepare-plan', label: menuText('Подготовить план…', 'Prepare plan…'), run: () => draftQuestion('plan') },
+            { id: 'save-plan', label: menuText('Сохранить план…', 'Save plan…'), run: () => void savePlanDraft() },
+            { id: 'open-plans', label: menuText('Открыть сохранённый план…', 'Open saved plan…'), run: () => { setPlansOpen(true); selectPanelTab('plans') } },
+            {
+              id: 'notes-pack',
+              label: menuText('Пакет заметок…', 'Note bundle…'),
+              run: () => { setNotesPackOpen(true); selectPanelTab('notesPack') },
+            },
+          ],
+        },
+        {
+          id: 'project',
+          label: menuText('Проект', 'Project'),
           items: [
             {
-              id: 'new-terminal',
-              label: 'Новый терминал',
-              disabled: true,
-              hint: 'Терминал DSH открывается отдельной вкладкой правой панели: у плагина нет доступа к PTY, встроить его внутрь IDE нельзя.',
+              id: 'worktrees',
+              label: menuText('Рабочие копии…', 'Worktrees…'),
+              run: () => { setWorktreesOpen(true); selectPanelTab('worktrees') },
+            },
+            {
+              id: 'blame-line',
+              label: menuText('Происхождение строки…', 'Line history…'),
+              disabled: tabs.length === 0,
+              run: openBlame,
+            },
+            { separator: true },
+            {
+              id: 'code-tour',
+              label: menuText('Экскурсия по коду…', 'Code tour…'),
+              run: () => { setTourOpen(true); selectPanelTab('tour') },
+            },
+            { separator: true },
+            {
+              id: 'run-tests',
+              label: menuText('Запустить тесты (npm test)…', 'Run tests (npm test)…'),
+              run: runProjectTests,
+            },
+            { id: 'terminal-context', label: menuText('Запуск терминала в чат…', 'Add terminal run to chat…'), run: () => { setTerminalOpen(true); selectPanelTab('terminal') } },
+            {
+              id: 'debug-journal',
+              label: menuText('Журнал отладки…', 'Debug journal…'),
+              run: () => { setDebugOpen(true); selectPanelTab('debug') },
+            },
+          ],
+        },
+        {
+          id: 'completion',
+          label: menuText('Подсказки', 'Suggestions'),
+          items: [
+            { id: 'connect-model', label: menuText('Подключить модель…', 'Connect model…'), run: () => setModelDialog(true) },
+            { separator: true },
+            { id: 'snooze-15', label: menuText('Приостановить подсказки на 15 минут', 'Pause suggestions for 15 minutes'), run: () => snoozeTab(15 * 60 * 1000) },
+            { id: 'snooze-60', label: menuText('Приостановить подсказки на 1 час', 'Pause suggestions for 1 hour'), run: () => snoozeTab(60 * 60 * 1000) },
+            { id: 'snooze-resume', label: menuText('Возобновить подсказки', 'Resume suggestions'), disabled: snoozeUntil === 0, run: resumeTab },
+            {
+              id: 'tab-extension',
+              label:
+                menuExtension === ''
+                  ? menuText('Подсказки по расширению', 'Suggestions by extension')
+                  : menuText(`${menuExtensionOff ? 'Включить' : 'Отключить'} подсказки для .${menuExtension}`, `${menuExtensionOff ? 'Enable' : 'Disable'} suggestions for .${menuExtension}`),
+              disabled: menuExtension === '',
+              run: () => void toggleTabExtension(),
             },
           ],
         },
         {
           id: 'help',
-          label: 'Справка',
+          label: menuText('Справка', 'Help'),
           items: [
             {
               id: 'about',
-              label: 'О плагине IDE',
+              label: menuText('О плагине IDE', 'About the IDE'),
               run: () =>
                 setInfo({
                   title: 'IDE для DSH',
@@ -8462,7 +10952,7 @@ function IdeBody(props) {
             },
             {
               id: 'shortcuts',
-              label: 'Горячие клавиши',
+              label: menuText('Горячие клавиши', 'Keyboard shortcuts'),
               run: () => {
                 // Built from the same table the editor dispatches, so the help
                 // cannot drift from the real map.
@@ -8475,7 +10965,7 @@ function IdeBody(props) {
                 }
                 lines.push('Tab — принять подсказку, Esc — отклонить, Ctrl+→ — принять слово')
                 lines.push('Все клавиши, кроме Tab и Esc, переназначаются: Параметры → Клавиши')
-                setInfo({ title: 'Горячие клавиши', lines })
+                setInfo({ title: menuText('Горячие клавиши', 'Keyboard shortcuts'), lines })
               },
             },
           ],
@@ -8506,13 +10996,13 @@ function IdeBody(props) {
         ? []
         : [
             tabMenuTarget.dirty
-              ? { id: 'save', label: 'Сохранить', run: () => void saveKey(tabMenuTarget.key) }
+              ? { id: 'save', label: menuText('Сохранить', 'Save'), run: () => void saveKey(tabMenuTarget.key) }
               : null,
-            { id: 'close', label: 'Закрыть', run: () => closeTab(tabMenuTarget.key) },
-            { id: 'close-others', label: 'Закрыть другие', run: () => closeOtherTabs(tabMenuTarget.key) },
-            { id: 'close-all', label: 'Закрыть все', run: () => closeAllTabs() },
+            { id: 'close', label: menuText('Закрыть', 'Close'), run: () => closeTab(tabMenuTarget.key) },
+            { id: 'close-others', label: menuText('Закрыть другие', 'Close others'), run: () => closeOtherTabs(tabMenuTarget.key) },
+            { id: 'close-all', label: menuText('Закрыть все', 'Close all'), run: () => closeAllTabs() },
             { separator: true },
-            { id: 'copy-path', label: 'Копировать путь', run: () => void copyText(tabMenuTarget.path) },
+            { id: 'copy-path', label: menuText('Копировать путь', 'Copy path'), run: () => void copyText(tabMenuTarget.path) },
           ].filter(Boolean)
 
       return h(
@@ -8752,6 +11242,11 @@ function IdeBody(props) {
                       onMessage: setScmMessage,
                       committing: scmBusy === 'commit',
                       busy: scmBusy,
+                      patching: scmPatching,
+                      onSendPatch: (group, path) => {
+                        void sendScmPatch(group, path)
+                      },
+                      onOpenFinding: openScmFinding,
                       onCommit: commitScm,
                       onRefresh: () => {
                         void refreshScm()
@@ -8895,7 +11390,7 @@ function IdeBody(props) {
                         ref: inlineInputRef,
                         className: 'dsh-ide-inline-input',
                         value: inlineView.instruction,
-                        placeholder: 'Что изменить в выделенном коде?',
+                        placeholder: inlineView.history > 0 ? 'Уточните: что поменять в предложении?' : 'Что изменить в выделенном коде?',
                         disabled: inlineView.phase === 'pending',
                         onChange: (event) => setInlineInstruction(event.target.value),
                         onKeyDown: (event) => {
@@ -8908,6 +11403,9 @@ function IdeBody(props) {
                           }
                         },
                       })
+                    : null,
+                  inlineView.phase === 'input' && inlineView.history > 0
+                    ? h('span', { className: 'dsh-ide-inline-text' }, 'Уточнение к предыдущему ответу')
                     : null,
                   inlineView.phase === 'pending' ? h('span', { className: 'dsh-ide-inline-text' }, 'Модель готовит правку…') : null,
                   inlineView.phase === 'preview'
@@ -9015,50 +11513,341 @@ function IdeBody(props) {
                     ),
                   ),
             ),
-            activeTab === undefined
-              ? h(
-                  'div',
-                  { className: 'dsh-ide-empty' },
-                  h('div', { className: 'dsh-ide-watermark' }, 'IDE'),
-                  h('div', { className: 'dsh-ide-empty-title' }, 'Файл не открыт'),
-                  h(
-                    'div',
-                    { className: 'dsh-ide-empty-text' },
-                    compact
-                      ? 'Выберите файл в проводнике или найдите его по имени.'
-                      : explorerSide === 'left'
-                        ? 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.'
-                        : 'Ctrl+P — открыть файл по имени, или выберите его в проводнике справа.',
-                  ),
-                  compact
-                    ? h(
-                        'div',
-                        { className: 'dsh-ide-empty-actions' },
-                        h(
-                          'button',
-                          { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: openQuick },
-                          'Открыть файл',
-                        ),
-                        h(
-                          'button',
-                          {
-                            type: 'button',
-                            className: 'dsh-ide-button',
-                            onClick: () => {
-                              setExplorerMode('files')
-                              setShowTree(true)
-                            },
-                          },
-                          'Проводник',
-                        ),
-                      )
-                    : null,
-                )
-              : null,
             h(
               'div',
               { className: 'dsh-ide-stage-wrap' },
               h('div', { className: 'dsh-ide-stage', ref: hostRef }),
+              activeTab === undefined
+                ? h(
+                    'div',
+                    { className: 'dsh-ide-empty' },
+                    h('div', { className: 'dsh-ide-watermark' }, 'IDE'),
+                    h('div', { className: 'dsh-ide-empty-title' }, 'Файл не открыт'),
+                    h(
+                      'div',
+                      { className: 'dsh-ide-empty-text' },
+                      compact
+                        ? 'Выберите файл в проводнике или найдите его по имени.'
+                        : explorerSide === 'left'
+                          ? 'Ctrl+P — открыть файл по имени, или выберите его в проводнике слева.'
+                          : 'Ctrl+P — открыть файл по имени, или выберите его в проводнике справа.',
+                    ),
+                    compact
+                      ? h(
+                          'div',
+                          { className: 'dsh-ide-empty-actions' },
+                          h(
+                            'button',
+                            { type: 'button', className: 'dsh-ide-button dsh-ide-button-primary', onClick: openQuick },
+                            'Открыть файл',
+                          ),
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-ide-button',
+                              onClick: () => {
+                                setExplorerMode('files')
+                                setShowTree(true)
+                              },
+                            },
+                            'Проводник',
+                          ),
+                        )
+                      : null,
+                  )
+                : null,
+              splitTab === undefined
+                ? null
+                : h(SplitEditor, {
+                    monaco,
+                    runtime,
+                    tab: splitTab,
+                    dirty: splitTab.dirty,
+                    onDirty: markTabDirty,
+                    onSave: (key) => void saveKey(key),
+                    onActivate: (key) => setActiveKey(key),
+                    onClose: () => setSplitKey(''),
+                  }),
+              crossFile === undefined
+                ? null
+                : h(
+                    'div',
+                    { className: 'dsh-ide-next-card', role: 'status' },
+                    h('span', { className: 'dsh-ide-next-text' }, 'Возможно, дальше:'),
+                    h(
+                      'button',
+                      {
+                        className: 'dsh-ide-next-path',
+                        title: 'Открыть этот файл',
+                        onClick: () => {
+                          setActiveKey(crossFile.key)
+                          setCrossFile(undefined)
+                        },
+                      },
+                      `${crossFile.path} · ${crossFile.token}`,
+                    ),
+                    h(
+                      'button',
+                      {
+                        className: 'dsh-ide-next-close',
+                        title: 'Скрыть',
+                        'aria-label': 'Скрыть предположение',
+                        onClick: () => setCrossFile(undefined),
+                      },
+                      '×',
+                    ),
+                  ),
+              blameView === undefined
+                ? null
+                : h(
+                    'div',
+                    { className: 'dsh-ide-symbol-card', role: 'dialog', 'aria-label': `Происхождение строки ${blameView.path}:${blameView.line}` },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-symbol-head' },
+                      h('span', { className: 'dsh-ide-symbol-title' }, `${blameView.path}:${blameView.line}`),
+                      h('span', { className: 'dsh-ide-symbol-count' }, blameView.records.length === 0 ? 'неизвестно' : `${blameView.records.length}`),
+                      h(
+                        'button',
+                        {
+                          className: 'dsh-ide-next-close',
+                          title: 'Закрыть',
+                          'aria-label': 'Закрыть происхождение строки',
+                          onClick: () => setBlameView(undefined),
+                        },
+                        '×',
+                      ),
+                    ),
+                    blameView.records.length === 0
+                      ? h(
+                          'div',
+                          { className: 'dsh-ide-symbol-note' },
+                          'Неизвестно: доказательств AI-правки нет. Это не значит, что строку писал человек — запись ведётся только для принятых правок Inline Edit в этой сессии.',
+                        )
+                      : h(
+                          'div',
+                          { className: 'dsh-ide-symbol-list' },
+                          blameView.records.map((record, index) =>
+                            h(
+                              'div',
+                              { key: `${record.at}:${index}`, className: 'dsh-ide-blame-record' },
+                              h(
+                                'div',
+                                { className: 'dsh-ide-blame-where' },
+                                `${record.provider}/${record.model} · ${new Date(record.at).toLocaleTimeString('ru-RU')}`,
+                              ),
+                              h('div', { className: 'dsh-ide-blame-instruction' }, record.instruction || 'Без инструкции'),
+                              record.conversation === undefined
+                                ? null
+                                : h(
+                                    'details',
+                                    { className: 'dsh-ide-blame-conversation' },
+                                    h('summary', {}, 'Показать ход'),
+                                    h('pre', {}, `Задача: ${record.conversation.message ?? ''}\n\nОтвет: ${record.conversation.answer ?? ''}`),
+                                  ),
+                            ),
+                          ),
+                        ),
+                    blameView.records.length === 0
+                      ? null
+                      : h('div', { className: 'dsh-ide-symbol-note' }, 'Ход — это запрос и ответ, сохранённые при принятии правки. Другие изменения строки здесь не отслеживаются.'),
+                  ),
+              symbolView === undefined
+                ? null
+                : h(
+                    'div',
+                    { className: 'dsh-ide-symbol-card', role: 'dialog', 'aria-label': `Символ ${symbolView.word}` },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-symbol-head' },
+                      h('span', { className: 'dsh-ide-symbol-title' }, symbolView.word),
+                      h('span', { className: 'dsh-ide-symbol-count' }, `${symbolView.rows.length} в открытых файлах`),
+                      h(
+                        'button',
+                        {
+                          className: 'dsh-ide-next-close',
+                          title: 'Закрыть',
+                          'aria-label': 'Закрыть список символов',
+                          onClick: () => setSymbolView(undefined),
+                        },
+                        '×',
+                      ),
+                    ),
+                    h(
+                      'div',
+                      { className: 'dsh-ide-symbol-list' },
+                      symbolView.rows.slice(0, 60).map((row, index) =>
+                        h(
+                          'button',
+                          {
+                            key: `${row.key}:${row.line}:${row.column}:${index}`,
+                            className: 'dsh-ide-symbol-row',
+                            title: row.text,
+                            onClick: () => {
+                              runtime.current.pendingReveal = { path: normalPath(row.path), line: row.line }
+                              setActiveKey(row.key)
+                              setSymbolView(undefined)
+                            },
+                          },
+                          h('span', { className: `dsh-ide-symbol-kind ${row.kind}` }, row.kind === 'definition' ? 'опр' : 'ссылка'),
+                          h('span', { className: 'dsh-ide-symbol-where' }, `${row.path}:${row.line}`),
+                          h('span', { className: 'dsh-ide-symbol-text' }, row.text),
+                        ),
+                      ),
+                    ),
+                    h('div', { className: 'dsh-ide-symbol-note' }, 'Только открытые вкладки и JS/TS: это поиск по тексту, не языковой сервер.'),
+                  ),
+              renameView === undefined
+                ? null
+                : h(
+                    'div',
+                    { className: 'dsh-ide-symbol-card', role: 'dialog', 'aria-label': `Переименовать ${renameView.word}` },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-symbol-head' },
+                      h('span', { className: 'dsh-ide-symbol-title' }, `Переименовать ${renameView.word}`),
+                      h(
+                        'button',
+                        {
+                          className: 'dsh-ide-next-close',
+                          title: 'Закрыть',
+                          'aria-label': 'Закрыть переименование',
+                          onClick: () => setRenameView(undefined),
+                        },
+                        '×',
+                      ),
+                    ),
+                    h(
+                      'div',
+                      { className: 'dsh-ide-symbol-form' },
+                      h('input', {
+                        className: 'dsh-ide-symbol-input',
+                        value: renameView.next,
+                        'aria-label': 'Новое имя',
+                        onInput: (event) => setRenameView({ ...renameView, next: event.target.value, plan: undefined }),
+                      }),
+                      h(
+                        'button',
+                        {
+                          className: 'dsh-ide-symbol-action',
+                          onClick: () => setRenameView({ ...renameView, plan: renamePlan(tabs, renameView.word, renameView.next) }),
+                        },
+                        'Просмотреть',
+                      ),
+                    ),
+                    renameView.plan === undefined
+                      ? null
+                      : renameView.plan.ok === false
+                        ? h('div', { className: 'dsh-ide-symbol-note' }, renameView.plan.reason)
+                        : h(
+                            'div',
+                            { className: 'dsh-ide-symbol-list' },
+                            renameView.plan.files.map((file) =>
+                              h(
+                                'div',
+                                { className: 'dsh-ide-symbol-row', key: file.key },
+                                h('span', { className: 'dsh-ide-symbol-kind definition' }, `${file.count}`),
+                                h('span', { className: 'dsh-ide-symbol-where' }, file.path),
+                                h('span', { className: 'dsh-ide-symbol-text' }, `${file.before.trim()} → ${file.after.trim()}`),
+                              ),
+                            ),
+                          ),
+                    renameView.plan?.ok === true
+                      ? h(
+                          'div',
+                          { className: 'dsh-ide-symbol-form' },
+                          h('span', { className: 'dsh-ide-symbol-note' }, `${renameView.plan.total} замен(ы) в ${renameView.plan.files.length} файл(ах)`),
+                          h('button', { className: 'dsh-ide-symbol-action', onClick: applyRename }, 'Применить'),
+                        )
+                      : null,
+                    h('div', { className: 'dsh-ide-symbol-note' }, 'Применение меняет текст открытых вкладок и помечает их изменёнными; файлы на диске не пишутся, Undo в моделях сбрасывается.'),
+                  ),
+              testsView === undefined
+                ? null
+                : h(
+                    'div',
+                    { className: 'dsh-ide-symbol-card', role: 'dialog', 'aria-label': 'Тесты проекта' },
+                    h(
+                      'div',
+                      { className: 'dsh-ide-symbol-head' },
+                      h('span', { className: 'dsh-ide-symbol-title' }, 'npm test'),
+                      h(
+                        'span',
+                        { className: 'dsh-ide-symbol-count' },
+                        testsView.phase === 'running'
+                          ? 'идёт запуск…'
+                          : testsView.phase === 'failed'
+                            ? 'ошибка'
+                            : `${testsView.result.failures.length} упавших · ${Math.round(testsView.result.durationMs / 1000)} с`,
+                      ),
+                      h(
+                        'button',
+                        {
+                          className: 'dsh-ide-next-close',
+                          title: 'Закрыть',
+                          'aria-label': 'Закрыть результаты тестов',
+                          onClick: () => {
+                            stopProjectTests()
+                            setTestsView(undefined)
+                          },
+                        },
+                        '×',
+                      ),
+                    ),
+                    testsView.phase === 'running'
+                      ? h(
+                          'div',
+                          { className: 'dsh-ide-symbol-form' },
+                          h('span', { className: 'dsh-ide-symbol-note' }, 'Тесты идут в рабочей папке. Вывод появится после завершения.'),
+                          h('button', { className: 'dsh-ide-symbol-action', onClick: stopProjectTests }, 'Остановить'),
+                        )
+                      : null,
+                    testsView.phase === 'failed' ? h('div', { className: 'dsh-ide-symbol-note' }, testsView.error) : null,
+                    testsView.phase === 'ready'
+                      ? h(
+                          'div',
+                          { className: 'dsh-ide-symbol-form' },
+                          h('button', { className: 'dsh-ide-symbol-action', onClick: runProjectTests }, 'Повторить'),
+                          h('span', { className: 'dsh-ide-symbol-note' }, `код ${testsView.result.code}${testsView.result.truncated ? ' · вывод обрезан' : ''}`),
+                        )
+                      : null,
+                    testsView.phase === 'ready'
+                      ? h(
+                          'div',
+                          { className: 'dsh-ide-symbol-list' },
+                          testsView.result.failures.length === 0
+                            ? h('div', { className: 'dsh-ide-symbol-note' }, `Тесты прошли, код ${testsView.result.code}.`)
+                            : testsView.result.failures.map((failure, index) =>
+                                h(
+                                  'button',
+                                  {
+                                    key: `${failure.file}:${failure.line}:${index}`,
+                                    className: 'dsh-ide-symbol-row',
+                                    title: failure.name,
+                                    onClick: () => {
+                                      if (failure.file === '') return
+                                      runtime.current.pendingReveal = { path: normalPath(failure.file), line: failure.line }
+                                      void openFile(failure.file, { activate: true })
+                                    },
+                                  },
+                                  h('span', { className: 'dsh-ide-symbol-kind definition' }, 'тест'),
+                                  h('span', { className: 'dsh-ide-symbol-where' }, `${failure.file}:${failure.line}`),
+                                  h('span', { className: 'dsh-ide-symbol-text' }, failure.name),
+                                ),
+                              ),
+                        )
+                      : null,
+                    testsView.phase === 'ready'
+                      ? h(
+                          'details',
+                          { className: 'dsh-ide-symbol-output' },
+                          h('summary', null, 'Вывод'),
+                          h('pre', null, testsView.result.output),
+                        )
+                      : null,
+                    h('div', { className: 'dsh-ide-symbol-note' }, 'Запускается только скрипт test из package.json; запись в файлы тестов не выполняется плагином.'),
+                  ),
               activeTab !== undefined && !editorReady && (editorFailure !== null || editorSlow)
                 ? h(
                     'div',
@@ -9116,6 +11905,10 @@ function IdeBody(props) {
                     },
                     onPrevious: () => jumpDiff('previous'),
                     onNext: () => jumpDiff('next'),
+                    onSendPatch: (group, path) => {
+                      void sendScmPatch(group, path)
+                    },
+                    patching: scmPatching,
                     containerRef: diffContainerRef,
                   })
                 : diffView === undefined
@@ -9143,6 +11936,7 @@ function IdeBody(props) {
               ? null
               : h(OutputPanel, {
                   panel,
+                  toolTabs,
                   height: panelHeight,
                   trace,
                   showChat,
@@ -9168,6 +11962,54 @@ function IdeBody(props) {
                 ? null
                 : h('span', { className: 'dsh-ide-status-item dsh-ide-status-eol' }, activeTab.eol === 'crlf' ? 'CRLF' : 'LF'),
               activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item dsh-ide-status-enc' }, 'UTF-8'),
+              askModeOn
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action dsh-ide-status-ask',
+                      title: 'Режим вопросов включён: запись запрещена. Нажмите, чтобы выключить',
+                      onClick: toggleAskMode,
+                    },
+                    'Ask',
+                  )
+                : null,
+              snoozeUntil > 0
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action dsh-ide-status-snooze',
+                      title: 'Возобновить автоподсказки Tab',
+                      onClick: resumeTab,
+                    },
+                    `Tab до ${snoozeLabel(snoozeUntil)}`,
+                  )
+                : null,
+              activeTab !== undefined && tabExtensionDisabled(preferences, activeTab.path)
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action',
+                      title: `Включить автоподсказки Tab для .${fileExtension(activeTab.path)}`,
+                      onClick: () => void toggleTabExtension(),
+                    },
+                    `Tab .${fileExtension(activeTab.path)} выкл`,
+                  )
+                : null,
+              activeTab === undefined || activeTab.hostId === undefined
+                ? null
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action',
+                      title: 'Показать правила проекта для этого файла',
+                      onClick: () => setRulesOpen(true),
+                    },
+                    'Правила',
+                  ),
               compact || coarsePointer
                 ? h(
                     'span',
@@ -9213,6 +12055,86 @@ function IdeBody(props) {
           ),
         ),
         menuSheetOpen && compact ? h(MenuSheet, { menus, onClose: () => setMenuSheetOpen(false) }) : null,
+        rulesOpen && activeTab !== undefined && activeTab.hostId !== undefined
+          ? h(RulesPanel, {
+              tab: { hostId: activeTab.hostId, path: activeTab.path },
+              sessionId: stateRef.current.sessionId,
+              onClose: () => setRulesOpen(false),
+            })
+          : null,
+        exploreOpen
+          ? h(ExplorePanel, {
+              onClose: () => setExploreOpen(false),
+              onAsk: (question) => call('explore', { sessionId: stateRef.current.sessionId, question }),
+              onOpen: (source) => {
+                setExploreOpen(false)
+                runtime.current.pendingReveal = { path: normalPath(source.path), line: source.line }
+                void openFile(source.path, { activate: true })
+              },
+            })
+          : null,
+        convSearchOpen
+          ? h(ConversationSearchPanel, {
+              onClose: () => setConvSearchOpen(false),
+              onSearch: (query) => call('sessionSearch', { sessionId: stateRef.current.sessionId, query }),
+              onOpen: (item) => openConversationSession(item.sessionId),
+              onAttach: (item) => void attachConversation(item),
+            })
+          : null,
+        convSource !== undefined
+          ? h(ConversationSourcePanel, {
+              source: convSource,
+              onClose: () => setConvSource(undefined),
+              onInsert: () => {
+                const title = convSource.title || convSource.sessionId
+                const accepted = insertQuote(
+                  `Прошлый разговор · ${title}\n\n${convSource.text}`,
+                  `Разговор: ${convSource.chars} символов`,
+                )
+                if (accepted) setConvSource(undefined)
+              },
+            })
+          : null,
+        sideChat !== undefined
+          ? h(SideChatPanel, {
+              context: sideChat,
+              onClose: () => setSideChat(undefined),
+              onAsk: askSideChat,
+            })
+          : null,
+        planPicker !== undefined
+          ? h('div', { className: 'dsh-ide-modal' }, h(
+              'div',
+              { className: 'dsh-ide-modal-card dsh-ide-plans-card', role: 'dialog', 'aria-label': 'Передать план в сессию' },
+              h(
+                'div',
+                { className: 'dsh-ide-plans-head' },
+                h('strong', null, 'Передать план в сессию'),
+                h('button', { type: 'button', className: 'dsh-ide-button', onClick: () => setPlanPicker(undefined) }, 'Отмена'),
+              ),
+              h('div', { className: 'dsh-ide-plans-meta' }, planPicker.title),
+              planTargets().length === 0
+                ? h('div', { className: 'dsh-ide-plans-note' }, 'Нет других открытых сессий: откройте нужную сессию и повторите.')
+                : h(
+                    'div',
+                    { className: 'dsh-ide-plans-list' },
+                    planTargets().map((target) =>
+                      h(
+                        'button',
+                        {
+                          key: target.id,
+                          type: 'button',
+                          className: 'dsh-ide-plans-row dsh-ide-plans-target',
+                          onClick: () => void transferSavedPlan(planPicker, target.id),
+                        },
+                        h('span', { className: 'dsh-ide-plans-title' }, target.title),
+                        h('span', { className: 'dsh-ide-plans-meta' }, target.id),
+                      ),
+                    ),
+                  ),
+              h('div', { className: 'dsh-ide-plans-foot' }, 'Текст попадает только в поле ввода выбранной сессии и не отправляется.'),
+            ))
+          : null,
         settingsOpen && preferences !== undefined
           ? h(SettingsPanel, {
               preferences,
@@ -9415,10 +12337,14 @@ function IdeBody(props) {
 .dsh-ide-explorer-head { display:flex; align-items:center; justify-content:space-between; padding:6px 8px 4px;
   font:600 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.06em; text-transform:uppercase; color:var(--ide-muted); }
 .dsh-ide-explorer-actions { display:flex; gap:2px; }
-.dsh-ide-explorer-search { padding:0 8px 6px; }
-.dsh-ide-search-input { width:100%; padding:3px 6px; border-radius:4px; color:inherit; background:var(--ide-bg);
+.dsh-ide-explorer-search { display:flex; align-items:center; gap:4px; padding:0 8px 6px; }
+.dsh-ide-search-input { flex:1 1 auto; min-width:0; padding:3px 6px; border-radius:4px; color:inherit; background:var(--ide-bg);
   border:1px solid var(--ide-border); font:400 11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); outline:none; }
 .dsh-ide-search-input:focus { border-color:var(--ide-accent); }
+.dsh-ide-search-toggle { flex:0 0 auto; padding:2px 5px; border-radius:4px; border:1px solid var(--ide-border);
+  background:var(--ide-bg); color:var(--ide-fg-dim); font:600 10px/1.5 var(--ide-mono); cursor:pointer; }
+.dsh-ide-search-toggle:hover { background:var(--ide-hover); color:var(--ide-fg); }
+.dsh-ide-search-toggle[aria-pressed='true'] { border-color:var(--ide-accent); background:var(--ide-hover); color:var(--ide-fg); }
 .dsh-ide-tree { flex:1 1 auto; overflow:auto; padding:2px 0 10px; }
 .dsh-ide-search-status { padding:0 8px 6px; color:var(--ide-fg-dim); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-search-file { border-bottom:1px solid var(--ide-border); padding-bottom:3px; }
@@ -9596,6 +12522,47 @@ function IdeBody(props) {
 .dsh-ide-scm-commit-button { width:100%; margin-top:4px; }
 .dsh-ide-scm-hint { margin-top:3px; color:var(--ide-fg-dim);
   font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+/* Chat and review act on the exact index snapshot: buttons stay small, the
+   payload size is stated, and a skipped file is named rather than hidden. */
+.dsh-ide-scm-actions { display:flex; flex-wrap:wrap; align-items:center; gap:4px; margin-top:5px; }
+.dsh-ide-scm-actions .dsh-ide-button { flex:0 0 auto; padding:2px 8px; font-size:10.5px; }
+.dsh-ide-scm-depth { display:flex; border:1px solid var(--ide-border); border-radius:4px; overflow:hidden; }
+.dsh-ide-scm-depth-button { border:0; background:transparent; color:var(--ide-muted); cursor:pointer;
+  padding:2px 7px; font-size:10.5px; }
+.dsh-ide-scm-depth-button[aria-pressed='true'] { background:var(--ide-accent); color:#fff; }
+.dsh-ide-scm-compare { margin-top:8px; border-top:1px solid var(--ide-border); padding-top:8px; }
+.dsh-ide-scm-compare-head { font-size:10.5px; color:var(--ide-muted); margin-bottom:4px; }
+.dsh-ide-scm-compare-form { display:flex; gap:4px; }
+.dsh-ide-scm-compare-input { flex:1 1 auto; min-width:0; padding:2px 6px; border-radius:4px;
+  border:1px solid var(--ide-border); background:var(--ide-bg); color:inherit; font-size:11px; }
+.dsh-ide-scm-compare-result { margin-top:6px; }
+.dsh-ide-scm-compare-note { color:var(--ide-muted); font-size:10.5px; line-height:1.45; }
+.dsh-ide-scm-compare-files { max-height:120px; overflow:auto; margin-top:4px; }
+.dsh-ide-scm-compare-file { display:flex; gap:6px; font:10.5px/1.5 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-compare-status { color:var(--ide-warn, #d19a66); width:10px; flex:0 0 auto; }
+.dsh-ide-scm-compare-path { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-scm-review-note { color:var(--ide-fg-dim);
+  font:400 10.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-review { padding:6px 10px 8px; border-top:1px solid var(--ide-border); }
+.dsh-ide-scm-review-stale { margin-bottom:4px; padding:3px 6px; border-radius:4px;
+  background:rgba(220, 170, 60, .14); color:var(--ide-fg-dim);
+  font:400 10.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-review-stale .dsh-ide-scm-link { margin-left:6px; }
+.dsh-ide-scm-findings { display:flex; flex-direction:column; gap:3px; margin-top:4px; }
+.dsh-ide-scm-finding { display:block; width:100%; padding:4px 6px; border:1px solid var(--ide-border);
+  border-left-width:3px; border-radius:4px; background:var(--ide-panel-2); color:inherit; text-align:left;
+  cursor:pointer; font:400 10.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-finding:hover { background:var(--ide-hover); }
+.dsh-ide-scm-finding-high { border-left-color:#f48771; }
+.dsh-ide-scm-finding-medium { border-left-color:#dcdcaa; }
+.dsh-ide-scm-finding-low { border-left-color:#9cdcfe; }
+.dsh-ide-scm-finding-where { display:block; color:var(--ide-fg-dim); font:400 9.5px/1.4 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-finding-message { display:block; }
+.dsh-ide-scm-chat { padding:0 5px; border:1px solid var(--ide-border); border-radius:3px;
+  background:var(--ide-panel-2); color:var(--ide-fg-dim); cursor:pointer; text-transform:none;
+  letter-spacing:0; font:400 9.5px/1.6 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-chat:hover:not(:disabled) { color:var(--ide-fg); border-color:var(--ide-accent); }
+.dsh-ide-scm-chat:disabled { opacity:.5; cursor:default; }
 .dsh-ide-scm-section { border-top:1px solid var(--ide-border); }
 .dsh-ide-scm-section-head { display:flex; align-items:center; justify-content:space-between; gap:8px;
   padding:6px 10px 2px; color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px;
@@ -9634,6 +12601,22 @@ function IdeBody(props) {
 .dsh-ide-scm-action:disabled { opacity:.5; cursor:default; }
 .dsh-ide-scm-conflict-note { flex:0 0 auto; color:var(--ide-fg-dim);
   font:400 9.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-resolve-action { flex:0 0 auto; border:1px solid var(--ide-border); border-radius:4px;
+  background:transparent; color:var(--ide-fg-dim); padding:2px 6px; cursor:pointer;
+  font:400 9.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-scm-resolve-action:hover:not(:disabled) { border-color:var(--ide-accent); color:var(--ide-fg); }
+.dsh-ide-scm-resolve-action:disabled { opacity:.5; cursor:default; }
+.dsh-ide-scm-resolve { margin:6px 8px; border:1px solid var(--ide-border); border-radius:5px;
+  background:var(--ide-panel-2); overflow:hidden; }
+.dsh-ide-scm-resolve-path { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; color:var(--ide-fg-dim);
+  font:400 9.5px/1.4 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-resolve-body { display:flex; flex-direction:column; gap:6px; padding:6px 8px 8px; }
+.dsh-ide-scm-resolve-text { width:100%; box-sizing:border-box; min-height:140px; resize:vertical;
+  background:var(--ide-panel); color:var(--ide-fg); border:1px solid var(--ide-border); border-radius:4px;
+  padding:6px; font:400 11px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-scm-resolve-text:focus { outline:1px solid var(--ide-accent); outline-offset:-1px; }
+.dsh-ide-scm-resolve-actions { display:flex; align-items:center; gap:8px; }
 .dsh-ide-scm-note { padding:5px 10px; color:var(--ide-fg-dim); background:var(--ide-panel-2);
   border-bottom:1px solid var(--ide-border); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-scm-error { padding:6px 10px; color:var(--ide-error);
@@ -9802,6 +12785,47 @@ function IdeBody(props) {
 .dsh-ide-crumb-last { color:var(--ide-text); }
 .dsh-ide-crumb-sep { padding:0 3px; opacity:.6; }
 .dsh-ide-stage { flex:1 1 auto; min-height:0; }
+.dsh-ide-split { display:flex; flex-direction:column; width:50%; min-width:0; min-height:0; border-left:1px solid var(--ide-border); background:var(--ide-bg); }
+.dsh-ide-split-head { display:flex; align-items:center; gap:6px; padding:3px 8px; min-height:24px; border-bottom:1px solid var(--ide-border); background:var(--ide-panel); }
+.dsh-ide-split-title { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; text-align:left; background:none; border:0; color:var(--ide-fg); cursor:pointer; padding:0; }
+.dsh-ide-split-title:hover { text-decoration:underline; }
+.dsh-ide-split-dirty { color:#d19a66; font-size:10px; }
+.dsh-ide-split-action { flex:0 0 auto; font-size:11px; color:var(--ide-muted); background:none; border:1px solid transparent; border-radius:3px; padding:1px 6px; cursor:pointer; }
+.dsh-ide-split-action:hover { color:var(--ide-fg); border-color:var(--ide-border); }
+.dsh-ide-split-action:disabled { opacity:.5; cursor:default; }
+.dsh-ide-split-stage { flex:1 1 auto; min-height:0; }
+.dsh-ide-root[data-compact] .dsh-ide-split { display:none; }
+.dsh-ide-next-card { position:absolute; right:12px; bottom:12px; z-index:5; display:flex; align-items:center; gap:6px; max-width:min(420px, 80%); padding:6px 8px; border:1px solid var(--ide-border); border-radius:6px; background:var(--ide-panel); box-shadow:0 4px 14px rgba(0,0,0,.18); font-size:11px; }
+.dsh-ide-next-text { color:var(--ide-muted); flex:0 0 auto; }
+.dsh-ide-next-path { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:none; border:0; color:var(--ide-accent); cursor:pointer; padding:0; font-size:11px; }
+.dsh-ide-next-path:hover { text-decoration:underline; }
+.dsh-ide-next-close { flex:0 0 auto; background:none; border:0; color:var(--ide-muted); cursor:pointer; font-size:13px; line-height:1; padding:0 2px; }
+.dsh-ide-next-close:hover { color:var(--ide-fg); }
+.dsh-ide-symbol-card { position:absolute; right:12px; bottom:12px; z-index:6; display:flex; flex-direction:column; width:min(560px, 90%); max-height:60%; border:1px solid var(--ide-border); border-radius:6px; background:var(--ide-panel); box-shadow:0 8px 24px rgba(0,0,0,.24); }
+.dsh-ide-symbol-head { display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--ide-border); }
+.dsh-ide-symbol-title { font-weight:600; font-size:12px; color:var(--ide-fg); }
+.dsh-ide-symbol-count { flex:1 1 auto; color:var(--ide-muted); font-size:11px; }
+.dsh-ide-symbol-list { overflow:auto; min-height:0; }
+.dsh-ide-symbol-row { display:flex; align-items:baseline; gap:8px; width:100%; text-align:left; padding:3px 8px; border:0; border-bottom:1px solid var(--ide-border); background:none; color:var(--ide-fg); cursor:pointer; font-size:11px; }
+.dsh-ide-symbol-row:hover { background:var(--ide-hover); }
+.dsh-ide-symbol-kind { flex:0 0 auto; color:var(--ide-muted); }
+.dsh-ide-symbol-kind.definition { color:var(--ide-accent); }
+.dsh-ide-symbol-where { flex:0 0 auto; max-width:45%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ide-accent); }
+.dsh-ide-symbol-text { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ide-muted); }
+.dsh-ide-symbol-note { padding:5px 8px; color:var(--ide-muted); font-size:10px; border-top:1px solid var(--ide-border); }
+.dsh-ide-blame-record { padding:6px 8px; border-bottom:1px solid var(--ide-border); display:flex; flex-direction:column; gap:3px; }
+.dsh-ide-blame-where { font-size:10px; color:var(--ide-muted); }
+.dsh-ide-blame-instruction { font-size:11px; white-space:pre-wrap; }
+.dsh-ide-blame-conversation summary { cursor:pointer; font-size:10.5px; color:var(--ide-accent); }
+.dsh-ide-blame-conversation pre { margin:4px 0 0; max-height:160px; overflow:auto; white-space:pre-wrap; font-size:10px; }
+.dsh-ide-symbol-form { display:flex; align-items:center; gap:6px; padding:6px 8px; border-bottom:1px solid var(--ide-border); }
+.dsh-ide-symbol-input { flex:1 1 auto; min-width:0; padding:3px 6px; font-size:12px; color:var(--ide-fg); background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:3px; }
+.dsh-ide-symbol-input:focus { outline:none; border-color:var(--ide-accent); }
+.dsh-ide-symbol-action { flex:0 0 auto; padding:3px 8px; font-size:11px; color:var(--ide-fg); background:var(--ide-hover); border:1px solid var(--ide-border); border-radius:3px; cursor:pointer; }
+.dsh-ide-symbol-action:hover { border-color:var(--ide-accent); }
+.dsh-ide-symbol-output { border-top:1px solid var(--ide-border); font-size:10px; color:var(--ide-muted); }
+.dsh-ide-symbol-output summary { padding:4px 8px; cursor:pointer; }
+.dsh-ide-symbol-output pre { margin:0; padding:6px 8px; max-height:180px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
 .dsh-ide-stage-fallback { position:absolute; inset:0; z-index:2; display:flex; flex-direction:column; overflow:auto; background:var(--ide-bg); }
 .dsh-ide-stage-fallback-head { display:flex; flex-direction:column; gap:6px; padding:12px 14px; border-bottom:1px solid var(--ide-border); }
 .dsh-ide-stage-fallback-title { color:var(--ide-text); font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
@@ -9823,6 +12847,9 @@ function IdeBody(props) {
 .dsh-ide-panel-hint { font:400 11px/1.6 var(--ide-font); color:var(--ide-fg-dim); padding-right:6px; }
 .dsh-ide-panel-close { border:none; background:transparent; color:var(--ide-fg-dim); font-size:14px; line-height:1; cursor:pointer; padding:2px 6px; }
 .dsh-ide-panel-close:hover { color:var(--ide-fg); }
+.dsh-ide-panel-tool { min-height:0; overflow:auto; flex:1; }
+.dsh-ide-panel-tool > .dsh-ide-modal-card { box-sizing:border-box; max-height:none; max-width:none; border:0; border-radius:0; box-shadow:none; }
+.dsh-ide-panel-head { overflow-x:auto; white-space:nowrap; }
 .dsh-ide-panel-body { flex:1 1 auto; min-height:0; overflow:auto; padding:4px 0; font:400 11.5px/1.55 var(--ide-font); }
 .dsh-ide-panel-empty { color:var(--ide-fg-dim); padding:8px 12px; }
 .dsh-ide-context-menu { position:fixed; z-index:1000; min-width:168px; padding:4px; border:1px solid var(--ide-border); border-radius:7px; background:var(--ide-panel-2); box-shadow:0 10px 28px rgba(0,0,0,.35); }
@@ -9842,9 +12869,7 @@ function IdeBody(props) {
 .dsh-ide-chat { padding:6px 12px 10px; }
 .dsh-ide-chat-label { color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px; font-size:10px; margin:8px 0 3px; }
 .dsh-ide-chat-text { margin:0; white-space:pre-wrap; word-break:break-word; font:400 11.5px/1.5 var(--ide-mono); color:var(--ide-fg); max-height:120px; overflow:auto; background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; }
-/* The editor host is a later sibling, so it paints over this layer; the empty
-   state must sit above it or its buttons never receive a tap on a phone. */
-.dsh-ide-empty { position:absolute; inset:64px 0 24px; display:flex; flex-direction:column; align-items:center; justify-content:center;
+.dsh-ide-empty { position:absolute; inset:0; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:6px; text-align:center; padding:16px; pointer-events:none; z-index:2; }
 .dsh-ide-watermark { font:700 72px/1 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.02em; color:var(--ide-text);
   opacity:.06; margin-bottom:-4px; }
@@ -9859,6 +12884,7 @@ function IdeBody(props) {
 .dsh-ide-status-item:hover { background:rgba(255,255,255,.12); border-radius:3px; padding:0 3px; margin:0 -3px; }
 .dsh-ide-status-action { cursor:pointer; border:none; background:transparent; color:inherit; font:inherit; }
 .dsh-ide-status-action:hover { background:rgba(255,255,255,.12); border-radius:3px; }
+.dsh-ide-status-ask { color:#e5c07b; font-weight:600; }
 .dsh-ide-drop-overlay { position:absolute; inset:0; z-index:25; display:flex; align-items:center; justify-content:center;
   background:rgba(0,0,0,.5); pointer-events:none; }
 .dsh-ide-drop-overlay-text { padding:10px 18px; border:2px dashed var(--ide-accent); border-radius:8px; background:var(--ide-panel);
@@ -9962,6 +12988,172 @@ function IdeBody(props) {
 .dsh-ide-modal-title { font:600 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); margin-bottom:6px; }
 .dsh-ide-modal-text { color:var(--ide-muted); font-size:11.5px; line-height:1.5; margin-bottom:12px; }
 .dsh-ide-modal-actions { display:flex; gap:8px; justify-content:flex-end; }
+.dsh-ide-rules-card { max-height:78%; display:flex; flex-direction:column; }
+.dsh-ide-rules-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-rules-list { overflow:auto; margin:8px 0; display:flex; flex-direction:column; gap:8px; }
+.dsh-ide-rules-row { border:1px solid var(--ide-border); border-radius:6px; padding:8px; }
+.dsh-ide-rules-row-head { display:flex; gap:8px; align-items:baseline; justify-content:space-between; }
+.dsh-ide-rules-path { font:600 12px/1.4 var(--dsh-font-mono, ui-monospace, monospace); word-break:break-all; }
+.dsh-ide-rules-badge { flex:0 0 auto; font-size:10.5px; padding:1px 6px; border-radius:999px;
+  background:rgba(255,255,255,.08); color:var(--ide-muted); white-space:nowrap; }
+.dsh-ide-rules-badge-on { background:rgba(80,180,120,.18); color:#a6e3bb; }
+.dsh-ide-rules-meta { color:var(--ide-muted); font-size:10.5px; margin-top:2px; }
+.dsh-ide-rules-preview { margin:6px 0 0; padding:6px; background:var(--ide-bg); border-radius:4px;
+  max-height:140px; overflow:auto; white-space:pre-wrap; font:11px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-rules-note { color:var(--ide-muted); font-size:11.5px; line-height:1.5; }
+.dsh-ide-rules-failed { display:flex; flex-direction:column; gap:8px; align-items:flex-start; }
+.dsh-ide-rules-foot { color:var(--ide-muted); font-size:11px; line-height:1.45;
+  border-top:1px solid var(--ide-border); padding-top:8px; margin-top:8px; }
+.dsh-ide-plans-card { max-height:78%; display:flex; flex-direction:column; }
+.dsh-ide-plans-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-plans-list { overflow:auto; margin:8px 0; display:flex; flex-direction:column; gap:8px; }
+.dsh-ide-plans-row { border:1px solid var(--ide-border); border-radius:6px; padding:8px; }
+.dsh-ide-plans-title { font-weight:600; font-size:12px; word-break:break-all; }
+.dsh-ide-plans-meta { color:var(--ide-muted); font-size:10.5px; margin-top:2px; }
+.dsh-ide-plans-actions { display:flex; gap:8px; margin-top:8px; }
+.dsh-ide-plans-note { color:var(--ide-muted); font-size:11.5px; line-height:1.5; }
+.dsh-ide-plans-failed { display:flex; flex-direction:column; gap:8px; align-items:flex-start; }
+.dsh-ide-plans-foot { color:var(--ide-muted); font-size:11px; line-height:1.45;
+  border-top:1px solid var(--ide-border); padding-top:8px; margin-top:8px; }
+.dsh-ide-plans-target { display:flex; flex-direction:column; align-items:flex-start; gap:2px; width:100%;
+  background:transparent; color:inherit; text-align:left; cursor:pointer; }
+.dsh-ide-plans-target:hover { border-color:var(--ide-accent); }
+.dsh-ide-terminal-card { max-height:82%; display:flex; flex-direction:column; }
+.dsh-ide-terminal-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-terminal-note { color:var(--ide-muted); font-size:11.5px; line-height:1.5; margin:6px 0 10px; }
+.dsh-ide-terminal-field { display:flex; flex-direction:column; gap:4px; margin-bottom:8px; font-size:11px; color:var(--ide-muted); }
+.dsh-ide-terminal-input, .dsh-ide-terminal-output { width:100%; box-sizing:border-box; padding:6px 8px; border-radius:4px;
+  border:1px solid var(--ide-border); background:var(--ide-bg); color:inherit; font:12px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-terminal-code { max-width:120px; }
+.dsh-ide-terminal-output { resize:vertical; min-height:120px; }
+.dsh-ide-terminal-meta { color:var(--ide-muted); font-size:10.5px; margin:2px 0 6px; }
+.dsh-ide-terminal-preview { margin:0 0 10px; padding:8px; border:1px solid var(--ide-border); border-radius:6px;
+  background:var(--ide-bg); max-height:180px; overflow:auto; white-space:pre-wrap;
+  font:11px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-terminal-actions { display:flex; gap:8px; justify-content:flex-end; }
+.dsh-ide-debug-card { max-height:86%; display:flex; flex-direction:column; }
+.dsh-ide-debug-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-debug-note { color:var(--ide-muted); font-size:11.5px; line-height:1.5; margin:6px 0 10px; }
+.dsh-ide-debug-field { display:flex; flex-direction:column; gap:4px; margin-bottom:8px; font-size:11px; color:var(--ide-muted); }
+.dsh-ide-debug-input, .dsh-ide-debug-text { width:100%; box-sizing:border-box; padding:6px 8px; border-radius:4px;
+  border:1px solid var(--ide-border); background:var(--ide-bg); color:inherit; font:12px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-debug-text { resize:vertical; min-height:56px; }
+.dsh-ide-debug-runs { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.dsh-ide-debug-check { display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--ide-muted); margin:2px 0 6px; }
+.dsh-ide-debug-warn { color:#e5c07b; font-size:11px; line-height:1.45; margin-bottom:6px; }
+.dsh-ide-debug-meta { color:var(--ide-muted); font-size:10.5px; margin:2px 0 6px; }
+.dsh-ide-debug-preview { margin:0 0 10px; padding:8px; border:1px solid var(--ide-border); border-radius:6px;
+  background:var(--ide-bg); max-height:180px; overflow:auto; white-space:pre-wrap;
+  font:11px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-debug-actions { display:flex; gap:8px; justify-content:flex-end; }
+.dsh-ide-notes-card { max-height:86%; display:flex; flex-direction:column; }
+.dsh-ide-notes-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-notes-note { color:var(--ide-muted); font-size:11.5px; line-height:1.5; margin:6px 0 10px; }
+.dsh-ide-notes-input { width:100%; box-sizing:border-box; padding:6px 8px; border-radius:4px; resize:vertical;
+  border:1px solid var(--ide-border); background:var(--ide-bg); color:inherit; font:12px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-notes-actions { display:flex; align-items:center; gap:8px; margin:8px 0; }
+.dsh-ide-notes-meta { color:var(--ide-muted); font-size:10.5px; margin-left:auto; }
+.dsh-ide-notes-list { margin:0; padding:0 0 0 18px; max-height:180px; overflow:auto; }
+.dsh-ide-notes-row { margin-bottom:4px; font-size:12px; line-height:1.45; }
+.dsh-ide-notes-where { color:var(--ide-muted); font:10.5px/1.4 var(--dsh-font-mono, ui-monospace, monospace); margin-right:6px; }
+.dsh-ide-notes-text { white-space:pre-wrap; }
+.dsh-ide-notes-remove { border:none; background:transparent; color:var(--ide-muted); cursor:pointer; padding:0 4px; }
+.dsh-ide-notes-empty { color:var(--ide-muted); font-size:11.5px; margin-bottom:8px; }
+.dsh-ide-notes-preview { margin:0 0 10px; padding:8px; border:1px solid var(--ide-border); border-radius:6px;
+  background:var(--ide-bg); max-height:160px; overflow:auto; white-space:pre-wrap;
+  font:11px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-notes-footer { display:flex; gap:8px; justify-content:flex-end; }
+.dsh-ide-tour-card { max-height:82%; display:flex; flex-direction:column; }
+.dsh-ide-tour-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-tour-note { color:var(--ide-muted); font-size:11px; line-height:1.5; margin:6px 0 10px; }
+.dsh-ide-tour-actions { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+.dsh-ide-tour-input { flex:1 1 auto; min-width:0; padding:5px 8px; border-radius:4px;
+  border:1px solid var(--ide-border); background:var(--ide-bg); color:inherit; font-size:12px; }
+.dsh-ide-tour-list { list-style:none; margin:0 0 8px; padding:0; max-height:240px; overflow:auto; }
+.dsh-ide-tour-row { display:flex; align-items:center; gap:6px; padding:3px 4px; border-radius:4px; font-size:12px; }
+.dsh-ide-tour-row-current { background:var(--ide-hover, rgba(127,127,127,.12)); }
+.dsh-ide-tour-open { flex:0 0 auto; border:none; background:transparent; color:var(--ide-accent, #61afef);
+  cursor:pointer; font:11px/1.4 var(--dsh-font-mono, ui-monospace, monospace); padding:0; text-align:left; }
+.dsh-ide-tour-text { flex:1 1 auto; min-width:0; color:var(--ide-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-tour-row-actions { flex:0 0 auto; display:flex; gap:2px; }
+.dsh-ide-tour-move { border:none; background:transparent; color:var(--ide-muted); cursor:pointer; padding:0 4px; }
+.dsh-ide-tour-move:disabled { opacity:.35; cursor:default; }
+.dsh-ide-tour-empty { color:var(--ide-muted); font-size:11.5px; margin-bottom:8px; }
+.dsh-ide-tour-footer { display:flex; gap:8px; align-items:center; justify-content:flex-end; }
+.dsh-ide-tour-meta { margin-right:auto; color:var(--ide-muted); font-size:11px; }
+.dsh-ide-worktree-card { max-height:82%; display:flex; flex-direction:column; }
+.dsh-ide-worktree-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-worktree-note { color:var(--ide-muted); font-size:11px; line-height:1.5; margin:6px 0 10px; }
+.dsh-ide-worktree-error { color:var(--ide-danger, #f14c4c); font-size:11.5px; margin:6px 0; }
+.dsh-ide-worktree-list { overflow:auto; max-height:240px; border:1px solid var(--ide-border); border-radius:6px; margin-bottom:10px; }
+.dsh-ide-worktree-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 8px; border-top:1px solid var(--ide-border); }
+.dsh-ide-worktree-row:first-child { border-top:none; }
+.dsh-ide-worktree-main { min-width:0; }
+.dsh-ide-worktree-path { font:11px/1.4 var(--dsh-font-mono, ui-monospace, monospace); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-worktree-meta { color:var(--ide-muted); font-size:10.5px; margin-top:2px; }
+.dsh-ide-worktree-form { display:flex; flex-direction:column; gap:8px; }
+.dsh-ide-worktree-field { display:flex; flex-direction:column; gap:3px; font-size:11px; color:var(--ide-muted); }
+.dsh-ide-worktree-check { display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--ide-muted); }
+.dsh-ide-worktree-form .dsh-ide-button-primary { align-self:flex-start; }
+.dsh-ide-explore-card { max-height:82%; display:flex; flex-direction:column; }
+.dsh-ide-explore-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.dsh-ide-explore-title { font-weight:600; font-size:12px; }
+.dsh-ide-explore-close { background:transparent; border:0; color:var(--ide-muted); cursor:pointer; font-size:16px; line-height:1; }
+.dsh-ide-explore-input { width:100%; box-sizing:border-box; margin:8px 0; padding:6px 8px; border-radius:4px;
+  border:1px solid var(--ide-border); background:var(--ide-bg); color:inherit; font:400 12.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-explore-actions { display:flex; align-items:center; gap:10px; }
+.dsh-ide-explore-ask { padding:4px 10px; }
+.dsh-ide-explore-note { color:var(--ide-muted); font-size:10.5px; line-height:1.45; }
+.dsh-ide-explore-error { color:var(--ide-danger, #f14c4c); font-size:11.5px; margin-top:8px; }
+.dsh-ide-explore-result { overflow:auto; margin-top:10px; }
+.dsh-ide-explore-answer { margin:0 0 8px; white-space:pre-wrap; font:11.5px/1.5 var(--dsh-font-ui, system-ui, sans-serif); }
+.dsh-ide-explore-sources-head { color:var(--ide-muted); font-size:10.5px; margin-bottom:4px; }
+.dsh-ide-explore-sources { display:flex; flex-wrap:wrap; gap:6px; }
+.dsh-ide-explore-source { padding:2px 6px; border:1px solid var(--ide-border); border-radius:4px;
+  background:transparent; color:inherit; cursor:pointer; font:10.5px/1.4 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-explore-source:hover { border-color:var(--ide-accent); }
+.dsh-ide-explore-meta { color:var(--ide-muted); font-size:10.5px; margin-top:8px; }
+.dsh-ide-explore-foot { color:var(--ide-muted); font-size:10.5px; line-height:1.45;
+  border-top:1px solid var(--ide-border); padding-top:8px; margin-top:8px; }
+.dsh-ide-conv-card { width:min(640px, 94vw); max-height:82vh; display:flex; flex-direction:column; }
+.dsh-ide-conv-result { overflow:auto; margin-top:8px; }
+.dsh-ide-conv-list { display:flex; flex-direction:column; gap:6px; }
+.dsh-ide-conv-hit { display:flex; flex-direction:column; gap:3px; text-align:left; width:100%;
+  padding:8px 10px; border:1px solid var(--ide-border); border-radius:6px; background:transparent;
+  color:inherit; cursor:pointer; }
+.dsh-ide-conv-hit:hover { border-color:var(--ide-accent); }
+.dsh-ide-conv-snippet { font-size:12px; line-height:1.45; white-space:pre-wrap; }
+.dsh-ide-conv-meta { color:var(--ide-muted); font-size:10.5px; }
+.dsh-ide-conv-row { display:flex; gap:6px; align-items:stretch; }
+.dsh-ide-conv-row .dsh-ide-conv-hit { flex:1 1 auto; min-width:0; }
+.dsh-ide-conv-attach { flex:0 0 auto; align-self:stretch; padding:0 10px; border:1px solid var(--ide-border);
+  border-radius:6px; background:transparent; color:inherit; cursor:pointer; font-size:11px; }
+.dsh-ide-conv-attach:hover:not(:disabled) { border-color:var(--ide-accent); }
+.dsh-ide-conv-attach:disabled { opacity:.45; cursor:default; }
+.dsh-ide-conv-source-title { font-weight:600; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-ide-conv-source-text { margin:8px 0 0; padding:8px 10px; border:1px solid var(--ide-border); border-radius:6px;
+  background:var(--ide-bg); font:11px/1.5 var(--dsh-font-mono, ui-monospace, monospace);
+  white-space:pre-wrap; overflow:auto; max-height:280px; }
+.dsh-ide-side-card { width:min(520px, 92vw); max-height:82vh; display:flex; flex-direction:column; padding:12px; gap:8px; }
+.dsh-ide-side-head { display:flex; align-items:center; justify-content:space-between; }
+.dsh-ide-side-title { font-weight:600; }
+.dsh-ide-side-close { border:none; background:transparent; color:inherit; cursor:pointer; font-size:16px; line-height:1; padding:2px 6px; }
+.dsh-ide-side-context { border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; background:var(--ide-bg); }
+.dsh-ide-side-where { color:var(--ide-muted); font:10.5px/1.4 var(--dsh-font-mono, ui-monospace, monospace); margin-bottom:4px; }
+.dsh-ide-side-selection { margin:0; max-height:110px; overflow:auto; white-space:pre-wrap; font:11px/1.45 var(--dsh-font-mono, ui-monospace, monospace); }
+.dsh-ide-side-turns { overflow:auto; display:flex; flex-direction:column; gap:8px; max-height:36vh; }
+.dsh-ide-side-turn { border-left:2px solid var(--ide-accent); padding-left:8px; }
+.dsh-ide-side-question { font-weight:600; margin-bottom:2px; }
+.dsh-ide-side-answer { white-space:pre-wrap; }
+.dsh-ide-side-error { color:#e06c75; }
+.dsh-ide-side-input { width:100%; padding:6px 8px; border-radius:4px; color:inherit; background:var(--ide-bg);
+  border:1px solid var(--ide-border); font:400 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); outline:none; }
+.dsh-ide-side-input:focus { border-color:var(--ide-accent); }
+.dsh-ide-side-actions { display:flex; gap:6px; align-items:center; }
+.dsh-ide-side-ask, .dsh-ide-side-new { padding:4px 10px; border-radius:4px; border:1px solid var(--ide-border); background:transparent; color:inherit; cursor:pointer; }
+.dsh-ide-side-ask { border-color:var(--ide-accent); }
+.dsh-ide-side-ask:disabled, .dsh-ide-side-new:disabled { opacity:.5; cursor:default; }
+.dsh-ide-side-foot { color:var(--ide-muted); font-size:10.5px; line-height:1.45; border-top:1px solid var(--ide-border); padding-top:8px; }
 .dsh-ide-quick { padding:8px; max-height:70%; display:flex; flex-direction:column; }
 .dsh-ide-quick-input { width:100%; padding:6px 8px; border-radius:4px; color:inherit; background:var(--ide-bg);
   border:1px solid var(--ide-accent); font:400 13px/1.4 var(--dsh-font-ui, system-ui, sans-serif); outline:none; }
@@ -10041,6 +13233,7 @@ function IdeBody(props) {
   display:inline-flex; align-items:center; justify-content:center; }
 .dsh-ide-root[data-compact] .dsh-ide-explorer-search { padding:0 10px 8px; }
 .dsh-ide-root[data-compact] .dsh-ide-search-input { padding:8px 9px; font-size:16px; }
+.dsh-ide-root[data-compact] .dsh-ide-search-toggle { padding:6px 8px; font-size:12px; }
 .dsh-ide-root[data-compact] .dsh-ide-search-file-head { padding:8px 10px 4px; }
 .dsh-ide-root[data-compact] .dsh-ide-search-file-name { font-size:12.5px; }
 .dsh-ide-root[data-compact] .dsh-ide-search-row { min-height:38px; }
@@ -10049,6 +13242,7 @@ function IdeBody(props) {
 .dsh-ide-root[data-compact] .dsh-ide-tree { padding:2px 0 16px; }
 .dsh-ide-root[data-compact] .dsh-ide-row { min-height:38px; padding:7px 8px; gap:6px; font-size:13px; }
 .dsh-ide-root[data-touch] .dsh-ide-row { min-height:36px; padding-top:6px; padding-bottom:6px; }
+.dsh-ide-root[data-touch] .dsh-ide-search-toggle { min-height:32px; padding:2px 8px; }
 
 /* Tabs and bars sized for a thumb, not for a mouse pointer. */
 .dsh-ide-root[data-compact] .dsh-ide-tabs-empty { padding:10px 12px; font-size:12px; }
@@ -10078,7 +13272,7 @@ function IdeBody(props) {
 .dsh-ide-root[data-compact] .dsh-ide-consent-actions { flex:1 1 100%; justify-content:flex-end; }
 .dsh-ide-root[data-compact] .dsh-ide-consent .dsh-ide-button { min-height:36px; }
 
-.dsh-ide-root[data-compact] .dsh-ide-empty { inset:48px 0 20px; gap:10px; padding:20px; }
+.dsh-ide-root[data-compact] .dsh-ide-empty { gap:10px; padding:20px; }
 .dsh-ide-root[data-compact] .dsh-ide-watermark { font-size:48px; }
 .dsh-ide-root[data-compact] .dsh-ide-empty-title { font-size:15px; }
 .dsh-ide-root[data-compact] .dsh-ide-empty-text { max-width:300px; font-size:12.5px; line-height:1.5; }
@@ -10211,7 +13405,7 @@ function IdeBody(props) {
     const plugin = {
       // Small, pure pieces of the Git panel are testable without a browser;
       // the module loader gives the tests exactly this object.
-      __test: { layoutGraph, scmSections, scmGroupsOf, scmLetter, describeScmError },
+      __test: { layoutGraph, scmSections, scmGroupsOf, scmLetter, describeScmError, terminalBlock, debugBlock, notesBlock, tourStep, tourAdd, tourMove, tourRemove, tourProgress, snoozeLabel, fileExtension, tabExtensionDisabled, splitCandidate, crossFileCandidate, diagnosticContext, wordAt, symbolReferences, renamePlan, lineAttribution },
       inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'theme'],
       apply(ctx) {
         services = {

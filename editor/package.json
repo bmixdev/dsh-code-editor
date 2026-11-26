@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-code-editor",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Secondary, optional Monaco code editor tab for DeepSeek Harness: workspace file tree, AI inline completions with a provider/model chooser, in-app settings, guarded save and quote-to-chat. It opens from the Edit button in the document preview; the repository's main plugin is @local/dsh-ide.",

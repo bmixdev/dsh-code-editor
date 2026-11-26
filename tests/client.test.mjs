@@ -545,6 +545,43 @@ function renderPaneElements(plugin, host) {
   return collectElements(pane.component({ tab: { contentId: 'dsh-resource://ide/session/session-1', id: 'tab-1' } }))
 }
 
+test('menus share one language and open tools as output tabs, not stacked dialogs', async () => {
+  const renderer = createHookReact()
+  const { plugin, document } = await loadPlugin({ react: { ...renderer.React, useEffect: () => {} } })
+  const host = createHost()
+  plugin.apply(host.ctx)
+  const pane = host.registrations.find((entry) => entry.config.name === 'sidebar.right.pane.tab')
+  const view = renderer.mount(pane.component, { sessionId: 'session-1' })
+  function nodes(element) {
+    return element && typeof element === 'object'
+      ? [element, ...(Array.isArray(element) ? element : element.children ?? []).flatMap(nodes)] : []
+  }
+  const propsOf = (name) => nodes(view.getTree()).find((node) => node.type?.name === name)?.props
+  const menus = () => propsOf('MenuBar').menus
+  const action = (group, id) => menus().find((menu) => menu.id === group).items.find((item) => item.id === id)
+  assert.equal(action('chat', 'notes-pack').label, 'Пакет заметок…')
+  document.documentElement = { lang: 'en-US' }
+  action('chat', 'notes-pack').run()
+  await Promise.resolve()
+  assert.equal(propsOf('OutputPanel').panel.tab, 'notesPack')
+  for (const menu of menus()) {
+    assert.doesNotMatch(menu.label, /[а-яё]/i)
+    for (const item of menu.items.filter((item) => !item.separator)) {
+      assert.doesNotMatch(item.label, /[а-яё]/i)
+      assert.equal(typeof item.run, 'function', `${item.id} is not a placeholder`)
+    }
+  }
+  action('project', 'worktrees').run()
+  await Promise.resolve()
+  const panel = propsOf('OutputPanel')
+  assert.equal(panel.panel.tab, 'worktrees')
+  assert.deepEqual(panel.toolTabs.map((tab) => tab.body.type.name), ['NotesPackPanel', 'WorktreesPanel'])
+  assert.equal(propsOf('WorktreesPanel'), undefined, 'no copy rendered outside the dock')
+  panel.onTab('chat')
+  await Promise.resolve()
+  assert.equal(propsOf('OutputPanel').toolTabs.length, 2, 'switching to chat keeps drafts mounted')
+})
+
 test('a wide pane keeps the desktop layout', async () => {
   const { plugin } = await loadPlugin({ innerWidth: 1024 })
   const host = createHost()
@@ -874,4 +911,225 @@ test('Git errors are explained in the panel language', async () => {
   assert.match(describeScmError({ code: 'branch-current' }), /Текущую ветку/)
   assert.match(describeScmError({ code: 'branch-unmerged' }), /невлитые коммиты/)
   assert.match(describeScmError({ code: 'switch-conflict' }), /мешают переключению/)
+})
+
+test('a terminal capture becomes a bounded chat block', async () => {
+  const { plugin } = await loadPlugin()
+  const { terminalBlock } = plugin.__test
+  const plain = terminalBlock('npm test', '0', 'ok\n')
+  assert.match(plain.text, /^Запуск в терминале: npm test\n/)
+  assert.match(plain.text, /Код выхода: 0/)
+  assert.match(plain.text, /```\nok\n```/)
+  assert.equal(plain.truncated, false)
+
+  const big = terminalBlock('run', '1', 'a'.repeat(13000))
+  assert.equal(big.truncated, true)
+  assert.equal(big.outputChars, 12000)
+  assert.match(big.text, /вывод обрезан/)
+
+  assert.equal(terminalBlock('', '', '').text, 'Запуск в терминале\n')
+})
+
+test('a debug journal keeps hypothesis, two runs and cleanup state', async () => {
+  const { plugin } = await loadPlugin()
+  const { debugBlock } = plugin.__test
+  const plain = debugBlock({
+    hypothesis: 'кэш отдаёт старый ответ',
+    steps: '1. открыть\n2. повторить',
+    runA: 'старый ответ',
+    runB: 'новый ответ',
+    logs: 'C:/tmp/debug.log',
+    cleaned: false,
+  })
+  assert.match(plain.text, /^Debug: кэш отдаёт старый ответ\n/)
+  assert.match(plain.text, /Шаги:\n1\. открыть\n2\. повторить/)
+  assert.match(plain.text, /Прогон A:\nстарый ответ/)
+  assert.match(plain.text, /Прогон B:\nновый ответ/)
+  assert.match(plain.text, /Временные логи: C:\/tmp\/debug\.log/)
+  assert.match(plain.text, /НЕ подтверждена/)
+  assert.equal(plain.truncated, false)
+
+  const cleaned = debugBlock({ logs: 'x', cleaned: true })
+  assert.match(cleaned.text, /подтверждена\./)
+  assert.doesNotMatch(cleaned.text, /НЕ подтверждена/)
+
+  const empty = debugBlock({})
+  assert.equal(empty.text, 'Debug\n')
+})
+
+test('a notes pack numbers remarks and keeps file anchors', async () => {
+  const { plugin } = await loadPlugin()
+  const { notesBlock } = plugin.__test
+  const packed = notesBlock([
+    { text: '  поправить   отступ ', path: 'src\\a.js', line: 12 },
+    { text: 'добавить тест' },
+    { text: '   ' },
+  ])
+  assert.match(packed.text, /^Замечания:\n1\. src\/a\.js:12 — поправить отступ\n2\. добавить тест\n$/)
+  assert.equal(packed.count, 2)
+  assert.equal(packed.truncated, false)
+  assert.equal(notesBlock([]).text, '')
+  assert.equal(notesBlock([{ text: '' }]).count, 0)
+})
+
+test('a code tour keeps ordered file stops and moves them locally', async () => {
+  const { plugin } = await loadPlugin()
+  const { tourStep, tourAdd, tourMove, tourRemove, tourProgress } = plugin.__test
+  assert.deepEqual(tourStep({ path: 'src\\a.js', line: 12, note: '  сюда   смотреть ' }), {
+    path: 'src/a.js',
+    line: 12,
+    note: 'сюда смотреть',
+  })
+  assert.deepEqual(tourStep({ path: './b.ts' }), { path: 'b.ts', line: 1, note: '' })
+  assert.equal(tourStep({ path: '   ' }), undefined)
+  assert.equal(tourStep(null), undefined)
+  const once = tourAdd([], { path: 'a.js', line: 3 })
+  assert.equal(once.length, 1)
+  assert.equal(once[0].line, 3)
+  assert.equal(tourAdd(once, { path: '' }).length, 1)
+  const two = tourAdd(once, { path: 'b.js', line: 4 })
+  assert.deepEqual(tourMove(two, 0, 1).map((step) => step.path), ['b.js', 'a.js'])
+  assert.deepEqual(tourMove(two, 0, -1).map((step) => step.path), ['a.js', 'b.js'])
+  assert.deepEqual(tourMove(two, 5, 1).map((step) => step.path), ['a.js', 'b.js'])
+  assert.deepEqual(tourRemove(two, 0).map((step) => step.path), ['b.js'])
+  assert.equal(tourRemove(two, 9).length, 2)
+  assert.equal(tourProgress(0, 3), '1/3')
+  assert.equal(tourProgress(2, 3), '3/3')
+  assert.equal(tourProgress(5, 3), '3/3')
+  assert.equal(tourProgress(0, 0), '0/0')
+  const maxed = Array.from({ length: 40 }, (_, at) => ({ path: `f${at}.js`, line: 1 }))
+  assert.equal(tourAdd(maxed, { path: 'extra.js' }).length, 40)
+})
+
+test('a snooze has a visible local return time', async () => {
+  const { plugin } = await loadPlugin()
+  const { snoozeLabel } = plugin.__test
+  assert.equal(snoozeLabel(0), '')
+  assert.equal(snoozeLabel(Number.NaN), '')
+  const at = new Date(2026, 0, 2, 9, 5, 0, 0)
+  assert.equal(snoozeLabel(at.getTime()), '09:05')
+})
+
+test('Tab can be disabled for one extension without touching the workspace', async () => {
+  const { plugin } = await loadPlugin()
+  const { fileExtension, tabExtensionDisabled } = plugin.__test
+  assert.equal(fileExtension('src/App.MD'), 'md')
+  assert.equal(fileExtension('Makefile'), '')
+  assert.equal(fileExtension('.env'), '')
+  assert.equal(tabExtensionDisabled({ tabDisabledExtensions: ['md'] }, 'docs/readme.md'), true)
+  assert.equal(tabExtensionDisabled({ tabDisabledExtensions: ['md'] }, 'src/app.ts'), false)
+  assert.equal(tabExtensionDisabled({}, 'src/app.ts'), false)
+})
+
+test('the second editor pane picks the next open file, not the active one', async () => {
+  const { plugin } = await loadPlugin()
+  const { splitCandidate } = plugin.__test
+  const tabs = [{ key: 'a' }, { key: 'b' }, { key: 'c' }]
+  assert.deepEqual(splitCandidate(tabs, 'a'), { key: 'b' })
+  assert.deepEqual(splitCandidate(tabs, 'b'), { key: 'a' })
+  assert.equal(splitCandidate([{ key: 'a' }], 'a'), undefined)
+})
+
+test('only nearby linter messages become bounded diagnostic context', async () => {
+  const { plugin } = await loadPlugin()
+  const { diagnosticContext } = plugin.__test
+  const markers = [
+    { severity: 8, startLineNumber: 3, startColumn: 5, endLineNumber: 3, endColumn: 9, message: 'NameError:  x\n is not defined' },
+    { severity: 4, startLineNumber: 6, startColumn: 1, endLineNumber: 6, endColumn: 2, message: 'unused import' },
+    { severity: 8, startLineNumber: 30, startColumn: 1, endLineNumber: 30, endColumn: 2, message: 'far error' },
+    { severity: 1, startLineNumber: 3, startColumn: 1, endLineNumber: 3, endColumn: 2, message: 'hint' },
+    { severity: 8, startLineNumber: 3, startColumn: 1, endLineNumber: 3, endColumn: 2, message: '' },
+  ]
+  const picked = diagnosticContext(markers, { lineNumber: 4, column: 1 })
+  assert.deepEqual(picked, [
+    { line: 3, column: 5, endLine: 3, endColumn: 9, severity: 'error', message: 'NameError: x is not defined' },
+    { line: 6, column: 1, endLine: 6, endColumn: 2, severity: 'warning', message: 'unused import' },
+  ])
+  assert.deepEqual(diagnosticContext(undefined, { lineNumber: 1, column: 1 }), [])
+  const long = diagnosticContext(
+    [{ severity: 8, startLineNumber: 1, startColumn: 1, message: 'x'.repeat(500) }],
+    { lineNumber: 1, column: 1 },
+  )
+  assert.equal(long[0].message.length, 300)
+})
+
+test('a new name accepted by Tab points at the file that already uses it', async () => {
+  const { plugin } = await loadPlugin()
+  const { crossFileCandidate } = plugin.__test
+  const tabs = [
+    { key: 'a', path: 'src/a.js', text: 'const answer = 1\n' },
+    { key: 'b', path: 'src/b.js', text: 'import { answer } from "./a"' },
+    { key: 'c', path: 'src/c.js', text: 'export const other = 2' },
+  ]
+  assert.deepEqual(crossFileCandidate(tabs, 'a', 'answer += 1', 'const undefined = 1\n'), {
+    key: 'b',
+    path: 'src/b.js',
+    token: 'answer',
+  })
+  assert.equal(crossFileCandidate(tabs, 'a', 'answer += 1', 'const answer = 0\n'), undefined)
+  assert.equal(crossFileCandidate(tabs, 'a', 'unusedName += 1', 'const x = 0\n'), undefined)
+})
+
+test('the symbol list marks definitions apart from references in open tabs', async () => {
+  const { plugin } = await loadPlugin()
+  const { wordAt, symbolReferences } = plugin.__test
+  assert.equal(wordAt('const total = 1', 8), 'total')
+  assert.equal(wordAt('const total = 1', 12), '')
+  assert.equal(wordAt('', 0), '')
+  const tabs = [
+    { key: 'a', path: 'src/a.js', text: 'const total = 1\nexport function sum() {\n  return total\n}\n' },
+    { key: 'b', path: 'src/b.ts', text: 'import { total } from "./a"\nconsole.log(total)\n' },
+    { key: 'c', path: 'README.md', text: 'total' },
+  ]
+  const rows = symbolReferences(tabs, 'total')
+  assert.deepEqual(
+    rows.map((row) => [row.path, row.line, row.kind]),
+    [
+      ['src/a.js', 1, 'definition'],
+      ['src/a.js', 3, 'reference'],
+      ['src/b.ts', 1, 'reference'],
+      ['src/b.ts', 2, 'reference'],
+    ],
+  )
+  assert.deepEqual(symbolReferences(tabs, ''), [])
+})
+
+test('rename preview rewrites whole words in open JS files before applying', async () => {
+  const { plugin } = await loadPlugin()
+  const { renamePlan } = plugin.__test
+  const tabs = [
+    { key: 'a', path: 'src/a.js', text: 'const total = 1\ntotal += total\n' },
+    { key: 'b', path: 'src/b.ts', text: 'total()\n' },
+    { key: 'c', path: 'README.md', text: 'total' },
+  ]
+  const plan = renamePlan(tabs, 'total', 'sum')
+  assert.equal(plan.ok, true)
+  assert.equal(plan.total, 4)
+  assert.deepEqual(
+    plan.files.map((file) => [file.path, file.count, file.text]),
+    [
+      ['src/a.js', 3, 'const sum = 1\nsum += sum\n'],
+      ['src/b.ts', 1, 'sum()\n'],
+    ],
+  )
+  assert.equal(renamePlan(tabs, 'total', '9bad').ok, false)
+  assert.equal(renamePlan(tabs, 'total', 'total').ok, false)
+  assert.equal(renamePlan(tabs, '', 'sum').ok, false)
+})
+
+test('line attribution matches only a recorded AI edit that covers the line', async () => {
+  const { plugin } = await loadPlugin()
+  const { lineAttribution } = plugin.__test
+  const records = [
+    { path: 'src/a.js', startLine: 2, endLine: 3, model: 'm', instruction: 'one' },
+    { path: './src/b.js', startLine: 5, endLine: 5, model: 'm', instruction: 'two' },
+  ]
+  assert.deepEqual(lineAttribution(records, 'src/a.js', 2).map((record) => record.instruction), ['one'])
+  assert.deepEqual(lineAttribution(records, 'src\\a.js', 3).map((record) => record.instruction), ['one'])
+  assert.equal(lineAttribution(records, 'src/a.js', 1).length, 0)
+  assert.equal(lineAttribution(records, 'src/a.js', 4).length, 0)
+  assert.deepEqual(lineAttribution(records, 'src/b.js', 5).map((record) => record.instruction), ['two'])
+  assert.equal(lineAttribution(records, 'src/b.js', 6).length, 0)
+  assert.deepEqual(lineAttribution(undefined, 'src/a.js', 2), [])
+  assert.deepEqual(lineAttribution(records, 'src/a.js', 0), [])
 })

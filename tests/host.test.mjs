@@ -22,6 +22,11 @@ const ROUTES = [
   'complete',
   'inlineEdit',
   'searchText',
+  'explore',
+  'sessionSearch',
+  'sessionExcerpt',
+  'sideChat',
+  'rules',
   'agentChanges',
   'agentChangeDiff',
   'agentChangeRestore',
@@ -35,9 +40,23 @@ const ROUTES = [
   'scmCommitFiles',
   'scmCommitDiff',
   'scmBranches',
+  'scmCompare',
   'scmCreateBranch',
   'scmSwitchBranch',
   'scmDeleteBranch',
+  'scmWorktrees',
+  'scmCreateWorktree',
+  'scmRemoveWorktree',
+  'scmPatch',
+  'scmReview',
+  'scmDraftMessage',
+  'scmConflict',
+  'runTests',
+  'scmResolve',
+  'scmResolveApply',
+  'planSave',
+  'planList',
+  'planRead',
   'resolve',
   'tree',
   'files',
@@ -69,7 +88,7 @@ async function makeWorkspace() {
   return root
 }
 
-function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1', models = [{ id: 'fixture-model', name: 'Fixture model' }], workspaceChanges, policyMode = 'workspace-write' }) {
+function setup({ root, selection = { provider: 'fixture', model: 'fixture-model' }, rejectEffort = '', answer = 'return 1', models = [{ id: 'fixture-model', name: 'Fixture model' }], workspaceChanges, policyMode = 'workspace-write', sessionQuery }) {
   // The catalog is cached per provider for five minutes, so one test's catalog
   // would leak into the next one and hide a model it added.
   resetModelCatalog()
@@ -101,6 +120,7 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
       },
     },
     sessions: { get: (id) => (id === SESSION_ID ? session : undefined), list: () => [session] },
+    sessionQuery,
     workingDirectory: { get: () => root },
     sandboxPolicy: { resolve: () => ({ mode: policyMode, workspaceRoot: root }) },
     agentDefaultModel: { currentSelection: () => selection },
@@ -173,6 +193,20 @@ function setup({ root, selection = { provider: 'fixture', model: 'fixture-model'
   return { call, routes, streamCalls, llm: ctx.llm, emit }
 }
 
+async function removeDirectory(directory) {
+  // Windows can report ENOTEMPTY for a recursive delete while a handle is
+  // still closing. A short retry is enough; other errors stay visible.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(directory, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (error.code !== 'ENOTEMPTY' && error.code !== 'EPERM') throw error
+      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)))
+    }
+  }
+}
+
 async function withFile(variable, name, run) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'dsh-ide-env-'))
   const file = path.join(directory, name)
@@ -183,7 +217,7 @@ async function withFile(variable, name, run) {
   } finally {
     if (previous === undefined) delete process.env[variable]
     else process.env[variable] = previous
-    await rm(directory, { recursive: true, force: true })
+    await removeDirectory(directory)
   }
 }
 
@@ -456,6 +490,27 @@ test('a keybinding patch keeps only commands and chords the client can use', asy
   }
 })
 
+test('Tab can be disabled for chosen file extensions', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root })
+      const initial = await app.call('prefs', {})
+      assert.deepEqual(initial.body.preferences.tabDisabledExtensions, [])
+
+      const saved = await app.call('prefs', {
+        patch: { tabDisabledExtensions: ['.MD', 'md', 'bad ext', 'txt', 'ts', 'ts'] },
+      })
+      assert.deepEqual(saved.body.preferences.tabDisabledExtensions, ['md', 'txt', 'ts'])
+
+      const cleared = await app.call('prefs', { patch: { tabDisabledExtensions: [] } })
+      assert.deepEqual(cleared.body.preferences.tabDisabledExtensions, [])
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the credential route degrades when no credential store is available', async () => {
   const root = await makeWorkspace()
   try {
@@ -499,6 +554,39 @@ test('the completion permission survives an editor restart', async () => {
         offset: 22,
       })
       assert.equal(allowed.body.text, 'return 1')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('linter diagnostics reach the completion prompt bounded and sanitized', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('settings', { id: opened.body.id, sessionId: SESSION_ID, smartTab: true })
+      const diagnostics = Array.from({ length: 7 }, (_, index) => ({
+        line: index + 1,
+        column: 3,
+        message: index === 0 ? 'NameError: answer is not defined\n' : `warning ${index}`,
+      }))
+      diagnostics[0].message = `${diagnostics[0].message}${'x'.repeat(400)}`
+      const answered = await app.call('complete', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 42\n',
+        offset: 'export const answer = 42\n'.length,
+        diagnostics,
+      })
+      assert.equal(answered.status, 200)
+      const sent = app.streamCalls[0].messages[0].content[0].text
+      assert.ok(sent.includes('--- диагностика ---'))
+      assert.ok(sent.includes('Строка 1, столбец 3: NameError: answer is not defined'))
+      assert.equal(sent.includes('warning 5'), false)
+      assert.ok(sent.length < 3000)
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -853,6 +941,233 @@ test('an unconfigured hint prefers a fast model over the session one', () => {  
   assert.equal(rankModels(['fixture-model'], 'fixture')[0], 'fixture-model')
 })
 
+test('project rules are listed and the applied ones reach inline edit', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'AGENTS.md'), 'Пиши тесты.\n', 'utf8')
+    await mkdir(path.join(root, 'src', 'deep'), { recursive: true })
+    await writeFile(path.join(root, 'src', 'CLAUDE.md'), 'Не трогай API.\n', 'utf8')
+    await writeFile(path.join(root, 'src', 'deep', 'app.js'), 'let a = 1\n', 'utf8')
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root, answer: '{"replacement":"2"}' })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/deep/app.js' })
+      assert.equal(opened.status, 200)
+
+      const listed = await app.call('rules', { sessionId: SESSION_ID, id: opened.body.id })
+      assert.equal(listed.status, 200)
+      assert.equal(listed.body.file, 'src/deep/app.js')
+      assert.deepEqual(
+        listed.body.rules.map((rule) => rule.path),
+        ['AGENTS.md', 'src/CLAUDE.md'],
+      )
+      assert.ok(listed.body.rules.every((rule) => rule.applied === true))
+
+      // Reading the chain is not consent to send it: the separate Inline Edit
+      // gate still applies, and only after it does the system prompt carry rules.
+      const denied = await app.call('inlineEdit', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        modelVersion: 1,
+        start: 8,
+        end: 9,
+        text: 'let a = 1\n',
+        instruction: 'поставь 2',
+      })
+      assert.equal(errorCode(denied.body), 'not-opted-in')
+      assert.equal(app.streamCalls.length, 0)
+
+      await app.call('prefs', { patch: { inlineEditConsent: true } })
+      const edited = await app.call('inlineEdit', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        modelVersion: 1,
+        start: 8,
+        end: 9,
+        text: 'let a = 1\n',
+        instruction: 'поставь 2',
+      })
+      assert.equal(edited.status, 200)
+      assert.deepEqual(edited.body.rules.applied, ['AGENTS.md', 'src/CLAUDE.md'])
+      assert.deepEqual(edited.body.rules.skipped, [])
+      assert.match(app.streamCalls[0].system, /Пиши тесты\./)
+      assert.match(app.streamCalls[0].system, /Не трогай API\./)
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('explore answers from matching lines and cites only them', async () => {
+  const root = await makeWorkspace()
+  try {
+    const answer = 'Ответ в src/index.js:1 — там объявлена константа answer.'
+    const app = setup({ root, answer })
+    const found = await app.call('explore', { sessionId: SESSION_ID, question: 'где answer?' })
+    assert.equal(found.status, 200)
+    assert.match(found.body.answer, /src\/index\.js:1/)
+    assert.deepEqual(found.body.sources.map((source) => `${source.path}:${source.line}`), ['src/index.js:1'])
+    assert.deepEqual(found.body.files, ['src/index.js'])
+    assert.equal(app.streamCalls.length, 1)
+    assert.match(app.streamCalls[0].messages[0].content[0].text, /src\/index\.js:1:/)
+    assert.equal(app.streamCalls[0].purpose, 'code-editor-explore')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('explore filters ignored files before asking the model', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'secret.ts'), 'hidden word\n', 'utf8')
+    await writeFile(path.join(root, '.cursorignore'), 'secret.ts\n', 'utf8')
+    const app = setup({ root, answer: 'не должно вызываться' })
+    const found = await app.call('explore', { sessionId: SESSION_ID, question: 'где hidden?' })
+    assert.equal(found.status, 200)
+    assert.deepEqual(found.body.sources, [])
+    assert.match(found.body.answer, /не нашлось/)
+    assert.equal(app.streamCalls.length, 0)
+
+    const empty = await app.call('explore', { sessionId: SESSION_ID, question: '   ' })
+    assert.equal(errorCode(empty.body), 'bad-request')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('side chat answers from the selection without touching the file', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root, answer: 'Здесь возвращается 42.' })
+    const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+    const text = opened.body.text
+    const start = text.indexOf('42')
+    const request = {
+      id: opened.body.id,
+      sessionId: SESSION_ID,
+      start,
+      end: start + 2,
+      selection: '42',
+      question: 'что здесь происходит?',
+    }
+    const asked = await app.call('sideChat', request)
+    assert.equal(asked.status, 200)
+    assert.equal(asked.body.answer, 'Здесь возвращается 42.')
+    assert.equal(asked.body.path, 'src/index.js')
+    assert.equal(app.streamCalls.length, 1)
+    assert.equal(app.streamCalls[0].purpose, 'code-editor-side-chat')
+    const prompt = app.streamCalls[0].messages[0].content[0].text
+    assert.ok(prompt.includes('src/index.js'))
+    assert.ok(prompt.includes('42'))
+    assert.ok(prompt.includes('что здесь происходит?'))
+
+    const again = await app.call('sideChat', {
+      ...request,
+      question: 'а почему?',
+      history: [{ question: request.question, answer: asked.body.answer }],
+    })
+    assert.equal(again.status, 200)
+    const second = app.streamCalls[1].messages[0].content[0].text
+    assert.ok(second.includes('а почему?'))
+    assert.ok(second.includes('Здесь возвращается 42.'))
+
+    const empty = await app.call('sideChat', { ...request, start: 5, end: 5, selection: '' })
+    assert.equal(errorCode(empty.body), 'bad-request')
+    assert.equal(await readFile(path.join(root, 'src/index.js'), 'utf8'), text)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('side chat refuses a selection in an ignored file', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'secret.ts'), 'const token = 1\n', 'utf8')
+    await writeFile(path.join(root, '.cursorignore'), 'secret.ts\n', 'utf8')
+    const app = setup({ root })
+    const opened = await app.call('open', { sessionId: SESSION_ID, path: 'secret.ts' })
+    const asked = await app.call('sideChat', {
+      id: opened.body.id,
+      sessionId: SESSION_ID,
+      start: 0,
+      end: 5,
+      selection: 'const',
+      question: 'что это?',
+    })
+    assert.equal(errorCode(asked.body), 'ignored-file')
+    assert.equal(app.streamCalls.length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('content search honours both ignore scopes', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'visible.ts'), 'needle\n', 'utf8')
+    await writeFile(path.join(root, 'secret.txt'), 'needle\n', 'utf8')
+    await mkdir(path.join(root, 'generated'), { recursive: true })
+    await writeFile(path.join(root, 'generated', 'x.ts'), 'needle\n', 'utf8')
+    await writeFile(path.join(root, '.cursorignore'), 'secret.txt\n', 'utf8')
+    await writeFile(path.join(root, '.cursorindexingignore'), 'generated/\n', 'utf8')
+    const app = setup({ root })
+    const found = await app.call('searchText', { sessionId: SESSION_ID, query: 'needle' })
+    assert.equal(found.status, 200)
+    assert.deepEqual(found.body.matches.map((match) => match.path), ['visible.ts'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('cursorignore blocks inline edit and rules, indexing ignore does not', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'AGENTS.md'), 'Пиши тесты.\n', 'utf8')
+    await writeFile(path.join(root, '.cursorignore'), 'AGENTS.md\nsrc/index.js\n', 'utf8')
+    await writeFile(path.join(root, '.cursorindexingignore'), 'src/util.ts\n', 'utf8')
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root, answer: '{"replacement":"3"}' })
+      await app.call('prefs', { patch: { inlineEditConsent: true } })
+
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      const listed = await app.call('rules', { sessionId: SESSION_ID, id: opened.body.id })
+      assert.deepEqual(
+        listed.body.rules.map((rule) => ({ path: rule.path, reason: rule.reason, applied: rule.applied })),
+        [{ path: 'AGENTS.md', reason: 'ignored', applied: false }],
+      )
+      const blocked = await app.call('inlineEdit', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        modelVersion: 1,
+        start: 22,
+        end: 24,
+        text: 'export const answer = 42\n',
+        instruction: 'поставь 3',
+      })
+      assert.equal(errorCode(blocked.body), 'ignored-file')
+      assert.equal(app.streamCalls.length, 0)
+
+      const allowedTab = await app.call('open', { sessionId: SESSION_ID, path: 'src/util.ts' })
+      const allowed = await app.call('inlineEdit', {
+        id: allowedTab.body.id,
+        sessionId: SESSION_ID,
+        token: allowedTab.body.token,
+        modelVersion: 1,
+        start: 13,
+        end: 18,
+        text: 'export const twice = (value: number) => value * 2\n',
+        instruction: 'переименуй',
+      })
+      assert.equal(allowed.status, 200)
+      assert.equal(app.streamCalls.length, 1)
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('inline edit needs its own consent and sends only the selection', async () => {
   const root = await makeWorkspace()
   try {
@@ -901,6 +1216,98 @@ test('inline edit needs its own consent and sends only the selection', async () 
       const reopened = await prose.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
       const bad = await prose.call('inlineEdit', { ...request, id: reopened.body.id, token: reopened.body.token })
       assert.equal(errorCode(bad.body), 'bad-answer')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('ask mode refuses workspace writes at the Host boundary', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const app = setup({ root })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      const enabled = await app.call('prefs', { patch: { askMode: true } })
+      assert.equal(enabled.body.preferences.askMode, true)
+
+      const saved = await app.call('save', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 1\n',
+      })
+      assert.equal(errorCode(saved.body), 'ask-mode')
+      const made = await app.call('mkdir', { sessionId: SESSION_ID, path: 'new-folder' })
+      assert.equal(errorCode(made.body), 'ask-mode')
+      assert.equal(await readFile(path.join(root, 'src/index.js'), 'utf8'), 'export const answer = 42\n')
+      await assert.rejects(readFile(path.join(root, 'new-folder/x')), /ENOENT/)
+
+      await app.call('prefs', { patch: { askMode: false } })
+      const again = await app.call('save', {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        text: 'export const answer = 1\n',
+      })
+      assert.equal(again.status, 200)
+      assert.equal(await readFile(path.join(root, 'src/index.js'), 'utf8'), 'export const answer = 1\n')
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an inline edit refinement sends the previous exchange', async () => {
+  const root = await makeWorkspace()
+  try {
+    await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
+      const text = 'export const answer = 42\n'
+      const app = setup({ root, answer: '{"replacement":"43"}' })
+      const opened = await app.call('open', { sessionId: SESSION_ID, path: 'src/index.js' })
+      await app.call('prefs', { patch: { inlineEditConsent: true } })
+      const request = {
+        id: opened.body.id,
+        sessionId: SESSION_ID,
+        token: opened.body.token,
+        modelVersion: 1,
+        start: text.indexOf('42'),
+        end: text.indexOf('42') + 2,
+        text,
+        instruction: 'поставь 43',
+      }
+      const first = await app.call('inlineEdit', request)
+      assert.equal(first.status, 200)
+
+      const refined = await app.call('inlineEdit', {
+        ...request,
+        instruction: 'сделай строкой',
+        history: [{ instruction: 'поставь 43', answer: '{"replacement":"43"}' }],
+      })
+      assert.equal(refined.status, 200)
+      assert.equal(app.streamCalls.length, 2)
+      const messages = app.streamCalls[1].messages
+      assert.equal(messages.length, 3)
+      assert.equal(messages[0].role, 'user')
+      assert.ok(messages[0].content[0].text.includes('поставь 43'))
+      assert.equal(messages[1].role, 'assistant')
+      assert.equal(messages[1].content[0].text, '{"replacement":"43"}')
+      assert.equal(messages[2].role, 'user')
+      assert.ok(messages[2].content[0].text.includes('сделай строкой'))
+      assert.ok(messages[2].content[0].text.includes('--- фрагмент ---\n42\n--- после фрагмента ---'))
+
+      // A damaged or oversized turn list is refused before the model is asked.
+      const broken = await app.call('inlineEdit', {
+        ...request,
+        history: [{ instruction: '', answer: 'x' }],
+      })
+      assert.equal(errorCode(broken.body), 'bad-request')
+      const tooMany = await app.call('inlineEdit', {
+        ...request,
+        history: Array.from({ length: 5 }, () => ({ instruction: 'ещё', answer: 'x' })),
+      })
+      assert.equal(errorCode(tooMany.body), 'bad-request')
+      assert.equal(app.streamCalls.length, 2)
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -980,6 +1387,82 @@ test('an empty search query is answered without walking the workspace', async ()
 
     const unknown = await app.call('searchText', { sessionId: 'missing', query: 'answer' })
     assert.equal(errorCode(unknown.body), 'no-session')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('text search forwards regex and whole-word flags', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'src', 'words.txt'), 'answer answers (answer)\n', 'utf8')
+    const app = setup({ root })
+
+    const whole = await app.call('searchText', {
+      sessionId: SESSION_ID,
+      query: 'answer',
+      wholeWord: true,
+    })
+    assert.equal(errorCode(whole.body), undefined)
+    assert.deepEqual(
+      whole.body.matches.map((match) => ({ path: match.path, line: match.line, column: match.column })),
+      [
+        { path: 'src/index.js', line: 1, column: 14 },
+        { path: 'src/words.txt', line: 1, column: 1 },
+        { path: 'src/words.txt', line: 1, column: 17 },
+      ],
+    )
+    assert.ok(whole.body.matches.every((match) => match.match === 'answer'))
+
+    const pattern = await app.call('searchText', {
+      sessionId: SESSION_ID,
+      query: 'answer\\s*=\\s*42',
+      regex: true,
+    })
+    assert.deepEqual(
+      pattern.body.matches.map((match) => ({
+        path: match.path,
+        line: match.line,
+        column: match.column,
+        match: match.match,
+      })),
+      [{ path: 'src/index.js', line: 1, column: 14, match: 'answer = 42' }],
+    )
+    // Both requests stay local.
+    assert.equal(app.streamCalls.length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a malformed pattern is a panel error, not a Host failure', async () => {
+  const root = await makeWorkspace()
+  try {
+    const app = setup({ root })
+    const broken = await app.call('searchText', { sessionId: SESSION_ID, query: '(', regex: true })
+    assert.equal(broken.status, 200)
+    assert.equal(errorCode(broken.body), 'bad-request')
+    assert.match(String(broken.body.error.message), /Некорректное регулярное выражение/)
+    assert.equal(app.streamCalls.length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a regular expression keeps leading spaces in the query', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'src', 'spaced.txt'), '  answer\n', 'utf8')
+    const app = setup({ root })
+    const result = await app.call('searchText', {
+      sessionId: SESSION_ID,
+      query: '^  answer',
+      regex: true,
+    })
+    assert.deepEqual(
+      result.body.matches.map((match) => ({ path: match.path, line: match.line, column: match.column })),
+      [{ path: 'src/spaced.txt', line: 1, column: 1 }],
+    )
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -1175,6 +1658,33 @@ function initRepository(root) {
   return run
 }
 
+test('scmCompare uses the real merge base, not the branch tip', async () => {
+  const root = await makeWorkspace()
+  try {
+    await writeFile(path.join(root, 'a.txt'), 'one\n', 'utf8')
+    const run = initRepository(root)
+    run(['checkout', '-q', '-b', 'feature'])
+    await writeFile(path.join(root, 'feature.txt'), 'new\n', 'utf8')
+    run(['add', '-A'])
+    run(['commit', '-q', '-m', 'фича'])
+    const app = setup({ root })
+    const compared = await app.call('scmCompare', { sessionId: SESSION_ID, base: 'main' })
+    assert.equal(compared.status, 200)
+    assert.equal(compared.body.base, 'main')
+    assert.equal(compared.body.ahead, 1)
+    assert.equal(compared.body.behind, 0)
+    assert.equal(compared.body.mergeBase, run(['rev-parse', 'main']).trim())
+    assert.deepEqual(compared.body.files.map((file) => [file.status, file.path]), [['A', 'feature.txt']])
+
+    const missing = await app.call('scmCompare', { sessionId: SESSION_ID, base: 'nope' })
+    assert.equal(errorCode(missing.body), 'not-found')
+    const bad = await app.call('scmCompare', { sessionId: SESSION_ID, base: '--all' })
+    assert.equal(errorCode(bad.body), 'bad-request')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the Git panel lists, compares, stages, commits and reads history through routes', async () => {
   const root = await makeWorkspace()
   try {
@@ -1333,6 +1843,155 @@ test('the Git panel lists, compares, stages, commits and reads history through r
   }
 })
 
+test('a patch route sends only the requested side of one file', async () => {
+  const root = await makeWorkspace()
+  try {
+    const git = initRepository(root)
+    const readme = path.join(root, 'README.md')
+    await writeFile(readme, '# staged\n', 'utf8')
+    git(['add', '--', 'README.md'])
+    await writeFile(readme, '# working\n', 'utf8')
+
+    const app = setup({ root })
+    const status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const revision = status.body.revision
+
+    const staged = await app.call('scmPatch', { sessionId: SESSION_ID, group: 'staged', revision })
+    assert.equal(staged.status, 200)
+    assert.match(staged.body.patch, /\+# staged/)
+    assert.doesNotMatch(staged.body.patch, /# working/)
+    assert.deepEqual(staged.body.files.map((file) => file.path), ['README.md'])
+
+    const changes = await app.call('scmPatch', { sessionId: SESSION_ID, group: 'changes', revision })
+    assert.match(changes.body.patch, /\+# working/)
+    assert.doesNotMatch(changes.body.patch, /\+# staged/)
+
+    const stale = await app.call('scmPatch', {
+      sessionId: SESSION_ID,
+      group: 'staged',
+      revision: 'nope',
+    })
+    assert.equal(errorCode(stale.body), 'stale')
+    const badGroup = await app.call('scmPatch', { sessionId: SESSION_ID, group: 'conflicts' })
+    assert.equal(errorCode(badGroup.body), 'bad-request')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the conflict routes read both sides, propose text and write it only on apply', async () => {
+  const root = await makeWorkspace()
+  try {
+    const git = initRepository(root)
+    const readme = path.join(root, 'README.md')
+    git(['checkout', '-q', '-b', 'feature'])
+    await writeFile(readme, '# feature\n', 'utf8')
+    git(['add', '--', 'README.md'])
+    git(['commit', '-q', '-m', 'feature'])
+    git(['checkout', '-q', 'main'])
+    await writeFile(readme, '# main\n', 'utf8')
+    git(['add', '--', 'README.md'])
+    git(['commit', '-q', '-m', 'main'])
+    assert.throws(() => git(['merge', 'feature']))
+    const conflictedText = await readFile(readme, 'utf8')
+    assert.match(conflictedText, /^<<<<<<< HEAD/m)
+
+    const app = setup({ root, answer: '# итог\n' })
+    let status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const conflictRow = status.body.entries.find((entry) => entry.kind === 'conflict')
+    assert.ok(conflictRow)
+    assert.equal(conflictRow.path, 'README.md')
+
+    const view = await app.call('scmConflict', {
+      sessionId: SESSION_ID,
+      path: 'README.md',
+      revision: status.body.revision,
+    })
+    assert.equal(view.status, 200)
+    assert.equal(view.body.conflict.base, '# demo\n')
+    assert.equal(view.body.conflict.ours, '# main\n')
+    assert.equal(view.body.conflict.theirs, '# feature\n')
+
+    const proposal = await app.call('scmResolve', {
+      sessionId: SESSION_ID,
+      path: 'README.md',
+      revision: status.body.revision,
+    })
+    assert.equal(proposal.status, 200)
+    assert.equal(proposal.body.resolution, '# итог')
+    assert.equal(proposal.body.provider, 'fixture')
+    assert.equal(proposal.body.model, 'fixture-model')
+    assert.equal(await readFile(readme, 'utf8'), conflictedText)
+    const prompt = app.streamCalls.at(-1).messages[0].content[0].text
+    assert.match(prompt, /--- base ---/)
+    assert.match(prompt, /# feature/)
+    assert.match(prompt, /# main/)
+
+    const stale = await app.call('scmResolveApply', {
+      sessionId: SESSION_ID,
+      path: 'README.md',
+      text: proposal.body.resolution,
+      revision: 'nope',
+    })
+    assert.equal(errorCode(stale.body), 'stale')
+
+    const applied = await app.call('scmResolveApply', {
+      sessionId: SESSION_ID,
+      path: 'README.md',
+      text: proposal.body.resolution,
+      revision: proposal.body.revision,
+    })
+    assert.equal(applied.status, 200)
+    assert.match(applied.body.oid, /^[0-9a-f]{40,64}$/)
+    assert.equal(await readFile(readme, 'utf8'), '# итог')
+    assert.equal(applied.body.status.entries.some((entry) => entry.kind === 'conflict'), false)
+    status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    assert.equal(status.body.entries.some((entry) => entry.kind === 'conflict'), false)
+    assert.deepEqual(
+      status.body.entries.map((entry) => [entry.path, entry.indexStatus]),
+      [['README.md', 'M']],
+    )
+
+    const again = await app.call('scmResolveApply', {
+      sessionId: SESSION_ID,
+      path: 'README.md',
+      text: 'x\n',
+      revision: applied.body.status.revision,
+    })
+    assert.equal(errorCode(again.body), 'not-conflict')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('conflict resolution refuses a read-only workspace and a clean file', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const app = setup({ root, policyMode: 'read-only' })
+    const status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const refused = await app.call('scmResolve', {
+      sessionId: SESSION_ID,
+      path: 'README.md',
+      revision: status.body.revision,
+    })
+    assert.equal(errorCode(refused.body), 'read-only')
+    const apply = await app.call('scmResolveApply', {
+      sessionId: SESSION_ID,
+      path: 'README.md',
+      text: 'x\n',
+      revision: status.body.revision,
+    })
+    assert.equal(errorCode(apply.body), 'read-only')
+
+    const writable = setup({ root })
+    const clean = await writable.call('scmConflict', { sessionId: SESSION_ID, path: 'README.md' })
+    assert.equal(errorCode(clean.body), 'not-conflict')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the Git panel creates, switches and deletes branches through routes', async () => {
   const root = await makeWorkspace()
   try {
@@ -1376,6 +2035,62 @@ test('the Git panel creates, switches and deletes branches through routes', asyn
   }
 })
 
+test('worktrees are created, listed and removed inside the workspace', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const app = setup({ root })
+
+    const initial = await app.call('scmWorktrees', { sessionId: SESSION_ID })
+    assert.equal(initial.status, 200)
+    assert.equal(initial.body.worktrees.length, 1)
+    assert.equal(initial.body.worktrees[0].current, true)
+
+    const created = await app.call('scmCreateWorktree', {
+      sessionId: SESSION_ID,
+      path: 'task-copy',
+      branch: 'task',
+      create: true,
+    })
+    assert.equal(created.status, 200)
+    assert.equal(created.body.path, path.join(root, 'task-copy'))
+    assert.equal(created.body.worktrees.length, 2)
+    assert.equal(created.body.worktrees.filter((item) => !item.current)[0].branch, 'task')
+
+    const removed = await app.call('scmRemoveWorktree', {
+      sessionId: SESSION_ID,
+      path: path.join(root, 'task-copy'),
+    })
+    assert.equal(removed.status, 200)
+    assert.equal(removed.body.worktrees.length, 1)
+
+    const escape = await app.call('scmCreateWorktree', {
+      sessionId: SESSION_ID,
+      path: '../outside',
+      branch: 'outside',
+      create: true,
+    })
+    assert.equal(errorCode(escape.body), 'bad-request')
+
+    const outside = await app.call('scmRemoveWorktree', {
+      sessionId: SESSION_ID,
+      path: path.join(root, '..', 'outside'),
+    })
+    assert.equal(errorCode(outside.body), 'outside-workspace')
+
+    const readOnly = setup({ root, policyMode: 'read-only' })
+    const refused = await readOnly.call('scmCreateWorktree', {
+      sessionId: SESSION_ID,
+      path: 'blocked',
+      branch: 'blocked',
+      create: true,
+    })
+    assert.equal(errorCode(refused.body), 'read-only')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the Git panel refuses a nested folder, a non-repository and read-only writes', async () => {
   const root = await makeWorkspace()
   try {
@@ -1406,6 +2121,384 @@ test('the Git panel refuses a nested folder, a non-repository and read-only writ
 
     const noSession = await app.call('scmStatus', { sessionId: 'missing' })
     assert.equal(errorCode(noSession.body), 'no-session')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the chat patch carries the index alone when a file has staged and unstaged edits', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const app = setup({ root })
+    const readme = path.join(root, 'README.md')
+    await writeFile(readme, '# staged\n', 'utf8')
+    execFileSync('git', ['add', '--', 'README.md'], { cwd: root })
+    await writeFile(readme, '# unstaged\n', 'utf8')
+
+    const status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const revision = status.body.revision
+    const staged = await app.call('scmPatch', { sessionId: SESSION_ID, group: 'staged', revision })
+    assert.equal(staged.status, 200)
+    assert.match(staged.body.patch, /\+# staged/)
+    assert.doesNotMatch(staged.body.patch, /unstaged/)
+    assert.deepEqual(staged.body.files.map((file) => file.path), ['README.md'])
+    assert.equal(staged.body.revision, revision)
+    assert.ok(staged.body.bytes > 0)
+
+    const changes = await app.call('scmPatch', { sessionId: SESSION_ID, group: 'changes', revision })
+    assert.match(changes.body.patch, /\+# unstaged/)
+    assert.match(changes.body.patch, /-# staged/)
+
+    const stale = await app.call('scmPatch', {
+      sessionId: SESSION_ID,
+      group: 'staged',
+      revision: '0'.repeat(64),
+    })
+    assert.equal(errorCode(stale.body), 'stale')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a review sends only the index and keeps findings that point into it', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const answer = JSON.stringify({
+      findings: [
+        { path: 'README.md', line: 1, severity: 'high', message: 'Заголовок потерял точку' },
+        { path: 'nope.txt', line: 1, severity: 'low', message: 'Файла нет в патче' },
+        { path: 'README.md', line: 99, severity: 'low', message: 'Строки нет в патче' },
+      ],
+    })
+    const app = setup({ root, answer })
+    const readme = path.join(root, 'README.md')
+    await writeFile(readme, '# staged\n', 'utf8')
+    execFileSync('git', ['add', '--', 'README.md'], { cwd: root })
+    await writeFile(readme, '# unstaged\n', 'utf8')
+
+    let status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const review = await app.call('scmReview', { sessionId: SESSION_ID, revision: status.body.revision })
+    assert.equal(review.status, 200)
+    assert.equal(review.body.findings.length, 1)
+    assert.equal(review.body.findings[0].path, 'README.md')
+    assert.equal(review.body.findings[0].line, 1)
+    assert.equal(review.body.findings[0].severity, 'high')
+    assert.equal(review.body.provider, 'fixture')
+    assert.equal(app.streamCalls.length, 1)
+    const sent = app.streamCalls[0]
+    assert.equal(sent.purpose, 'code-editor-scm-review')
+    const text = sent.messages[0].content[0].text
+    assert.match(text, /\+# staged/)
+    assert.doesNotMatch(text, /unstaged/)
+
+    const stale = await app.call('scmReview', {
+      sessionId: SESSION_ID,
+      revision: '0'.repeat(64),
+    })
+    assert.equal(errorCode(stale.body), 'stale')
+    assert.equal(app.streamCalls.length, 1)
+
+    const broken = setup({ root, answer: 'это не JSON' })
+    status = await broken.call('scmStatus', { sessionId: SESSION_ID })
+    const badAnswer = await broken.call('scmReview', {
+      sessionId: SESSION_ID,
+      revision: status.body.revision,
+    })
+    assert.equal(errorCode(badAnswer.body), 'bad-answer')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('deep review splits a large index into bounded calls', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const answer = JSON.stringify({
+      findings: [{ path: 'big.txt', line: 1, severity: 'medium', message: 'Проверить первую строку' }],
+    })
+    const app = setup({ root, answer })
+    const lines = Array.from({ length: 1200 }, (_, index) => `line ${index + 1} ${'x'.repeat(20)}`)
+    await writeFile(path.join(root, 'big.txt'), `${lines.join('\n')}\n`, 'utf8')
+    await writeFile(path.join(root, 'small.txt'), 'small\n', 'utf8')
+    execFileSync('git', ['add', '--', 'big.txt', 'small.txt'], { cwd: root })
+
+    const status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const review = await app.call('scmReview', {
+      sessionId: SESSION_ID,
+      revision: status.body.revision,
+      depth: 'deep',
+    })
+    assert.equal(review.status, 200, JSON.stringify(review.body))
+    assert.equal(review.body.depth, 'deep')
+    assert.ok(review.body.calls >= 2)
+    assert.equal(app.streamCalls.length, review.body.calls)
+    assert.ok(review.body.findings.some((finding) => finding.path === 'big.txt'))
+
+    const quick = setup({ root, answer })
+    const single = await quick.call('scmReview', {
+      sessionId: SESSION_ID,
+      revision: status.body.revision,
+    })
+    assert.equal(single.body.depth, 'quick')
+    assert.equal(single.body.calls, 1)
+    assert.equal(quick.streamCalls.length, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a review refuses read-only and a clean index without calling the model', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const app = setup({ root })
+    const status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const clean = await app.call('scmReview', {
+      sessionId: SESSION_ID,
+      revision: status.body.revision,
+    })
+    assert.equal(errorCode(clean.body), 'nothing-staged')
+    assert.equal(app.streamCalls.length, 0)
+
+    const readOnly = setup({ root, policyMode: 'read-only' })
+    const refused = await readOnly.call('scmReview', {
+      sessionId: SESSION_ID,
+      revision: status.body.revision,
+    })
+    assert.equal(errorCode(refused.body), 'read-only')
+    assert.equal(readOnly.streamCalls.length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a commit message is drafted from the index and nothing is committed', async () => {
+  const root = await makeWorkspace()
+  try {
+    initRepository(root)
+    const app = setup({ root, answer: 'Обновить README\n\nОписание изменения.' })
+    const readme = path.join(root, 'README.md')
+    await writeFile(readme, '# staged\n', 'utf8')
+    execFileSync('git', ['add', '--', 'README.md'], { cwd: root })
+    const status = await app.call('scmStatus', { sessionId: SESSION_ID })
+    const before = execFileSync('git', ['rev-list', '--count', 'HEAD'], { cwd: root, encoding: 'utf8' })
+
+    const draft = await app.call('scmDraftMessage', {
+      sessionId: SESSION_ID,
+      revision: status.body.revision,
+    })
+    assert.equal(draft.status, 200)
+    assert.equal(draft.body.message, 'Обновить README\n\nОписание изменения.')
+    assert.deepEqual(draft.body.files.map((file) => file.path), ['README.md'])
+    assert.equal(app.streamCalls[0].purpose, 'code-editor-scm-message')
+    const after = execFileSync('git', ['rev-list', '--count', 'HEAD'], { cwd: root, encoding: 'utf8' })
+    assert.equal(after, before)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('saved plans round-trip through the routes', async () => {
+  const root = await makeWorkspace()
+  const file = path.join(root, 'plans.json')
+  const previous = process.env.DSH_CODE_EDITOR_PLANS
+  process.env.DSH_CODE_EDITOR_PLANS = file
+  try {
+    const app = setup({ root })
+    const empty = await app.call('planList', { sessionId: SESSION_ID })
+    assert.equal(empty.status, 200)
+    assert.deepEqual(empty.body.plans, [])
+
+    const text = 'Подготовить план изменения: заменить 42 на 43.'
+    const title = 'src/index.js:1-2'
+    const saved = await app.call('planSave', {
+      sessionId: SESSION_ID,
+      title,
+      text,
+      path: 'src/index.js',
+      from: 1,
+      to: 2,
+    })
+    assert.equal(saved.status, 200)
+    assert.equal(saved.body.title, title)
+    assert.equal(saved.body.path, 'src/index.js')
+    assert.equal(saved.body.from, 1)
+    assert.equal(saved.body.to, 2)
+    assert.equal(saved.body.chars, text.length)
+
+    const listed = await app.call('planList', { sessionId: SESSION_ID })
+    assert.equal(listed.status, 200)
+    assert.deepEqual(listed.body.plans, [saved.body])
+
+    const read = await app.call('planRead', { sessionId: SESSION_ID, id: saved.body.id })
+    assert.equal(read.status, 200)
+    assert.equal(read.body.text, text)
+    assert.equal(read.body.title, title)
+
+    const missing = await app.call('planRead', { sessionId: SESSION_ID, id: 'nope' })
+    assert.equal(errorCode(missing.body), 'not-found')
+    const blank = await app.call('planSave', { sessionId: SESSION_ID, text: '   ' })
+    assert.equal(errorCode(blank.body), 'bad-request')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_CODE_EDITOR_PLANS
+    else process.env.DSH_CODE_EDITOR_PLANS = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('project tests run through package.json and report the failing location', async () => {
+  const root = await makeWorkspace()
+  const script = [
+    'TAP version 13',
+    'not ok 1 - broken arithmetic',
+    '  ---',
+    '  location: ' + JSON.stringify(path.join(root, 'spec.js') + ':3:5'),
+    '  ...',
+    '1..1',
+    '',
+  ].join('\n')
+  await writeFile(
+    path.join(root, 'package.json'),
+    JSON.stringify({ name: 'fixture', private: true, scripts: { test: 'node run-test.js' } }),
+  )
+  await writeFile(path.join(root, 'run-test.js'), `process.exitCode = 1\nprocess.stdout.write(${JSON.stringify(script)})`)
+  await writeFile(path.join(root, 'spec.js'), 'const a = 1\nconst b = 2\nboom(a, b)\n')
+  const app = setup({ root })
+  try {
+    const response = await app.call('runTests', { sessionId: SESSION_ID })
+    assert.equal(response.status, 200)
+    assert.equal(response.body.code, 1)
+    assert.equal(response.body.failures.length, 1)
+    assert.equal(response.body.failures[0].file, 'spec.js')
+    assert.equal(response.body.failures[0].line, 3)
+    assert.equal(response.body.failures[0].column, 5)
+    assert.equal(response.body.failures[0].name, 'broken arithmetic')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('running project tests is refused in a read-only session', async () => {
+  const root = await makeWorkspace()
+  const app = setup({ root, policyMode: 'read-only' })
+  try {
+    const response = await app.call('runTests', { sessionId: SESSION_ID })
+    assert.equal(errorCode(response.body), 'read-only')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('conversation search reads sessionQuery inside the open workspace only', async () => {
+  const root = await makeWorkspace()
+  const calls = []
+  const sessionQuery = {
+    async searchSessions(request) {
+      calls.push(request)
+      return {
+        items: [
+          {
+            header: { id: 'older-1', title: 'Разбор индекса', cwd: root },
+            bestMatch: {
+              sessionId: 'older-1',
+              surface: 'current',
+              type: 'assistant/message',
+              seq: 7,
+              time: 1_700_000_000_000,
+              snippet: 'нашли <mark>ответ</mark> в индексе',
+            },
+          },
+        ],
+        hasMore: false,
+      }
+    },
+  }
+  const app = setup({ root, sessionQuery })
+  try {
+    const response = await app.call('sessionSearch', { sessionId: SESSION_ID, query: ' ответ ' })
+    assert.equal(response.status, 200)
+    assert.equal(response.body.query, 'ответ')
+    assert.deepEqual(response.body.items, [
+      {
+        sessionId: 'older-1',
+        title: 'Разбор индекса',
+        snippet: 'нашли ответ в индексе',
+        seq: 7,
+        time: 1_700_000_000_000,
+        type: 'assistant/message',
+      },
+    ])
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0].sessionFilters, [{ kind: 'cwd', values: [root] }])
+    assert.deepEqual(calls[0].eventFilters, [
+      { kind: 'type', values: ['user/message', 'assistant/message'] },
+      { kind: 'surface', values: ['current'] },
+    ])
+    assert.equal(calls[0].limit, 20)
+
+    const empty = await app.call('sessionSearch', { sessionId: SESSION_ID, query: '   ' })
+    assert.equal(errorCode(empty.body), 'bad-request')
+    const long = await app.call('sessionSearch', { sessionId: SESSION_ID, query: 'x'.repeat(201) })
+    assert.equal(errorCode(long.body), 'bad-request')
+    assert.equal(calls.length, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('conversation search reports a missing sessionQuery service', async () => {
+  const root = await makeWorkspace()
+  const app = setup({ root })
+  try {
+    const response = await app.call('sessionSearch', { sessionId: SESSION_ID, query: 'anything' })
+    assert.equal(errorCode(response.body), 'unavailable')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('one conversation turn becomes a bounded excerpt before the chat', async () => {
+  const root = await makeWorkspace()
+  const calls = []
+  const long = 'я'.repeat(9000)
+  const sessionQuery = {
+    async readEvent(request) {
+      calls.push(request)
+      if (request.seq === 99) {
+        throw Object.assign(new Error('gone'), { code: 'SESSION_QUERY_EVENT_NOT_FOUND' })
+      }
+      return {
+        session: { id: 'older-1', title: 'Разбор индекса' },
+        target: {
+          seq: request.seq,
+          type: 'assistant/message',
+          time: 1_700_000_000_000,
+          data: { content: [{ type: 'text', text: long }, { type: 'text', text: 'хвост' }] },
+        },
+      }
+    },
+  }
+  const app = setup({ root, sessionQuery })
+  try {
+    const response = await app.call('sessionExcerpt', { sessionId: SESSION_ID, target: 'older-1', seq: 7 })
+    assert.equal(response.status, 200)
+    assert.equal(response.body.sessionId, 'older-1')
+    assert.equal(response.body.title, 'Разбор индекса')
+    assert.equal(response.body.seq, 7)
+    assert.equal(response.body.type, 'assistant/message')
+    assert.equal(response.body.chars, 9007)
+    assert.equal(response.body.text.length, 8000)
+    assert.equal(response.body.truncated, true)
+    assert.deepEqual(calls[0], { sessionId: 'older-1', seq: 7, before: 0, after: 0 })
+
+    const missing = await app.call('sessionExcerpt', { sessionId: SESSION_ID, target: 'older-1', seq: 99 })
+    assert.equal(errorCode(missing.body), 'not-found')
+    const bad = await app.call('sessionExcerpt', { sessionId: SESSION_ID, target: 'older-1' })
+    assert.equal(errorCode(bad.body), 'bad-request')
+    assert.equal(calls.length, 2)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

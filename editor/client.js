@@ -110,8 +110,16 @@ window.__ModuleLoader__.load({
             reject(new Error('Загрузчик Monaco не инициализировался'))
             return
           }
+          const language = /^en(?:-|$)/i.test(document.documentElement?.lang || '') ? 'en' : 'ru'
           amd.config({ paths: { vs: ASSET_BASE } })
-          amd(['vs/editor/editor.main'], () => resolve(window.monaco), (error) => reject(error))
+          const start = () => amd(['vs/editor/editor.main'], () => resolve(window.monaco), reject)
+          if (language === 'en') return start()
+          // The vendored language pack sets globals; it is not an AMD module.
+          const locale = document.createElement('script')
+          locale.src = `${ASSET_BASE}/nls/lang/ru.js`
+          locale.onload = start
+          locale.onerror = () => reject(new Error('Не удалось загрузить русский перевод Monaco'))
+          document.head.appendChild(locale)
         })
         script.addEventListener('error', () => reject(new Error('Не удалось загрузить Monaco из /code-editor/vs')))
         document.head.appendChild(script)

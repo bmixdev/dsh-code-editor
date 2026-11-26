@@ -34,6 +34,16 @@ export const MAX_STATUS_BYTES = 16 * 1024 * 1024
 export const MAX_INDEX_BYTES = 32 * 1024 * 1024
 /** The largest blob the comparison will send to the browser, per side. */
 export const MAX_DIFF_BYTES = 2 * 1024 * 1024
+/**
+ * The exact patch text that may leave the Host for a chat message or a model
+ * call. It is deliberately smaller than a comparison: the whole point of the
+ * limit is that the user sees the payload size before it is sent.
+ */
+export const MAX_PATCH_BYTES = 256 * 1024
+/** How many files one patch request may include. */
+export const MAX_PATCH_FILES = 40
+/** Each side of a conflicted file that may be sent to the model. */
+export const MAX_CONFLICT_BYTES = 512 * 1024
 /** First bytes of a large worktree file used for its content marker. */
 const TOKEN_PREFIX_BYTES = 4 * 1024 * 1024
 /** Total worktree bytes hashed for one snapshot. */
@@ -597,6 +607,225 @@ export async function loadDiff(git, snapshot, { group, path: target, maxBytes = 
   return { ...base, kind: 'text', before: left.text, after: right.text }
 }
 
+const PATCH_FLAGS = ['--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-M', '--']
+
+/** The argv of one patch read. Paths after `--` are data, never options. */
+function patchArgs(group, paths) {
+  return readArgs('diff', ...(group === 'staged' ? ['--cached'] : []), ...PATCH_FLAGS, ...paths)
+}
+
+/** Everything a patch may cover for one group; ignored rows never reach it. */
+function patchEntries(snapshot, group) {
+  return snapshot.entries.filter((entry) => groupsOf(entry).includes(group))
+}
+
+/** Both names of a rename, so Git emits the rename and not a delete plus add. */
+function diffPaths(entry) {
+  return entry.oldPath === undefined ? [entry.path] : [entry.oldPath, entry.path]
+}
+
+/** Git prints this instead of hunks when it refuses to diff a binary blob. */
+function binaryPatch(patch) {
+  return /^Binary files .* differ$/m.test(patch) || /^GIT binary patch$/m.test(patch)
+}
+
+/**
+ * The exact `git diff` text for one panel group.
+ *
+ * The result is the payload a user chooses to insert into chat or to send for
+ * review, so every refusal is explicit: a file that is untracked, binary,
+ * looks like a secret, is empty for this comparison, or does not fit the byte
+ * budget is listed in `skipped` with a reason instead of silently vanishing.
+ * `staged` is HEAD → index; `changes` is index → worktree.
+ */
+export async function loadPatch(
+  git,
+  snapshot,
+  { group = 'staged', maxBytes = MAX_PATCH_BYTES, maxFiles = MAX_PATCH_FILES, skip, signal } = {},
+) {
+  if (group !== 'staged' && group !== 'changes') {
+    throw new ScmError('bad-request', 'Патч доступен только для индекса и рабочей копии.')
+  }
+  const files = []
+  const parts = []
+  const skipped = []
+  let bytes = 0
+  let truncated = false
+  for (const entry of patchEntries(snapshot, group)) {
+    if (files.length + skipped.length >= maxFiles) {
+      truncated = true
+      break
+    }
+    if (entry.kind === 'conflict' || entry.kind === 'ignored') continue
+    if (group === 'changes' && entry.kind === 'untracked') {
+      skipped.push({ path: entry.path, reason: 'untracked' })
+      continue
+    }
+    if (typeof skip === 'function') {
+      const verdict = skip(entry.path)
+      if (verdict !== false && verdict !== undefined && verdict !== null && verdict !== '') {
+        skipped.push({ path: entry.path, reason: typeof verdict === 'string' ? verdict : 'secret' })
+        continue
+      }
+    }
+    let result
+    try {
+      result = await git.run(patchArgs(group, diffPaths(entry)), {
+        signal,
+        maxBytes: Math.max(1, maxBytes - bytes) + 1,
+      })
+    } catch (error) {
+      if (error?.code === 'output-limit') {
+        skipped.push({ path: entry.path, reason: 'too-large' })
+        truncated = true
+        continue
+      }
+      throw error
+    }
+    if (result.code !== 0) throw classifyFailure(result)
+    const patch = result.stdout.toString('utf8')
+    if (patch.trim() === '') {
+      skipped.push({ path: entry.path, reason: 'empty' })
+      continue
+    }
+    if (binaryPatch(patch)) {
+      skipped.push({ path: entry.path, reason: 'binary' })
+      continue
+    }
+    const size = Buffer.byteLength(patch, 'utf8')
+    if (bytes + size > maxBytes) {
+      skipped.push({ path: entry.path, reason: 'too-large' })
+      truncated = true
+      continue
+    }
+    bytes += size
+    parts.push({ path: entry.path, patch })
+    files.push({
+      path: entry.path,
+      ...(entry.oldPath === undefined ? {} : { oldPath: entry.oldPath }),
+      status: group === 'staged' ? entry.indexStatus : entry.worktreeStatus,
+      bytes: size,
+    })
+  }
+  return {
+    group,
+    patch: parts.map((part) => part.patch).join(''),
+    parts,
+    files,
+    skipped,
+    bytes,
+    truncated,
+  }
+}
+
+/**
+ * Line numbers of the new side of one patch.
+ *
+ * A review answer may only name a line that the reviewer actually saw: `+`
+ * and context lines exist on the new side, a removed line does not, and a new
+ * `diff --git` resets the count until the next hunk header.
+ */
+export function patchLineNumbers(patch) {
+  const lines = new Set()
+  let line = 0
+  for (const text of String(patch).split('\n')) {
+    if (text.startsWith('diff --git ')) {
+      line = 0
+      continue
+    }
+    if (text.startsWith('@@ ')) {
+      const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text)
+      line = header === null ? 0 : Number(header[1])
+      continue
+    }
+    if (line === 0) continue
+    if (text.startsWith('+')) {
+      lines.add(line)
+      line += 1
+    } else if (text.startsWith(' ')) {
+      lines.add(line)
+      line += 1
+    }
+  }
+  return lines
+}
+
+/**
+ * Read the three stages of one conflicted file. A missing stage is not an
+ * error: an add/delete conflict legitimately has no base or no one side.
+ */
+export async function loadConflict(git, snapshot, target, { maxBytes = MAX_CONFLICT_BYTES, signal } = {}) {
+  if (findRow(snapshot, 'conflicts', target) === undefined) {
+    throw new ScmError('not-conflict', 'Файл не находится в состоянии конфликта.')
+  }
+  const read = async (stage) => {
+    let result
+    try {
+      result = await git.run(readArgs('show', `:${stage}:${target}`), { maxBytes, signal })
+    } catch (error) {
+      if (error instanceof ScmError && error.code === 'output-limit') {
+        throw new ScmError('too-large', 'Сторона конфликта больше допустимого размера.')
+      }
+      throw error
+    }
+    if (result.code !== 0) return undefined
+    const text = decodeText(result.stdout)
+    if (text === undefined) throw new ScmError('binary', 'Сторона конфликта — двоичный файл.')
+    return text
+  }
+  const base = await read(1)
+  const ours = await read(2)
+  const theirs = await read(3)
+  if (ours === undefined && theirs === undefined) {
+    throw new ScmError('not-conflict', 'У файла нет сторон для разрешения.')
+  }
+  const bytes = (base?.length ?? 0) + (ours?.length ?? 0) + (theirs?.length ?? 0)
+  if (bytes > maxBytes) throw new ScmError('too-large', 'Конфликт целиком больше допустимого размера.')
+  return {
+    path: target,
+    base: base ?? '',
+    ours: ours ?? '',
+    theirs: theirs ?? '',
+    hasBase: base !== undefined,
+    hasOurs: ours !== undefined,
+    hasTheirs: theirs !== undefined,
+    bytes,
+  }
+}
+
+/**
+ * Resolve one conflict by writing the chosen text as the stage-0 blob and
+ * checking it out. The index and the worktree change together, and no local
+ * helper file is written first.
+ */
+export async function resolveConflict(git, target, text, { signal } = {}) {
+  const listing = await git.run(readArgs('--literal-pathspecs', 'ls-files', '-u', '-z', '--', target), { signal })
+  if (listing.code !== 0) throw classifyFailure(listing)
+  const stages = new Map()
+  // `ls-files -u -z` is NUL separated, so its bytes are not a UTF-8 document:
+  // only the leading mode/oid/stage fields are read and the path stays unused.
+  for (const record of listing.stdout.toString('utf8').split('\0')) {
+    const match = /^([0-7]{6}) ([0-9a-f]{40,64}) ([123])\t/.exec(record)
+    if (match !== null) stages.set(Number(match[3]), { mode: match[1], oid: match[2] })
+  }
+  const chosen = stages.get(2) ?? stages.get(3) ?? stages.get(1)
+  if (chosen === undefined) throw new ScmError('not-conflict', 'У файла нет стадий конфликта.')
+
+  const hash = await git.run(readArgs('hash-object', '-w', '--stdin'), { input: text, signal })
+  const oid = hash.stdout.toString('utf8').trim()
+  if (hash.code !== 0 || !/^[0-9a-f]{40,64}$/.test(oid)) {
+    throw new ScmError('git-failed', 'Не удалось записать разрешённый текст в объект Git.')
+  }
+  const update = await git.run(
+    writeArgs('--literal-pathspecs', 'update-index', '--add', '--cacheinfo', `${chosen.mode},${oid},${target}`),
+    { signal },
+  )
+  if (update.code !== 0) throw classifyFailure(update)
+  const checkout = await git.run(writeArgs('--literal-pathspecs', 'checkout-index', '-f', '--', target), { signal })
+  if (checkout.code !== 0) throw classifyFailure(checkout)
+  return { mode: chosen.mode, oid }
+}
+
 /** Stage one row (both paths of a rename) with literal pathspecs. */
 export async function addRow(git, entry, { signal } = {}) {
   const paths = entry.oldPath === undefined ? [entry.path] : [entry.oldPath, entry.path]
@@ -772,7 +1001,133 @@ export async function deleteBranch(git, value, { signal } = {}) {
   return { name }
 }
 
+function checkedWorktreePath(value) {
+  const raw = typeof value === 'string' ? value.trim() : ''
+  if (raw === '' || raw.length > 4096 || raw.includes('\0') || !path.isAbsolute(raw)) {
+    throw new ScmError('bad-request', 'Укажите абсолютный путь рабочей копии.')
+  }
+  const resolved = path.resolve(raw)
+  if (resolved === path.parse(resolved).root) throw new ScmError('bad-request', 'Корень диска рабочей копией быть не может.')
+  return resolved
+}
+
+/** One line per worktree, plus its branch and whether it is this checkout. */
+export async function listWorktrees(git, { signal } = {}) {
+  const result = await git.run(readArgs('worktree', 'list', '--porcelain'), { signal })
+  if (result.code !== 0) throw classifyFailure(result)
+  const worktrees = []
+  let current = {}
+  const flush = () => {
+    if (typeof current.path !== 'string' || current.path === '') return
+    const entry = {
+      path: path.resolve(current.path),
+      head: typeof current.HEAD === 'string' ? current.HEAD : '',
+      branch: typeof current.branch === 'string' ? current.branch : '',
+      detached: current.detached === true,
+      bare: current.bare === true,
+      locked: typeof current.locked === 'string' && current.locked !== '',
+      prunable: typeof current.prunable === 'string' && current.prunable !== '',
+      current: false,
+    }
+    worktrees.push(entry)
+    current = {}
+  }
+  for (const line of text(result.stdout).split(/\r?\n/)) {
+    if (line === '') {
+      flush()
+      continue
+    }
+    const at = line.indexOf(' ')
+    const key = at < 0 ? line : line.slice(0, at)
+    const value = at < 0 ? '' : line.slice(at + 1)
+    if (key === 'worktree') current.path = value
+    else if (key === 'HEAD') current.HEAD = value
+    else if (key === 'branch') current.branch = value.replace(/^refs\/heads\//, '')
+    else if (key === 'detached') current.detached = true
+    else if (key === 'bare') current.bare = true
+    else if (key === 'locked') current.locked = value === '' ? 'locked' : value
+    else if (key === 'prunable') current.prunable = value === '' ? 'prunable' : value
+  }
+  flush()
+  const own = path.resolve(git.cwd)
+  const norm = (value) => (process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value))
+  for (const entry of worktrees) entry.current = norm(entry.path) === norm(own)
+  return { worktrees }
+}
+
+function worktreeFailure(result) {
+  const message = `${result.stderr}\n${result.stdout.toString('utf8')}`
+  if (/already exists/i.test(message)) return new ScmError('worktree-exists', 'Каталог рабочей копии уже существует.')
+  if (/already checked out|is already used by worktree|already used by worktree|already checked out at/i.test(message)) {
+    return new ScmError('worktree-branch', 'Эта ветка уже открыта в другой рабочей копии.')
+  }
+  if (/contains modified or untracked files/i.test(message)) {
+    return new ScmError('worktree-dirty', 'В рабочей копии есть незакоммиченные файлы — удаление без force невозможно.')
+  }
+  if (/is a main working tree|main working tree/i.test(message)) {
+    return new ScmError('worktree-main', 'Основную рабочую копию удалить нельзя.')
+  }
+  if (/not a working tree|is not a working tree/i.test(message)) return new ScmError('not-found', 'Рабочая копия не найдена.')
+  return classifyFailure(result)
+}
+
+/** Create an isolated checkout. `create` starts a new branch from HEAD. */
+export async function addWorktree(git, target, branch, { create = false, signal } = {}) {
+  const dest = checkedWorktreePath(target)
+  const name = branchName(branch)
+  const args = create
+    ? writeArgs('worktree', 'add', '-b', name, dest)
+    : writeArgs('worktree', 'add', dest, name)
+  const result = await git.run(args, { signal })
+  if (result.code !== 0) throw worktreeFailure(result)
+  return { path: dest, branch: name }
+}
+
+export async function removeWorktree(git, target, { force = false, signal } = {}) {
+  const dest = checkedWorktreePath(target)
+  const args = force
+    ? writeArgs('worktree', 'remove', '--force', dest)
+    : writeArgs('worktree', 'remove', dest)
+  const result = await git.run(args, { signal })
+  if (result.code !== 0) throw worktreeFailure(result)
+  return { path: dest }
+}
+
 /** Ref OIDs pinned by an explicit `git for-each-ref`, no network. */
+/** Compare HEAD with a branch from its real fork point, not from the branch tip. */
+export async function compareBranch(git, value, { signal, maxFiles = 200 } = {}) {
+  const base = branchName(value)
+  const verify = await git.run(readArgs('rev-parse', '--verify', `${base}^{commit}`), { signal })
+  if (verify.code !== 0) throw new ScmError('not-found', 'Ветка не найдена.')
+  const baseOid = text(verify.stdout).trim()
+  const merge = await git.run(readArgs('merge-base', baseOid, 'HEAD'), { signal })
+  if (merge.code !== 0) throw new ScmError('not-found', 'У ветки нет общей истории с HEAD.')
+  const mergeBase = text(merge.stdout).trim()
+  if (!/^[0-9a-f]{40,64}$/i.test(mergeBase)) throw new ScmError('git-failed', 'Git не вернул точку ветвления.')
+  const counts = await git.run(readArgs('rev-list', '--left-right', '--count', `${baseOid}...HEAD`), { signal })
+  if (counts.code !== 0) throw classifyFailure(counts)
+  const [behind = 0, ahead = 0] = text(counts.stdout)
+    .trim()
+    .split(/\s+/)
+    .map((value) => Number.parseInt(value, 10) || 0)
+  const diff = await git.run(readArgs('diff', '--name-status', '-z', '-M', mergeBase, 'HEAD'), {
+    signal,
+    maxBytes: MAX_STATUS_BYTES,
+  })
+  if (diff.code !== 0) throw classifyFailure(diff)
+  const entries = parseNameStatus(diff.stdout)
+  return {
+    base,
+    baseOid,
+    mergeBase,
+    ahead,
+    behind,
+    files: entries.slice(0, maxFiles),
+    truncated: entries.length > maxFiles,
+    total: entries.length,
+  }
+}
+
 export async function listVertices(git, { signal } = {}) {
   const result = await git.run(readArgs('for-each-ref', '--format=%(objectname)', 'refs/heads', 'refs/remotes'), { signal })
   if (result.code !== 0) throw classifyFailure(result)

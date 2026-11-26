@@ -1,14 +1,19 @@
 /**
- * Literal text search across the session workspace.
+ * Text search across the session workspace.
  *
  * The search is local: it never reaches a model, and it works without the Tab
  * opt-in. It walks the workspace with `node:fs` exactly like the tree does,
  * reuses the tree's skip policy and its realpath guard, and stops on a budget
  * instead of pretending that a truncated scan found nothing.
  *
- * Deliberately absent: regular expressions, external processes (`rg`, `git
- * grep`), an index. Those are separate decisions with their own follow-ups; the
- * route answers the one question «where does this text appear» honestly.
+ * A query is either a literal substring or a one-line regular expression, and
+ * either can be restricted to whole words. Lines are matched one by one, so a
+ * pattern never spans a newline; a match keeps the text it actually found, not
+ * the text of the pattern.
+ *
+ * Deliberately absent: external processes (`rg`, `git grep`), an index, and
+ * multi-line patterns. Those are separate decisions with their own follow-ups;
+ * the route answers the one question «where does this text appear» honestly.
  */
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises'
 import path from 'node:path'
@@ -42,11 +47,12 @@ const PREVIEW_CHARS = 200
 const BINARY_PROBE_BYTES = 4096
 
 /**
- * Search one workspace for a literal string.
+ * Search one workspace for a literal string or a regular expression.
  *
  * @param {object} ctx Host context carrying `fs`.
  * @param {{cwd: string, query: string, limit?: number, hidden?: boolean,
- *          ignoreCase?: boolean, maxResults?: number, maxFileBytes?: number,
+ *          ignoreCase?: boolean, regex?: boolean, wholeWord?: boolean,
+ *          maxResults?: number, maxFileBytes?: number,
  *          maxTotalBytes?: number, maxFiles?: number, signal?: AbortSignal}} request
  * @returns {Promise<{matches: Array<{path: string, line: number, column: number,
  *   preview: string, match: string}>, truncated: boolean, scanned: number, bytes: number}>}
@@ -61,8 +67,16 @@ export async function searchText(ctx, request) {
   const signal = request.signal
   const hidden = request.hidden === true
   const ignoreCase = request.ignoreCase !== false
+  const useRegex = request.regex === true
+  const wholeWord = request.wholeWord === true
+  const skip = typeof request.skip === 'function' ? request.skip : undefined
 
   if (query === '') return { matches: [], truncated: false, scanned: 0, bytes: 0 }
+
+  // A malformed pattern is refused before the walk starts, so the error costs
+  // nothing and the caller gets the engine's own explanation.
+  const expression = useRegex ? compile(query, ignoreCase) : undefined
+  const needle = useRegex ? '' : ignoreCase ? query.toLowerCase() : query
 
   const root = await ctx.fs.resolve(request.cwd, { signal })
   const nativeRoot = ctx.fs.processPath(root)
@@ -72,7 +86,6 @@ export async function searchText(ctx, request) {
   const realRoot = await safeRealpath(nativeRoot)
   const knownRoot = realRoot === undefined ? nativeRoot : realRoot
 
-  const needle = ignoreCase ? query.toLowerCase() : query
   const matches = []
   const queue = [{ relative: '', absolute: knownRoot, depth: 0 }]
   let scanned = 0
@@ -97,6 +110,7 @@ export async function searchText(ctx, request) {
       if (dirent.isSymbolicLink()) continue
       if (!hidden && name.startsWith('.')) continue
       const relative = current.relative === '' ? name : `${current.relative}/${name}`
+      if (skip !== undefined && skip(relative, dirent.isDirectory())) continue
       if (dirent.isDirectory()) {
         if (SKIPPED.has(name)) continue
         if (current.depth >= MAX_DEPTH) {
@@ -141,22 +155,27 @@ export async function searchText(ctx, request) {
       const lines = text.split(/\r?\n/)
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index]
-        const haystack = ignoreCase ? line.toLowerCase() : line
-        let at = haystack.indexOf(needle)
-        while (at !== -1) {
+        // `visit` owns the result budget, so a helper stops as soon as the
+        // budget is full instead of first collecting every hit on the line.
+        const visit = (at, found) => {
+          if (wholeWord && !isWholeWord(line, at, found.length)) return true
           matches.push({
             path: relative,
             line: index + 1,
             column: at + 1,
             preview: clipLine(line, at),
-            match: line.slice(at, at + query.length),
+            match: found,
           })
           if (matches.length >= maxResults) {
             truncated = true
-            break walk
+            return false
           }
-          at = haystack.indexOf(needle, at + Math.max(1, needle.length))
+          return true
         }
+        const more = useRegex
+          ? eachRegexHit(expression, line, visit)
+          : eachLiteralHit(ignoreCase ? line.toLowerCase() : line, line, needle, query.length, visit)
+        if (!more) break walk
       }
     }
   }
@@ -171,6 +190,65 @@ function clipLine(line, at) {
   const left = Math.min(at - 40, indent + trimmed.length - PREVIEW_CHARS)
   const start = Math.max(0, left);
   return line.slice(start, start + PREVIEW_CHARS).trimEnd()
+}
+
+/**
+ * Visit every non-empty regex match on one line; returns false when `visit`
+ * asks to stop. `lastIndex` advances past an empty match, otherwise `exec`
+ * returns the same position forever and the scan never ends.
+ */
+function eachRegexHit(expression, line, visit) {
+  expression.lastIndex = 0
+  let hit
+  while ((hit = expression.exec(line)) !== null) {
+    if (hit[0] === '') {
+      expression.lastIndex += 1
+      continue
+    }
+    if (!visit(hit.index, hit[0])) return false
+  }
+  return true
+}
+
+/** Visit every literal hit; the text is cut from the line, not from `needle`. */
+function eachLiteralHit(haystack, line, needle, width, visit) {
+  let at = haystack.indexOf(needle)
+  while (at !== -1) {
+    if (!visit(at, line.slice(at, at + width))) return false
+    at = haystack.indexOf(needle, at + Math.max(1, needle.length))
+  }
+  return true
+}
+
+/**
+ * Letters, digits and `_` count as one word, including non-ASCII letters, so a
+ * hit inside `needle_1` or `нужно` is filtered exactly like one inside `needles`.
+ */
+const WORD = /[\p{L}\p{N}_]/u
+
+function isWholeWord(line, at, length) {
+  return !WORD.test(charBefore(line, at)) && !WORD.test(charAfter(line, at + length))
+}
+
+/** One code point to the left, so a surrogate pair is not torn in half. */
+function charBefore(line, at) {
+  if (at <= 0) return ''
+  const low = line.charCodeAt(at - 1)
+  const start = low >= 0xdc00 && low <= 0xdfff && at >= 2 ? at - 2 : at - 1
+  return String.fromCodePoint(line.codePointAt(start))
+}
+
+/** One code point to the right; `''` at the end of the line. */
+function charAfter(line, at) {
+  return at >= line.length ? '' : String.fromCodePoint(line.codePointAt(at))
+}
+
+function compile(query, ignoreCase) {
+  try {
+    return new RegExp(query, ignoreCase ? 'gi' : 'g')
+  } catch (error) {
+    throw fail('bad-request', `Некорректное регулярное выражение: ${error.message}`)
+  }
 }
 
 function looksBinary(buffer) {

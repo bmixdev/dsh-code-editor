@@ -48,6 +48,11 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   hiddenFiles: false,
   /** Offer inline suggestions without pressing Ctrl+Space. */
   autoSuggest: true,
+  /**
+   * File extensions whose automatic Tab requests are off. Manual Ctrl+Space
+   * still asks: this disables a type, not the whole workspace.
+   */
+  tabDisabledExtensions: Object.freeze([]),
   /** Characters of the buffer sent before the cursor. */
   contextLeft: 4000,
   /** Characters of the buffer sent after the cursor. */
@@ -62,6 +67,8 @@ export const DEFAULT_PREFERENCES = Object.freeze({
    * hints does not allow sending a selection with a request.
    */
   inlineEditConsent: false,
+  /** Ask-only mode: every workspace write through the plugin is refused. */
+  askMode: false,
   /** Command id -> chord text. Only ids the client knows are used; the Host
    *  stores the strings and never interprets them. */
   keybindings: Object.freeze({}),
@@ -206,6 +213,7 @@ const BOOLEAN_KEYS = [
   'autoModel',
   'noReasoningHint',
   'inlineEditConsent',
+  'askMode',
 ]
 
 /** How many workspaces may stay opted in at once. */
@@ -213,6 +221,12 @@ const MAX_OPT_IN = 20
 
 /** How many remapped chords are kept. */
 const MAX_KEYBINDINGS = 40
+
+/** How many disabled file extensions are kept. */
+const MAX_TAB_EXTENSIONS = 20
+
+/** Extension text accepted from the menu: `md`, `ts`, `cs`, `c++`. */
+const TAB_EXTENSION = /^[a-z0-9+#._-]{1,12}$/
 
 /** Command ids and chord text the client may store. */
 const KEYBINDING_ID = /^[a-z0-9-]{1,40}$/
@@ -274,8 +288,20 @@ function sanitize(patch) {
     }
     result.completionOptIn = roots
   }
-  if (patch.keybindings !== undefined) {
-    if (typeof patch.keybindings !== 'object' || patch.keybindings === null || Array.isArray(patch.keybindings)) {
+  if (patch.tabDisabledExtensions !== undefined) {
+    if (!Array.isArray(patch.tabDisabledExtensions)) {
+      throw Object.assign(new Error('Список расширений должен быть массивом.'), { code: 'bad-request' })
+    }
+    const extensions = []
+    for (const candidate of patch.tabDisabledExtensions) {
+      const value = String(candidate ?? '').trim().toLowerCase().replace(/^\./, '')
+      if (!TAB_EXTENSION.test(value)) continue
+      if (!extensions.includes(value)) extensions.push(value)
+      if (extensions.length >= MAX_TAB_EXTENSIONS) break
+    }
+    result.tabDisabledExtensions = extensions
+  }
+  if (patch.keybindings !== undefined) {    if (typeof patch.keybindings !== 'object' || patch.keybindings === null || Array.isArray(patch.keybindings)) {
       throw Object.assign(new Error('Раскладка клавиш должна быть объектом.'), { code: 'bad-request' })
     }
     const chords = {}

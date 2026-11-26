@@ -651,3 +651,249 @@ test('rename, delete and copy letters are classified for history rows', () => {
   )
   assert.equal(status[3].kind, 'renamed')
 })
+
+test('the index patch and the worktree patch split one file exactly', async () => {
+  const repo = await makeRepo()
+  try {
+    await commitFile(repo, 'a.txt', 'one\ntwo\nthree\n', 'first')
+    await putFile(repo, 'a.txt', 'one\nSTAGED\nthree\n')
+    runGit(repo.directory, repo.env, ['add', '--', 'a.txt'])
+    await putFile(repo, 'a.txt', 'one\nSTAGED\nWORK\n')
+    const state = await snapshot(repo)
+
+    const staged = await scm.loadPatch(repo.git, state, { group: 'staged' })
+    assert.equal(staged.files.length, 1)
+    assert.equal(staged.files[0].path, 'a.txt')
+    assert.ok(staged.bytes > 0)
+    assert.match(staged.patch, /\+STAGED/)
+    assert.doesNotMatch(staged.patch, /WORK/)
+
+    const changes = await scm.loadPatch(repo.git, state, { group: 'changes' })
+    assert.match(changes.patch, /-three/)
+    assert.match(changes.patch, /\+WORK/)
+    assert.doesNotMatch(changes.patch, /\+STAGED/)
+  } finally {
+    await cleanup(repo.root)
+  }
+})
+
+test('a patch names untracked, binary, secret and oversized files instead of losing them', async () => {
+  const repo = await makeRepo()
+  try {
+    await commitFile(repo, 'base.txt', 'base\n', 'first')
+    await commitFile(repo, 'big.txt', 'small\n', 'big base')
+    await commitFile(repo, 'bin.dat', 'text\n', 'binary base')
+    await putFile(repo, 'new.txt', 'new\n')
+    await putFile(repo, 'bin.dat', Buffer.from([0, 1, 2, 3, 0, 4]))
+    await putFile(repo, 'big.txt', `${'x'.repeat(400)}\n`)
+    await putFile(repo, 'secret.txt', 'token=1\n')
+    runGit(repo.directory, repo.env, ['add', '--', 'secret.txt'])
+
+    const state = await snapshot(repo)
+    const changes = await scm.loadPatch(repo.git, state, { group: 'changes', maxBytes: 400 })
+    const reasons = Object.fromEntries(changes.skipped.map((item) => [item.path, item.reason]))
+    assert.equal(reasons['new.txt'], 'untracked')
+    assert.equal(reasons['bin.dat'], 'binary')
+    assert.equal(reasons['big.txt'], 'too-large')
+    assert.deepEqual(changes.files, [])
+    assert.equal(changes.truncated, true)
+
+    const staged = await scm.loadPatch(repo.git, state, {
+      group: 'staged',
+      skip: (target) => target === 'secret.txt',
+    })
+    assert.deepEqual(
+      staged.skipped.map((item) => [item.path, item.reason]),
+      [['secret.txt', 'secret']],
+    )
+
+    const ignored = await scm.loadPatch(repo.git, state, {
+      group: 'staged',
+      skip: (target) => (target === 'secret.txt' ? 'ignored' : false),
+    })
+    assert.deepEqual(
+      ignored.skipped.map((item) => [item.path, item.reason]),
+      [['secret.txt', 'ignored']],
+    )
+  } finally {
+    await cleanup(repo.root)
+  }
+})
+
+test('patch line numbers follow the new side and reset per file', () => {
+  const patch = [
+    'diff --git a/a.txt b/a.txt',
+    '--- a/a.txt',
+    '+++ b/a.txt',
+    '@@ -1,2 +1,3 @@',
+    ' one',
+    '+two',
+    ' three',
+    'diff --git a/b.txt b/b.txt',
+    '--- a/b.txt',
+    '+++ b/b.txt',
+    '@@ -5,1 +5,2 @@',
+    ' five',
+    '+six',
+    '',
+  ].join('\n')
+  assert.deepEqual([...scm.patchLineNumbers(patch)].sort((left, right) => left - right), [1, 2, 3, 5, 6])
+  assert.deepEqual([...scm.patchLineNumbers('')], [])
+})
+
+test('a patch request for conflicts is refused instead of drawing a two-way diff', async () => {
+  const repo = await makeRepo()
+  try {
+    await commitFile(repo, 'a.txt', 'A\n', 'first')
+    const state = await snapshot(repo)
+    await assert.rejects(
+      () => scm.loadPatch(repo.git, state, { group: 'conflicts' }),
+      (error) => error.code === 'bad-request',
+    )
+  } finally {
+    await cleanup(repo.root)
+  }
+})
+
+test('a both-sides conflict exposes base, ours and theirs, and the chosen text clears it', async () => {
+  const repo = await makeRepo()
+  const file = path.join(repo.directory, 'file.txt')
+  try {
+    await commitFile(repo, 'file.txt', 'base\n', 'base')
+    runGit(repo.directory, repo.env, ['checkout', '-q', '-b', 'feature'])
+    await putFile(repo, 'file.txt', 'feature\n')
+    runGit(repo.directory, repo.env, ['add', '--', 'file.txt'])
+    runGit(repo.directory, repo.env, ['commit', '-q', '-m', 'feature'])
+    runGit(repo.directory, repo.env, ['checkout', '-q', 'main'])
+    await putFile(repo, 'file.txt', 'main\n')
+    runGit(repo.directory, repo.env, ['add', '--', 'file.txt'])
+    runGit(repo.directory, repo.env, ['commit', '-q', '-m', 'main'])
+    assert.throws(() => runGit(repo.directory, repo.env, ['merge', 'feature']))
+
+    const state = await snapshot(repo)
+    assert.ok(state.entries.some((entry) => entry.kind === 'conflict' && entry.path === 'file.txt'))
+    const conflict = await scm.loadConflict(repo.git, state, 'file.txt')
+    assert.equal(conflict.base, 'base\n')
+    assert.equal(conflict.ours, 'main\n')
+    assert.equal(conflict.theirs, 'feature\n')
+    assert.equal(conflict.hasBase, true)
+    assert.equal(conflict.hasOurs, true)
+    assert.equal(conflict.hasTheirs, true)
+
+    const resolution = 'main + feature\n'
+    const outcome = await scm.resolveConflict(repo.git, 'file.txt', resolution)
+    assert.match(outcome.oid, /^[0-9a-f]{40,64}$/)
+    assert.equal(await readFile(file, 'utf8'), resolution)
+    assert.equal(runGit(repo.directory, repo.env, ['show', ':0:file.txt']), resolution)
+    const after = await snapshot(repo)
+    assert.equal(after.entries.some((entry) => entry.kind === 'conflict'), false)
+    assert.deepEqual(
+      after.entries.map((entry) => [entry.path, entry.kind]),
+      [['file.txt', 'modified']],
+    )
+  } finally {
+    await cleanup(repo.root)
+  }
+})
+
+test('a modify/delete conflict reports the missing side instead of inventing it', async () => {
+  const repo = await makeRepo()
+  try {
+    await commitFile(repo, 'gone.txt', 'base\n', 'base')
+    runGit(repo.directory, repo.env, ['checkout', '-q', '-b', 'deleter'])
+    runGit(repo.directory, repo.env, ['rm', '-q', '--', 'gone.txt'])
+    runGit(repo.directory, repo.env, ['commit', '-q', '-m', 'delete'])
+    runGit(repo.directory, repo.env, ['checkout', '-q', 'main'])
+    await putFile(repo, 'gone.txt', 'changed\n')
+    runGit(repo.directory, repo.env, ['add', '--', 'gone.txt'])
+    runGit(repo.directory, repo.env, ['commit', '-q', '-m', 'modify'])
+    assert.throws(() => runGit(repo.directory, repo.env, ['merge', 'deleter']))
+
+    const state = await snapshot(repo)
+    const conflict = await scm.loadConflict(repo.git, state, 'gone.txt')
+    assert.equal(conflict.hasOurs, true)
+    assert.equal(conflict.hasTheirs, false)
+    assert.equal(conflict.ours, 'changed\n')
+    assert.equal(conflict.theirs, '')
+    await assert.rejects(
+      () => scm.loadConflict(repo.git, state, 'missing.txt'),
+      (error) => error.code === 'not-conflict',
+    )
+  } finally {
+    await cleanup(repo.root)
+  }
+})
+
+test('a binary conflict is refused rather than shown as text', async () => {
+  const repo = await makeRepo()
+  try {
+    await commitFile(repo, 'marker.txt', 'base\n', 'base')
+    runGit(repo.directory, repo.env, ['checkout', '-q', '-b', 'binary'])
+    await writeFile(path.join(repo.directory, 'bin.dat'), Buffer.from([0, 1, 2, 3]))
+    runGit(repo.directory, repo.env, ['add', '--', 'bin.dat'])
+    runGit(repo.directory, repo.env, ['commit', '-q', '-m', 'binary'])
+    runGit(repo.directory, repo.env, ['checkout', '-q', 'main'])
+    await writeFile(path.join(repo.directory, 'bin.dat'), Buffer.from([0, 9, 8, 7]))
+    runGit(repo.directory, repo.env, ['add', '--', 'bin.dat'])
+    runGit(repo.directory, repo.env, ['commit', '-q', '-m', 'other binary'])
+    assert.throws(() => runGit(repo.directory, repo.env, ['merge', 'binary']))
+
+    const state = await snapshot(repo)
+    await assert.rejects(
+      () => scm.loadConflict(repo.git, state, 'bin.dat'),
+      (error) => error.code === 'binary',
+    )
+  } finally {
+    await cleanup(repo.root)
+  }
+})
+
+test('worktrees are created, listed with their branch, and removed', async () => {
+  const repo = await makeRepo()
+  try {
+    await commitFile(repo, 'a.txt', 'A\n', 'first')
+    const target = path.join(repo.root, 'task-copy')
+    const created = await scm.addWorktree(repo.git, target, 'task', { create: true })
+    assert.equal(created.branch, 'task')
+    assert.equal(created.path, path.resolve(target))
+
+    let listing = await scm.listWorktrees(repo.git)
+    assert.equal(listing.worktrees.length, 2)
+    const main = listing.worktrees.find((item) => item.current)
+    const copy = listing.worktrees.find((item) => !item.current)
+    assert.equal(main.branch, 'main')
+    assert.equal(copy.branch, 'task')
+    assert.equal(copy.path, path.resolve(target))
+
+    await assert.rejects(
+      () => scm.addWorktree(repo.git, path.join(repo.root, 'second'), 'task'),
+      (error) => error.code === 'worktree-branch',
+    )
+
+    await scm.removeWorktree(repo.git, target)
+    listing = await scm.listWorktrees(repo.git)
+    assert.equal(listing.worktrees.length, 1)
+    assert.equal(listing.worktrees[0].current, true)
+  } finally {
+    await cleanup(repo.root)
+  }
+})
+
+test('a dirty worktree refuses removal without force', async () => {
+  const repo = await makeRepo()
+  try {
+    await commitFile(repo, 'a.txt', 'A\n', 'first')
+    const target = path.join(repo.root, 'dirty-copy')
+    await scm.addWorktree(repo.git, target, 'dirty', { create: true })
+    await writeFile(path.join(target, 'a.txt'), 'changed\n', 'utf8')
+    await assert.rejects(
+      () => scm.removeWorktree(repo.git, target),
+      (error) => error.code === 'worktree-dirty',
+    )
+    await scm.removeWorktree(repo.git, target, { force: true })
+    const listing = await scm.listWorktrees(repo.git)
+    assert.equal(listing.worktrees.length, 1)
+  } finally {
+    await cleanup(repo.root)
+  }
+})
