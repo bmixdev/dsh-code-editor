@@ -6710,6 +6710,21 @@ function terminalScreenTail(term) {
 }
 
 /**
+ * Keys that wipe the typed input before the replacement command is written.
+ * The prediction replaces the draft (a model answer may rewrite it entirely),
+ * and only the shell itself can clear its own line:
+ * PSReadLine binds Escape to RevertLine (a fresh prompt reverts to empty) and
+ * cmd.exe clears the line on Escape; readline shells (bash, zsh, the Node
+ * REPL) discard the input on Ctrl+U. WSL profiles are bash-like, hence the
+ * fallback.
+ */
+function terminalClearKeys(profile) {
+  const id = String(profile ?? '').split(':')[0]
+  if (id === 'powershell' || id === 'pwsh' || id === 'cmd') return '\x1b'
+  return '\x15'
+}
+
+/**
  * One real PTY session in the bottom panel. Terminals live on the Host, so a
  * page reload finds them again through `termList`; the reader keeps a byte
  * offset per terminal and long-polls for new output.
@@ -6856,10 +6871,12 @@ function PtyPanel({ sessionId, call, height }) {
     if (current === undefined || current.busy === true) return
     cancelIdle()
     applyHint(undefined)
-    // The prediction lands as ordinary typed text: the shell echoes it and the
-    // user still runs it with Enter, so nothing is executed implicitly.
     if (call !== undefined && current.text !== '') {
-      call('termWrite', { sessionId, id: current.id, data: current.text }).catch(() => {})
+      // The prediction replaces the draft: clear the shell's own line first
+      // (per-shell key), then type the full command. Nothing is executed —
+      // the user still runs it with Enter.
+      const engine = engineOf(current.id)
+      call('termWrite', { sessionId, id: current.id, data: terminalClearKeys(engine?.profile) + current.text }).catch(() => {})
     }
   }, [call, sessionId, cancelIdle, applyHint])
 
@@ -7235,7 +7252,7 @@ function PtyPanel({ sessionId, call, height }) {
                     style: { left: `${position.x}px`, top: `${position.y}px` },
                     title: shown.busy === true
                       ? menuText('Предугадывание…', 'Predicting…')
-                      : menuText('Вставить предсказание (Tab), Esc — убрать', 'Insert prediction (Tab), Esc to dismiss'),
+                      : menuText('Заменить ввод командой (Tab), Esc — убрать', 'Replace input with the prediction (Tab), Esc to dismiss'),
                     onClick: (event) => {
                       event.stopPropagation()
                       smartRef.current.accept()

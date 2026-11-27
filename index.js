@@ -3429,17 +3429,18 @@ export function apply(ctx, config) {
    */
   const TERMINAL_SUGGEST_PROMPT = [
     'Ты — ассистент командной строки в IDE. Пользователь начал вводить команду в терминале.',
-    'Допечатай команду: верни ТОЛЬКО текст, который нужно добавить после уже введённого.',
-    'Правила: одна строка; без пояснений; без кавычек-обёрток вокруг всего ответа;',
-    'не повторяй уже введённый текст; учитывай недавний вывод терминала —',
-    'после ошибки предложи исправленную команду; если продолжать нечего — верни пустой ответ.',
+    'Верни ПОЛНУЮ команду целиком — то, что должно остаться на строке вместо набранного:',
+    'введённое считай черновиком, его можно исправить и дополнить.',
+    'Правила: одна строка; без пояснений; без кавычек-обёрток; БЕЗ текста промпта',
+    '(не повторяй «PS C:\\…>», «$» и т. п.); учитывай недавний вывод терминала —',
+    'после ошибки предложи исправленную команду; если команду предложить нечего — верни пустой ответ.',
   ].join('\n')
 
   /**
-   * The model may echo the typed prefix (chat models love to restate the
-   * input). The client types the answer verbatim on Tab, so an echo would
-   * duplicate the command — cut it, take the first line only, and cap the
-   * length so a runaway answer cannot push a wall of text into the shell.
+   * The answer is typed onto a cleared line on Tab, so it must be a bare full
+   * command: cut the echo of the screen line (the client sends the line with
+   * its prompt), a bare prompt prefix, wrapping fences, and cap the length so
+   * a runaway answer cannot push a wall of text into the shell.
    */
   function sanitizeTermSuggestion(raw, typed) {
     let text = String(raw ?? '').replace(/\r/g, '')
@@ -3449,7 +3450,12 @@ export function apply(ctx, config) {
     if (text === '') return ''
     text = text.replace(/^`+/, '').replace(/`+$/, '').trim()
     const echo = String(typed ?? '')
-    if (echo !== '' && text.toLowerCase().startsWith(echo.toLowerCase())) text = text.slice(echo.length)
+    if (echo !== '' && text.toLowerCase().startsWith(echo.toLowerCase())) text = text.slice(echo.length).trim()
+    // A model that ignores the "no prompt" rule still gets a usable answer.
+    text = text
+      .replace(/^(?:PS\s+)?[A-Za-z]:\\[^>\n]{0,160}>\s*/, '')
+      .replace(/^(?:PS\s*>\s*|\$\s+|>\s+)/, '')
+      .trim()
     if (text === '') return ''
     return text.slice(0, 200)
   }
