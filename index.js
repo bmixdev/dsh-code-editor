@@ -478,6 +478,7 @@ export function apply(ctx, config) {
     termKill: (body) => terminalService.termKillRoute(body),
     termList: (body) => terminalService.termListRoute(body),
     termRead: (body, signal) => terminalService.termReadRoute(body, signal),
+    termSuggest: (body, signal) => termSuggest(body, signal),
     catalog: () => buildCatalog(ctx),
     credentials: (body) => credentialsRoute(body),
     prefs: (body) => prefsRoute(body),
@@ -3418,6 +3419,194 @@ export function apply(ctx, config) {
     const root = await rootTarget(scope.cwd, signal)
     return terminalService.termCreateRoute(body, { cwd: ctx.fs.processPath(root) })
   }
+
+  // -------------------------------------------------------- smart terminal
+
+  /**
+   * The instruction for a terminal continuation. It is deliberately stricter
+   * than the editor prompt: the answer is typed into a live shell on Tab, so
+   * anything but the bare remaining characters becomes typed garbage.
+   */
+  const TERMINAL_SUGGEST_PROMPT = [
+    'Ты — ассистент командной строки в IDE. Пользователь начал вводить команду в терминале.',
+    'Допечатай команду: верни ТОЛЬКО текст, который нужно добавить после уже введённого.',
+    'Правила: одна строка; без пояснений; без кавычек-обёрток вокруг всего ответа;',
+    'не повторяй уже введённый текст; учитывай недавний вывод терминала —',
+    'после ошибки предложи исправленную команду; если продолжать нечего — верни пустой ответ.',
+  ].join('\n')
+
+  /**
+   * The model may echo the typed prefix (chat models love to restate the
+   * input). The client types the answer verbatim on Tab, so an echo would
+   * duplicate the command — cut it, take the first line only, and cap the
+   * length so a runaway answer cannot push a wall of text into the shell.
+   */
+  function sanitizeTermSuggestion(raw, typed) {
+    let text = String(raw ?? '').replace(/\r/g, '')
+    const newline = text.indexOf('\n')
+    if (newline !== -1) text = text.slice(0, newline)
+    text = text.trim()
+    if (text === '') return ''
+    text = text.replace(/^`+/, '').replace(/`+$/, '').trim()
+    const echo = String(typed ?? '')
+    if (echo !== '' && text.toLowerCase().startsWith(echo.toLowerCase())) text = text.slice(echo.length)
+    if (text === '') return ''
+    return text.slice(0, 200)
+  }
+
+  /**
+   * One idle-pause prediction for the smart terminal: continue the text the
+   * user has typed so far. The screen tail rides along so a visible error can
+   * shape the continuation. Same model chain as the editor completion — the
+   * user configured a model once and expects both features to use it.
+   */
+  async function termSuggest(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — предугадывание недоступно.')
+    const typed = String(body.command ?? '').slice(0, 300)
+    const requestId = randomUUID()
+    if (typed.trim() === '') return { text: '', requestId, provider: '', model: '', durationMs: 0, reason: '' }
+    // The screen is context, never a transcript: bound it on the way in.
+    const screen = String(body.output ?? '').replace(/\s+$/g, '').slice(-1200)
+    const shell = typeof body.profile === 'string' ? body.profile.slice(0, 60) : ''
+    const cwd = typeof body.cwd === 'string' ? body.cwd.slice(0, 200) : ''
+    const startedAt = Date.now()
+
+    const selection = ctx.agentDefaultModel.currentSelection()
+    if (!selection || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
+      return fail('no-model', 'Модель не выбрана — предугадывание недоступно, терминал работает.')
+    }
+    const preferences = await readPreferences()
+    const requestedModel = String(
+      preferences.completionModel ||
+        (typeof config === 'object' && config !== null && typeof config.completionModel === 'string'
+          ? config.completionModel
+          : '') ||
+        process.env.DSH_CODE_EDITOR_MODEL ||
+        '',
+    ).trim()
+    let modelSource =
+      String(preferences.completionModel ?? '').trim() !== ''
+        ? 'settings'
+        : typeof config === 'object' && config !== null && String(config.completionModel ?? '').trim() !== ''
+          ? 'config'
+          : String(process.env.DSH_CODE_EDITOR_MODEL ?? '').trim() !== ''
+            ? 'env'
+            : 'session'
+    const provider = selection.provider
+    let effectiveModel = requestedModel
+    // The session's own model is usually a thinking one; a suggestion that
+    // lands 20 s late is worse than none. Same reasoning as the editor path.
+    if (modelSource === 'session' && preferences.autoModel !== false) {
+      const family = String(selection.model).toLowerCase().split('-')[0]
+      const fast = await untilAbort(signal, () => pickFastModel(ctx, provider, family))
+      if (fast !== '' && fast !== selection.model) {
+        effectiveModel = fast
+        modelSource = 'auto'
+      }
+    }
+
+    const deadline = AbortSignal.timeout(boundedMs(preferences.deadlineMs, 8000, 1000, 20000))
+    const combined = AbortSignal.any([signal, deadline])
+    const requestText =
+      `Оболочка: ${shell}\n` +
+      (cwd === '' ? '' : `Папка: ${cwd}\n`) +
+      (screen === '' ? '' : `--- недавний вывод терминала ---\n${screen}\n--- конец вывода ---\n`) +
+      `Введено: ${typed}`
+
+    const effortChain = effortChainFor(preferences.completionEffort)
+    let text = ''
+    let used
+    let effortUsed
+    let streamError = ''
+    for (const attempt of [{ provider, model: effectiveModel !== '' ? effectiveModel : selection.model }]) {
+      for (const effort of effortChain) {
+        let buffer = ''
+        const stop = new AbortController()
+        const attemptSignal = AbortSignal.any([combined, stop.signal])
+        let iterator
+        try {
+          iterator = ctx.llm.stream({
+            provider: attempt.provider,
+            model: attempt.model,
+            ...(effort === undefined ? {} : { reasoningEffort: effort }),
+            system: TERMINAL_SUGGEST_PROMPT,
+            messages: [{ role: 'user', content: [{ type: 'text', text: requestText }] }],
+            temperature: 0.2,
+            signal: attemptSignal,
+            sessionId: scope.id,
+            purpose: 'code-editor-terminal-suggestion',
+          })[Symbol.asyncIterator]()
+          while (true) {
+            const { done, value: chunk } = await untilAbort(attemptSignal, () => iterator.next())
+            if (done) { iterator = undefined; break }
+            if (!chunk || typeof chunk !== 'object') continue
+            if (chunk.type === 'text-delta' && typeof chunk.text === 'string') buffer += chunk.text
+            if (chunk.type === 'error') {
+              const detail = chunk.message ?? chunk.error?.message ?? chunk.error
+              streamError = typeof detail === 'string' && detail !== '' ? detail : 'stream-error'
+            }
+            if (chunk.type === 'finish') {
+              const reason = chunk.reason ?? {}
+              if (reason.kind === 'error' && reason.failure !== undefined && reason.failure !== null) {
+                const message = typeof reason.failure.message === 'string' ? reason.failure.message : ''
+                const code = typeof reason.failure.code === 'string' ? reason.failure.code : ''
+                streamError = message !== '' ? message : code !== '' ? code : 'stream-error'
+              }
+            }
+            if (buffer.length > 600) break
+          }
+        } catch (cause) {
+          if (signal?.aborted) combined.throwIfAborted()
+          if (buffer.trim() === '') streamError = cause instanceof Error ? cause.message : String(cause)
+        } finally {
+          if (iterator !== undefined) {
+            stop.abort()
+            void Promise.resolve().then(() => iterator.return?.()).catch(() => {})
+          }
+        }
+        const answer = sanitizeTermSuggestion(buffer, typed)
+        if (answer !== '') {
+          used = attempt
+          effortUsed = effort
+          text = answer
+          break
+        }
+        if (streamError !== '' && !isUnsupportedEffort(streamError)) break
+      }
+      if (text !== '') break
+    }
+
+    logCompletion({
+      file: `терминал:${shell}`,
+      kind: 'terminal-suggest',
+      provider: used?.provider ?? '',
+      model: used?.model ?? '',
+      modelSource,
+      effort: effortUsed ?? '',
+      answerChars: text.length,
+      typedChars: typed.length,
+      screenChars: screen.length,
+      ms: Date.now() - startedAt,
+      error: streamError !== '' ? streamError : undefined,
+    })
+    const reason =
+      text !== ''
+        ? ''
+        : streamError !== ''
+          ? `Модель не ответила: ${streamError}`
+          : 'Модель не предложила продолжение.'
+    return {
+      text,
+      requestId,
+      provider: used?.provider ?? '',
+      model: used?.model ?? '',
+      modelSource,
+      durationMs: Date.now() - startedAt,
+      reason,
+    }
+  }
+
 
   async function credentialsRoute(body) {
     const operation = typeof body.op === 'string' ? body.op : 'status'

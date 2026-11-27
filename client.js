@@ -6659,6 +6659,56 @@ const TERMINAL_PROFILE_LABELS = {
   shell: 'Shell',
 }
 
+/** Pause length that decides "the user stopped typing" for the smart terminal. */
+const TERMINAL_SUGGEST_IDLE_MS = 600
+
+/**
+ * Text of the input line under the caret, joined across wrapped rows. Shells
+ * such as PSReadLine repaint the prompt as terminal output, so the line carries
+ * the prompt too — the model sees exactly what the screen shows and continues
+ * it. Buffer rows are addressed absolutely: cursorY is viewport-relative and
+ * must be rebased by viewportY before getLine.
+ */
+function terminalLineUnderCursor(term) {
+  try {
+    const buffer = term.buffer.active
+    const absoluteY = buffer.viewportY + buffer.cursorY
+    let first = absoluteY
+    while (first > 0) {
+      const above = buffer.getLine(first - 1)
+      if (above === undefined || above.isWrapped !== true) break
+      first -= 1
+    }
+    let text = ''
+    for (let index = first; index <= absoluteY; index += 1) {
+      const line = buffer.getLine(index)
+      if (line === undefined) break
+      text += line.translateToString(true)
+    }
+    return text
+  } catch {
+    return ''
+  }
+}
+
+/** The visible screen, trimmed: context for the prediction, not a transcript. */
+function terminalScreenTail(term) {
+  try {
+    const buffer = term.buffer.active
+    const base = Math.max(0, buffer.viewportY)
+    const lines = []
+    for (let index = 0; index < term.rows; index += 1) {
+      const line = buffer.getLine(base + index)
+      if (line === undefined) break
+      lines.push(line.translateToString(true).trimEnd())
+    }
+    while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+    return lines.join('\n').slice(-2000)
+  } catch {
+    return ''
+  }
+}
+
 /**
  * One real PTY session in the bottom panel. Terminals live on the Host, so a
  * page reload finds them again through `termList`; the reader keeps a byte
@@ -6719,6 +6769,130 @@ function PtyPanel({ sessionId, call, height }) {
 
   const markDead = React.useCallback((id, exitCode) => {
     setTerminals((previous) => previous.map((item) => (item.id === id ? { ...item, alive: false, exitCode: exitCode ?? item.exitCode } : item)))
+    const engine = enginesRef.current.get(id)
+    if (engine !== undefined) engine.alive = false
+  }, [])
+
+  // ---- smart terminal: a lightbulb over the input line on typing idle -----
+  // The prediction is requested only for the active terminal, only when the
+  // user stopped typing, and never twice: any keystroke invalidates the
+  // previous answer because the line under the caret has changed.
+  const [hint, setHint] = React.useState(undefined)
+  const hintRef = React.useRef(undefined)
+  const hintTokenRef = React.useRef(0)
+  const hintAbortRef = React.useRef(undefined)
+  const idleRef = React.useRef(undefined)
+  const hintBlockedRef = React.useRef(false)
+  // The xterm key handler is installed once per engine; it reads the newest
+  // hint state through this mirror instead of a stale closure.
+  const smartRef = React.useRef({ accept: () => {}, dismiss: () => {} })
+
+  const applyHint = React.useCallback((value) => {
+    hintRef.current = value
+    setHint(value)
+  }, [])
+
+  const cancelIdle = React.useCallback(() => {
+    if (idleRef.current !== undefined) {
+      clearTimeout(idleRef.current)
+      idleRef.current = undefined
+    }
+  }, [])
+
+  const requestHint = React.useCallback(async (id) => {
+    if (call === undefined || hintBlockedRef.current) return
+    const engine = engineOf(id)
+    if (engine === undefined || engine.alive === false) return
+    const command = terminalLineUnderCursor(engine.term)
+    if (command.trim() === '') {
+      applyHint(undefined)
+      return
+    }
+    const token = hintTokenRef.current + 1
+    hintTokenRef.current = token
+    hintAbortRef.current?.abort()
+    const controller = new AbortController()
+    hintAbortRef.current = controller
+    applyHint({ id, text: '', busy: true })
+    try {
+      const payload = await call(
+        'termSuggest',
+        {
+          sessionId,
+          id,
+          command,
+          profile: engine.profile ?? '',
+          cwd: engine.cwd ?? '',
+          output: terminalScreenTail(engine.term),
+        },
+        controller.signal,
+      )
+      if (controller.signal.aborted || hintTokenRef.current !== token || engineOf(id) !== engine) return
+      const text = typeof payload.text === 'string' ? payload.text : ''
+      applyHint(text === '' ? undefined : { id, text, busy: false })
+    } catch {
+      if (controller.signal.aborted) return
+      // A missing model or a broken provider is not an input error: asking on
+      // every pause would spam a dead route, so block until the tab changes.
+      hintBlockedRef.current = true
+      if (hintTokenRef.current === token) applyHint(undefined)
+    }
+  }, [call, sessionId, applyHint])
+
+  const scheduleHint = React.useCallback(
+    (id) => {
+      cancelIdle()
+      applyHint(undefined)
+      idleRef.current = setTimeout(() => {
+        idleRef.current = undefined
+        void requestHint(id)
+      }, TERMINAL_SUGGEST_IDLE_MS)
+    },
+    [cancelIdle, applyHint, requestHint],
+  )
+
+  const acceptHint = React.useCallback(() => {
+    const current = hintRef.current
+    if (current === undefined || current.busy === true) return
+    cancelIdle()
+    applyHint(undefined)
+    // The prediction lands as ordinary typed text: the shell echoes it and the
+    // user still runs it with Enter, so nothing is executed implicitly.
+    if (call !== undefined && current.text !== '') {
+      call('termWrite', { sessionId, id: current.id, data: current.text }).catch(() => {})
+    }
+  }, [call, sessionId, cancelIdle, applyHint])
+
+  React.useEffect(() => {
+    smartRef.current = {
+      accept: () => acceptHint(),
+      dismiss: () => {
+        cancelIdle()
+        applyHint(undefined)
+      },
+    }
+  }, [acceptHint, cancelIdle, applyHint])
+
+  // A new tab has a different shell and screen: forget the block and the hint.
+  React.useEffect(() => {
+    hintBlockedRef.current = false
+    cancelIdle()
+    applyHint(undefined)
+  }, [activeId, cancelIdle, applyHint])
+
+  // Pixel position of the caret cell: the fit addon divides the host exactly
+  // into cols×rows cells, so cell size needs no private renderer internals.
+  const ghostPosition = React.useCallback((id) => {
+    const engine = engineOf(id)
+    const host = hostsRef.current.get(id)
+    if (engine === undefined || host === undefined) return undefined
+    if (host.clientWidth < 8 || host.clientHeight < 8) return undefined
+    const term = engine.term
+    // The screen padds the xterm by 2px 4px; the caret cell starts there.
+    const cellW = host.clientWidth / Math.max(1, term.cols)
+    const cellH = host.clientHeight / Math.max(1, term.rows)
+    const buffer = term.buffer.active
+    return { x: 4 + buffer.cursorX * cellW, y: 2 + buffer.cursorY * cellH, cellH, hostWidth: host.clientWidth }
   }, [])
 
   const startReader = React.useCallback((id) => {
@@ -6755,6 +6929,9 @@ function PtyPanel({ sessionId, call, height }) {
             }
           }
           offsetsRef.current.set(id, payload.offset)
+          // Fresh output repaints the screen: a ghost drawn against the old
+          // grid would sit on the wrong cells, so let it go.
+          if (payload.data !== '' && hintRef.current?.id === id) applyHint(undefined)
           if (payload.alive === false) {
             markDead(id, payload.exitCode)
             return
@@ -6766,7 +6943,7 @@ function PtyPanel({ sessionId, call, height }) {
         }
       }
     })()
-  }, [call, markDead, sessionId])
+  }, [call, markDead, sessionId, applyHint])
 
   // Attach an xterm to every terminal that does not have one yet, then start
   // its reader. Dead terminals from a previous page keep their scrollback.
@@ -6793,7 +6970,7 @@ function PtyPanel({ sessionId, call, height }) {
         })
         const fit = new libs.FitAddon()
         term.loadAddon(fit)
-        enginesRef.current.set(item.id, { term, fit })
+        enginesRef.current.set(item.id, { term, fit, profile: item.profile, cwd: item.cwd, alive: item.alive !== false })
         term.open(host)
         host.setAttribute('data-pty-id', item.id)
         observerRef.current?.observe(host)
@@ -6811,11 +6988,35 @@ function PtyPanel({ sessionId, call, height }) {
           const engine = engineOf(item.id)
           if (engine !== undefined && engine.mute === true) return
           if (call !== undefined) call('termWrite', { sessionId, id: item.id, data }).catch(() => {})
+          // Enter runs the command: the line under the caret is about to
+          // vanish, so predicting on it would suggest a finished command.
+          if (data.includes('\r') || data.includes('\n')) {
+            cancelIdle()
+            applyHint(undefined)
+          } else {
+            scheduleHint(item.id)
+          }
+        })
+        // Tab accepts the prediction, Escape drops it; every other key goes to
+        // xterm untouched. The handler reads live state through the mirror.
+        term.attachCustomKeyEventHandler((event) => {
+          if (event.type !== 'keydown') return true
+          const current = hintRef.current
+          if (event.key === 'Tab' && current !== undefined && current.busy !== true) {
+            event.preventDefault()
+            smartRef.current.accept()
+            return false
+          }
+          if (event.key === 'Escape' && current !== undefined) {
+            event.preventDefault()
+            smartRef.current.dismiss()
+            return false
+          }
+          return true
         })
         term.onResize((size) => {
           if (call !== undefined) call('termResize', { sessionId, id: item.id, cols: size.cols, rows: size.rows }).catch(() => {})
         })
-        enginesRef.current.set(item.id, { term, fit })
         if (item.alive !== false) startReader(item.id)
         // Pull the backlog the reader may already have missed.
         if (call !== undefined && item.alive !== false && (offsetsRef.current.get(item.id) ?? 0) === 0) {
@@ -6837,7 +7038,7 @@ function PtyPanel({ sessionId, call, height }) {
     return () => {
       cancelled = true
     }
-  }, [terminals, startReader, call, sessionId])
+  }, [terminals, startReader, call, sessionId, scheduleHint, cancelIdle, applyHint])
 
   // Keep the active terminal fitted to the panel: height drags and window
   // resizes both land here.
@@ -6918,7 +7119,9 @@ function PtyPanel({ sessionId, call, height }) {
   React.useEffect(() => () => {
     for (const controller of readersRef.current.values()) controller.abort()
     readersRef.current.clear()
-  }, [])
+    cancelIdle()
+    hintAbortRef.current?.abort()
+  }, [cancelIdle])
 
   React.useEffect(() => {
     if (!profileMenu) return undefined
@@ -6995,19 +7198,52 @@ function PtyPanel({ sessionId, call, height }) {
             { className: 'dsh-ide-pty-blank' },
             profiles === undefined ? menuText('Загрузка…', 'Loading…') : menuText('Создайте терминал кнопкой «+»', 'Create a terminal with “+”'),
           )
-        : visible.map((item) => h(
-            'div',
-            {
-              key: item.id,
-              hidden: item.id !== activeId,
-              className: 'dsh-ide-pty-screen',
-              onClick: () => engineOf(item.id)?.term.focus(),
-              ref: (node) => {
-                if (node === null) hostsRef.current.delete(item.id)
-                else hostsRef.current.set(item.id, node)
+        : visible.map((item) => {
+            const shown = hint !== undefined && hint.id === item.id ? hint : undefined
+            const position = shown !== undefined ? ghostPosition(item.id) : undefined
+            return h(
+              'div',
+              {
+                key: item.id,
+                hidden: item.id !== activeId,
+                className: 'dsh-ide-pty-screen',
+                onClick: () => engineOf(item.id)?.term.focus(),
+                ref: (node) => {
+                  if (node === null) hostsRef.current.delete(item.id)
+                  else hostsRef.current.set(item.id, node)
+                },
               },
-            },
-          )),
+              position !== undefined && shown !== undefined && shown.busy !== true
+                ? h(
+                    'span',
+                    {
+                      className: 'dsh-ide-pty-ghost',
+                      style: {
+                        left: `${position.x}px`,
+                        top: `${position.y}px`,
+                        lineHeight: `${position.cellH}px`,
+                        maxWidth: `${Math.max(60, position.hostWidth - position.x - 8)}px`,
+                      },
+                    },
+                    shown.text,
+                  )
+                : null,
+              position !== undefined && shown !== undefined
+                ? h('button', {
+                    type: 'button',
+                    className: `dsh-ide-pty-bulb${shown.busy === true ? ' dsh-ide-pty-bulb-busy' : ''}`,
+                    style: { left: `${position.x}px`, top: `${position.y}px` },
+                    title: shown.busy === true
+                      ? menuText('Предугадывание…', 'Predicting…')
+                      : menuText('Вставить предсказание (Tab), Esc — убрать', 'Insert prediction (Tab), Esc to dismiss'),
+                    onClick: (event) => {
+                      event.stopPropagation()
+                      smartRef.current.accept()
+                    },
+                  }, '💡')
+                : null,
+            )
+          }),
     ),
     profileMenu
       ? h(
@@ -13949,6 +14185,11 @@ function IdeBody(props) {
 .dsh-ide-pty-profiles { position:absolute; z-index:40; top:24px; left:6px; min-width:180px; padding:4px; border:1px solid var(--ide-border); border-radius:7px; background:var(--ide-panel-2); box-shadow:0 10px 28px rgba(0,0,0,.35); }
 .dsh-ide-pty-profile { display:block; width:100%; padding:5px 9px; border:0; border-radius:5px; background:transparent; color:var(--ide-text); font:12px/1.4 var(--dsw-font-family,inherit); text-align:left; cursor:pointer; }
 .dsh-ide-pty-profile:hover { background:var(--ide-active); }
+.dsh-ide-pty-bulb { position:absolute; z-index:6; width:20px; height:20px; margin-left:-10px; margin-top:-24px; padding:0; border:1px solid var(--ide-border); border-radius:50%; background:var(--ide-panel); color:var(--ide-fg); font-size:11px; line-height:18px; text-align:center; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.4); }
+.dsh-ide-pty-bulb:hover { background:var(--ide-hover); }
+.dsh-ide-pty-bulb-busy { cursor:progress; opacity:.65; animation:dsh-ide-pty-pulse 1.2s ease-in-out infinite; }
+@keyframes dsh-ide-pty-pulse { 50% { opacity:.3; } }
+.dsh-ide-pty-ghost { position:absolute; z-index:5; color:color-mix(in srgb, var(--ide-fg) 38%, transparent); font:12.5px/1 Consolas, "Courier New", monospace; white-space:pre; overflow:hidden; pointer-events:none; user-select:none; }
 .dsh-ide-empty { position:absolute; inset:0; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:6px; text-align:center; padding:16px; pointer-events:none; z-index:2; }
 .dsh-ide-watermark { font:700 72px/1 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.02em; color:var(--ide-text);

@@ -74,6 +74,7 @@ const ROUTES = [
   'termKill',
   'termList',
   'termRead',
+  'termSuggest',
   'catalog',
   'credentials',
   'prefs',
