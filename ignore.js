@@ -1,11 +1,11 @@
-// Two scopes, matching Cursor's convention:
-// `.cursorignore`          — never send these files to a model;
-// `.cursorindexingignore`  — keep them out of content search, but an explicit
+// Two scopes, matching the reference editor's convention:
+// `.dshideignore`          — never send these files to a model;
+// `.dshideindexingignore`  — keep them out of content search, but an explicit
 //                            action on the file is still allowed.
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 
-export const IGNORE_FILES = ['.cursorignore', '.cursorindexingignore']
+export const IGNORE_FILES = ['.dshideignore', '.dshideindexingignore']
 export const MAX_IGNORE_BYTES = 64 * 1024
 
 function escape(value) {
@@ -110,14 +110,14 @@ async function readIgnore(file) {
 }
 
 /**
- * Reads both files from the workspace root. `blocked` covers `.cursorignore`
- * only; `skipped` adds `.cursorindexingignore` for content search.
+ * Reads both files from the workspace root. `blocked` covers `.dshideignore`
+ * only; `skipped` adds `.dshideindexingignore` for content search.
  */
 export async function loadIgnore(root) {
   const base = path.resolve(String(root))
   const [blockedText, skippedText] = await Promise.all([
-    readIgnore(path.join(base, '.cursorignore')),
-    readIgnore(path.join(base, '.cursorindexingignore')),
+    readIgnore(path.join(base, '.dshideignore')),
+    readIgnore(path.join(base, '.dshideindexingignore')),
   ])
   const blocked = compileIgnore(parseIgnore(blockedText))
   const indexed = compileIgnore(parseIgnore(skippedText))

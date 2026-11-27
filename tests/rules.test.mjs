@@ -22,18 +22,18 @@ test('the chain runs from the workspace root to the file folder', async () => {
   try {
     await project.write('AGENTS.md', 'корневые правила\n')
     await project.write('src/CLAUDE.md', 'правила src\n')
-    await project.write('src/deep/.cursor/rules/style.mdc', 'стиль deep\n')
+    await project.write('src/deep/.dshide/rules/style.mdc', 'стиль deep\n')
     await project.write('src/deep/app.js', 'const a = 1\n')
     await project.write('src/other/AGENTS.md', 'чужая папка\n')
     const found = await discoverRules({ root: project.root, target: path.join(project.root, 'src/deep/app.js') })
     assert.equal(found.file, 'src/deep/app.js')
     assert.deepEqual(
       found.rules.map((rule) => rule.path),
-      ['AGENTS.md', 'src/CLAUDE.md', 'src/deep/.cursor/rules/style.mdc'],
+      ['AGENTS.md', 'src/CLAUDE.md', 'src/deep/.dshide/rules/style.mdc'],
     )
     assert.deepEqual(
       found.rules.map((rule) => rule.dir),
-      ['.', 'src', 'src/deep/.cursor/rules'],
+      ['.', 'src', 'src/deep/.dshide/rules'],
     )
     assert.equal(found.truncated, false)
   } finally {
@@ -89,7 +89,7 @@ test('the total budget stops later rules and keeps the prompt honest', async () 
     const chunk = 'b'.repeat(30 * 1024)
     await project.write('AGENTS.md', chunk)
     await project.write('src/CLAUDE.md', chunk)
-    await project.write('src/deep/.cursorrules', chunk)
+    await project.write('src/deep/.dshiderules', chunk)
     await project.write('src/deep/app.js', 'x\n')
     const found = await discoverRules({ root: project.root, target: path.join(project.root, 'src/deep/app.js') })
     const chosen = chooseRules(found.rules)
@@ -98,7 +98,7 @@ test('the total budget stops later rules and keeps the prompt honest', async () 
     const prompt = rulePrompt(chosen)
     assert.match(prompt, /AGENTS\.md/)
     assert.match(prompt, /src\/CLAUDE\.md/)
-    assert.doesNotMatch(prompt, /src\/deep\/\.cursorrules/)
+    assert.doesNotMatch(prompt, /src\/deep\/\.dshiderules/)
   } finally {
     await project.cleanup()
   }
@@ -108,12 +108,12 @@ test('the applied text reaches the prompt without the skipped one', async () => 
   const project = await workspace()
   try {
     await project.write('AGENTS.md', 'Пиши тесты.\n')
-    await project.write('src/.cursorrules', 'Не трогай README.\n')
+    await project.write('src/.dshiderules', 'Не трогай README.\n')
     await project.write('src/app.js', 'x\n')
     const found = await discoverRules({ root: project.root, target: path.join(project.root, 'src/app.js') })
     const prompt = rulePrompt(chooseRules(found.rules))
     assert.match(prompt, /### AGENTS\.md\nПиши тесты\./)
-    assert.match(prompt, /### src\/\.cursorrules\nНе трогай README\./)
+    assert.match(prompt, /### src\/\.dshiderules\nНе трогай README\./)
   } finally {
     await project.cleanup()
   }

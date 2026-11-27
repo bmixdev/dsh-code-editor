@@ -2,11 +2,11 @@
  * Tab mechanics: the parts of an inline-suggestion engine that decide *where*
  * the answer lands in the buffer and whether it is worth showing at all.
  *
- * The behaviour of Cursor 3.23.23's Tab was measured statically (see
- * `docs/cursor-tab-mechanics.md`); this module is an independent
+ * The behaviour of the reference editor's Tab (build 3.23.23) was measured statically (see
+ * `docs/reference-editor-tab-mechanics.md`); this module is an independent
  * implementation of that behaviour, not a copy of its code. It lives on the
  * host because the host already receives the whole buffer, which is what an
- * edit plan needs: Cursor derives the same range from its server response
+ * edit plan needs: the reference editor derives the same range from its server response
  * (`range_to_replace`) and from the model's own body text.
  *
  * Everything here is pure: no model calls, no file system, no editor.
@@ -47,7 +47,7 @@ export function trailingBlankLines(lines) {
 /**
  * Whether a suggestion only restates text that is already at the cursor.
  *
- * Cursor normalises the answer's trailing line endings so they match the source
+ * The reference editor normalises the answer's trailing line endings so they match the source
  * plus at most one blank line, then compares the two line lists from the end.
  * Trimming both lists first reaches the same verdict without mutating either.
  */

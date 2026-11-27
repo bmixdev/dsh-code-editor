@@ -1,5 +1,5 @@
 /**
- * Whole-file edit suggestions, the part of Tab that Cursor calls "next edit".
+ * Whole-file edit suggestions, the part of Tab that the reference editor calls "next edit".
  *
  * A cursor continuation alone only appends text at the caret. When the answer
  * changes the shape of the code — `main(f)` typed below a `def main():` that

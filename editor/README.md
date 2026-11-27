@@ -1,8 +1,8 @@
 # Редактор кода для DeepSeek Harness
 
 `@local/dsh-code-editor` — вспомогательный бандл этого репозитория (папка
-`editor/`). Главный плагин — [`@local/dsh-ide`](../README.md): среда в стиле
-VS Code с деревом, вкладками и быстрым поиском.
+`editor/`). Главный плагин — [`@local/dsh-ide`](../README.md): классический
+редактор кода с деревом, вкладками и быстрым поиском.
 
 Плагин добавляет в правую панель DeepSeek Harness вкладку с редактором
 [Monaco](https://microsoft.github.io/monaco-editor/): дерево файлов рабочей

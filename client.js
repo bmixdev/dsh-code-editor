@@ -1,7 +1,7 @@
 /**
  * Client half of `@local/dsh-ide`.
  *
- * A VS Code-shaped editor that lives in the right sidebar and brings its own
+ * A classic code-editor that lives in the right sidebar and brings its own
  * explorer: it lists the session workspace itself, keeps several files open as
  * tabs (one Monaco model each, so undo and cursor survive a tab switch) and
  * does not depend on the built-in file preview plugin for anything but the way
@@ -581,7 +581,7 @@ window.__ModuleLoader__.load({
     }
 
     // Small stroke icons for the explorer toolbar, so the buttons read like
-    // the VS Code explorer instead of relying on font glyphs.
+    // the reference file explorer instead of relying on font glyphs.
     function ToolbarIcon({ kind }) {
       const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-width': 1.3, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }
       const paths =
@@ -624,8 +624,8 @@ window.__ModuleLoader__.load({
 
     /**
      * Review of one assistant turn: the side-by-side comparison plus the list of
-     * files that turn touched. Each file carries the same two decisions Cursor
-     * offers (keep / undo), and the header applies them to the whole turn.
+     * files that turn touched. Each file carries the same two decisions the
+     * reference editor offers (keep / undo), and the header applies them to the whole turn.
      *
      * A component rather than inline JSX: the editor surface of `IdeBody` is
      * already the largest expression in this file.
@@ -1419,7 +1419,7 @@ function describeScmError(cause) {
           case 'secret':
             return 'похож на секрет'
           case 'ignored':
-            return 'исключено .cursorignore'
+            return 'исключено .dshideignore'
           case 'too-large':
             return 'больше лимита'
           case 'empty':
@@ -2464,6 +2464,9 @@ function describeScmError(cause) {
       )
     }
 
+    /** Outline glyphs: one letter per symbol kind; the row color comes from CSS. */
+    const STRUCTURE_GLYPHS = { class: 'C', function: 'ƒ', method: 'm', interface: 'I', heading: '#', rule: '#', atrule: '@' }
+
     /**
      * Workspace explorer. Folders load on first expand; the filter box switches
      * the view to a flat, fuzzy list served by the `files` route so a match in
@@ -2478,6 +2481,9 @@ function describeScmError(cause) {
       const onInsertReference = props.onInsertReference
       const searchOpen = props.searchOpen === true
       const onCloseSearch = props.onCloseSearch
+      const structureOpen = props.structureOpen === true
+      const structure = props.structure === undefined ? { phase: 'idle', language: '', symbols: [], error: '' } : props.structure
+      const onCloseStructure = props.onCloseStructure
       const changesOpen = props.changesOpen === true
       const changes = Array.isArray(props.changes) ? props.changes : []
       const onCloseChanges = props.onCloseChanges
@@ -2500,7 +2506,7 @@ function describeScmError(cause) {
       const [reloadKey, setReloadKey] = React.useState(0)
       const [rowMenu, setRowMenu] = React.useState(undefined)
       const [moreMenu, setMoreMenu] = React.useState(undefined)
-      // Inline "new file / new folder" row, the way the VS Code explorer does it:
+      // Inline "new file / new folder" row, the way a classic file explorer does it:
       // the name is typed straight into the tree instead of a modal dialog.
       const [draft, setDraft] = React.useState(undefined)
       const [draftError, setDraftError] = React.useState('')
@@ -2570,7 +2576,7 @@ function describeScmError(cause) {
         return () => window.clearTimeout(timer)
       }, [searchOpen])
       // New files and folders land in the selected folder, or next to the
-      // selected file, exactly like the VS Code explorer.
+      // selected file, exactly like a classic file explorer.
       const targetDirectory = () => {
         if (selected === undefined || typeof selected.path !== 'string') return ''
         return selected.type === 'directory' ? selected.path : dirName(selected.path)
@@ -2729,7 +2735,7 @@ function describeScmError(cause) {
         if (typeof sessionId === 'string' && sessionId !== '') void load('')
       }, [sessionId, hidden, load])
 
-      // Refreshing keeps the expanded folders open, the way VS Code does: only
+      // Refreshing keeps the expanded folders open, the way a classic explorer does: only
       // the listings are reloaded, not the tree layout.
       const firstRefresh = React.useRef(true)
       React.useEffect(() => {
@@ -2795,10 +2801,19 @@ function describeScmError(cause) {
           .slice(0, 200)
       }, [needle, flat])
 
+      // Height of the outline section below the tree; the splitter between
+      // them is dragged like a classic sidebar's section handle.
+      // This state lives with the other hooks on purpose: the changes and
+      // search branches below return early, and a hook after those returns
+      // would disappear from the render whenever either pane opens — React
+      // then kills the whole subtree with "Rendered fewer hooks than
+      // expected" until the page is reloaded.
+      const [structureHeight, setStructureHeight] = React.useState(300)
+
       const rows = []
 
       // The inline "new file / new folder" row. Enter accepts, Escape cancels,
-      // and losing focus cancels like the VS Code explorer does.
+      // and losing focus cancels like a classic explorer does.
       const draftRow = (directory, depth) => {
         if (draft === undefined) return null
         const submit = async () => {
@@ -3382,6 +3397,58 @@ function describeScmError(cause) {
         )
       }
 
+      // Splitter state is declared with the other hooks above (see the note
+      // there): keeping it below the early returns would change the hook count
+      // between renders and crash the pane.
+      const startStructureResize = (event) => {
+        event.preventDefault()
+        const startY = event.clientY
+        const startHeight = structureHeight
+        const move = (moveEvent) => {
+          const next = startHeight + (startY - moveEvent.clientY)
+          setStructureHeight(Math.max(120, Math.min(next, window.innerHeight - 200)))
+        }
+        const stop = () => {
+          window.removeEventListener('pointermove', move)
+          window.removeEventListener('pointerup', stop)
+          window.removeEventListener('pointercancel', stop)
+          document.body.style.cursor = ''
+        }
+        window.addEventListener('pointermove', move)
+        window.addEventListener('pointerup', stop)
+        window.addEventListener('pointercancel', stop)
+        document.body.style.cursor = 'row-resize'
+      }
+      const structureRows = (nodes, depth) =>
+        nodes.map((node, index) =>
+          h(
+            'div',
+            { key: `${depth}-${index}`, className: 'dsh-ide-structure-row', role: 'listitem' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-ide-search-hit dsh-ide-structure-hit',
+                style: { paddingLeft: `${depth * 12 + 2}px` },
+                title: `${node.name} · строка ${node.line}`,
+                onClick: () => {
+                  if (typeof onOpenFile === 'function') onOpenFile(activePath, node.line)
+                },
+              },
+              h(
+                'span',
+                { className: 'dsh-ide-structure-main' },
+                h('span', { className: `dsh-ide-structure-kind dsh-ide-structure-${node.kind}` }, STRUCTURE_GLYPHS[node.kind] ?? '·'),
+                h('span', { className: 'dsh-ide-structure-name' }, node.name),
+                h('span', { className: 'dsh-ide-structure-line' }, String(node.line)),
+              ),
+              typeof node.comment === 'string' && node.comment !== ''
+                ? h('span', { className: 'dsh-ide-structure-comment', title: node.comment }, node.comment)
+                : null,
+            ),
+            depth < 12 && Array.isArray(node.children) && node.children.length > 0 ? structureRows(node.children, depth + 1) : null,
+          ),
+        )
       return h(
         'div',
         { className: 'dsh-ide-explorer' },
@@ -3486,6 +3553,59 @@ function describeScmError(cause) {
           }),
         ),
         h('div', { className: 'dsh-ide-tree', role: 'tree' }, rows),
+        structureOpen
+          ? h('div', {
+              className: 'dsh-ide-structure-resize',
+              title: 'Потяните, чтобы изменить высоту панели',
+              onPointerDown: startStructureResize,
+            })
+          : null,
+        structureOpen
+          ? h(
+              'div',
+              { className: 'dsh-ide-structure', style: { height: `${structureHeight}px` } },
+              h(
+                'div',
+                { className: 'dsh-ide-explorer-head' },
+                h('span', { className: 'dsh-ide-explorer-title' }, 'СТРУКТУРА'),
+                h(
+                  'span',
+                  { className: 'dsh-ide-explorer-actions' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-icon-button',
+                      title: 'Закрыть структуру',
+                      'aria-label': 'Закрыть структуру',
+                      onClick: () => {
+                        if (typeof onCloseStructure === 'function') onCloseStructure()
+                      },
+                    },
+                    '✕',
+                  ),
+                ),
+              ),
+              h(
+                'div',
+                { className: 'dsh-ide-search-status', title: activePath },
+                `${baseName(activePath)}${structure.phase === 'pending' && structure.language !== '' ? ' · обновляю…' : ''}`,
+              ),
+              h(
+                'div',
+                { className: 'dsh-ide-tree dsh-ide-structure-list', role: 'list' },
+                activePath === ''
+                  ? [h('div', { key: 'structure-no-file', className: 'dsh-ide-tree-empty' }, 'Откройте файл — здесь появится его структура')]
+                  : structure.phase === 'failed'
+                    ? [h('div', { key: 'structure-error', className: 'dsh-ide-tree-error' }, structure.error)]
+                    : structure.language === ''
+                      ? [h('div', { key: 'structure-unsupported', className: 'dsh-ide-tree-empty' }, 'Структура для этого типа файла не поддерживается (пока: JS, TS, Python, Markdown, CSS)')]
+                      : structure.symbols.length === 0
+                        ? [h('div', { key: 'structure-empty', className: 'dsh-ide-tree-empty' }, structure.phase === 'ready' ? 'Символов в файле нет' : 'Разбираю…')]
+                        : structureRows(structure.symbols, 0),
+              ),
+            )
+          : null,
         rowMenu === undefined ? null : h(TabContextMenu, { menu: rowMenu, items: rowMenuItems(rowMenu), onClose: () => setRowMenu(undefined) }),
         moreMenu === undefined ? null : h(TabContextMenu, { menu: moreMenu, items: moreMenuItems, onClose: () => setMoreMenu(undefined) }),
       )
@@ -3506,7 +3626,7 @@ function describeScmError(cause) {
 
     // -------------------------------------------------------------- tab strip
 
-    // The menu bar mirrors VS Code's title bar: a row of top-level menus whose
+    // The menu bar mirrors a classic editor's title bar: a row of top-level menus whose
     // dropdowns list commands. Items that the IDE cannot honour stay visible but
     // disabled, with the reason in the tooltip, so the gap is explicit.
     function MenuBar({ menus, openId, onOpen }) {
@@ -4871,7 +4991,7 @@ function describeScmError(cause) {
         rule.reason === 'limit'
           ? 'пропущено: общий лимит'
           : rule.reason === 'ignored'
-            ? 'исключено .cursorignore'
+            ? 'исключено .dshideignore'
             : 'пропущено: больше 32 КиБ'
       return h(
         'div',
@@ -4896,7 +5016,7 @@ function describeScmError(cause) {
               )
             : null,
           view.phase === 'ready' && view.rules.length === 0
-            ? h('div', { className: 'dsh-ide-rules-note' }, 'Правил не найдено: AGENTS.md, CLAUDE.md, .cursorrules и .cursor/rules/*.mdc отсутствуют на пути к файлу.')
+            ? h('div', { className: 'dsh-ide-rules-note' }, 'Правил не найдено: AGENTS.md, CLAUDE.md, .dshiderules и .dshide/rules/*.mdc отсутствуют на пути к файлу.')
             : null,
           view.phase === 'ready' && view.rules.length > 0
             ? h(
@@ -6561,6 +6681,12 @@ function IdeBody(props) {
       /** Host checkpoints of assistant turns: `{phase, available, turns, error}`. */
       const [assistant, setAssistant] = React.useState({ phase: 'idle', available: true, turns: [], error: '' })
       const [changesOpen, setChangesOpen] = React.useState(false)
+      const [structureOpen, setStructureOpen] = React.useState(false)
+      /** Outline of the active file: `{phase, language, symbols, error}`. */
+      const [structure, setStructure] = React.useState({ phase: 'idle', language: '', symbols: [], error: '' })
+      // Bumped on every «open at line» click: an already-active tab makes
+      // openFile a state no-op, and the reveal effect only runs when a dep changes.
+      const [revealNonce, setRevealNonce] = React.useState(0)
       /** Per-file decision on an assistant turn, keyed `seq:index`. */
       const [assistantWork, setAssistantWork] = React.useState({})
       /** Side-by-side comparison over the editor: `{phase, seq, index, path, display, before, after, language, error}`. */
@@ -6640,7 +6766,7 @@ function IdeBody(props) {
       const [createRequest, setCreateRequest] = React.useState(undefined)
       const [catalog, setCatalog] = React.useState(undefined)
       const [tabMenu, setTabMenu] = React.useState(undefined)
-  // The output panel mirrors the VS Code one: "Trajectory" explains every
+  // The output panel mirrors a classic output panel: "Trajectory" explains every
   // completion request, "Chat" shows the exact prompt and answer.
   const [panel, setPanel] = React.useState(undefined)
   const [panelHeight, setPanelHeight] = React.useState(190)
@@ -7593,9 +7719,9 @@ function IdeBody(props) {
       //
       // The Host does the reasoning: it asks the model, plans a concrete edit
       // (an insertion or a small replacement) and filters it through the
-      // bad-case checks ported from Cursor's `cppBadHeuristics`. The client only
+      // bad-case checks ported from the reference editor's `cppBadHeuristics`. The client only
       // draws that plan, records whether it was accepted or rejected, and keeps
-      // the histories those checks need. See docs/cursor-tab-mechanics.md.
+      // the histories those checks need. See docs/reference-editor-tab-mechanics.md.
       // ---------------------------------------------------------------------
 
       const remember = (map, key, text) => {
@@ -7613,7 +7739,7 @@ function IdeBody(props) {
         if (editor !== undefined && decorations.length > 0) editor.deltaDecorations(decorations, [])
       }
 
-      // A replacement hides text that the suggestion rewrites. Cursor paints
+      // A replacement hides text that the suggestion rewrites. The reference editor paints
       // the part it drops; the same marker keeps the edit honest here.
       const decorateRemoved = (plan, model) => {
         clearRemovedDecoration()
@@ -7999,7 +8125,7 @@ function IdeBody(props) {
           }
           if (payload.text === '' && edits.length === 0) {
             // A silent empty answer is the worst failure mode: an explicit
-            // request says why, an automatic one stays quiet like VS Code.
+            // request says why, an automatic one stays quiet like a classic editor.
             if (explicit && typeof payload.reason === 'string' && payload.reason !== '') {
               setStatus({ kind: 'error', message: payload.reason })
             }
@@ -8351,7 +8477,7 @@ function IdeBody(props) {
         const editor = runtime.current.editor
         const model = editor === undefined ? null : editor.getModel()
         const tabKey = model === null ? '' : runtime.current.modelTabs.get(model.uri.toString())
-        // Cursor remembers what the user threw away and refuses to offer it again
+        // The reference editor remembers what the user threw away and refuses to offer it again
         // for a while; the Host applies the threshold, the client keeps history.
         remember(runtime.current.tab.rejections, tabKey, plan.insertText)
         const ms = Number(tabPref('snoozeAfterRejectMs', 800))
@@ -10200,7 +10326,7 @@ function IdeBody(props) {
       }
 
       // The explorer pane is far too narrow for two columns, so the comparison
-      // opens over the editor the way Cursor shows a change before accepting it.
+      // opens over the editor the way the reference editor shows a change before accepting it.
       // A Git comparison takes precedence; both shells share this one editor.
       const activeDiff = scmDiff !== undefined ? scmDiff : diffView
       const diffKey =
@@ -10299,7 +10425,64 @@ function IdeBody(props) {
         }
         setCursor({ line, column: 1 })
         editor.focus()
-      }, [activeKey, tabs, symbolView, testsView])
+      }, [activeKey, tabs, symbolView, testsView, revealNonce])
+
+      // The outline follows the live buffer: it re-runs on a tab switch and on
+      // every edit, debounced like the file search, and the previous request is
+      // aborted so a slow parse cannot answer a file the user already left.
+      React.useEffect(() => {
+        if (!structureOpen) return undefined
+        const entry = tabs.find((candidate) => candidate.key === activeKey)
+        if (entry === undefined) {
+          setStructure({ phase: 'idle', language: '', symbols: [], error: '' })
+          return undefined
+        }
+        const editor = runtime.current.editor
+        if (editor === undefined) return undefined
+        const controller = new AbortController()
+        let timer = 0
+        const run = () => {
+          const model = editor.getModel()
+          if (model === null || runtime.current.modelTabs.get(model.uri.toString()) !== entry.key) return
+          const text = model.getValue()
+          if (text === '') {
+            // `empty` keeps the panel from calling an empty JS file unsupported.
+            setStructure({ phase: 'ready', language: 'empty', symbols: [], error: '' })
+            return
+          }
+          setStructure((previous) => ({ ...previous, phase: 'pending', error: '' }))
+          void call('structure', { sessionId, path: entry.path, text }, controller.signal)
+            .then((payload) => {
+              if (controller.signal.aborted) return
+              setStructure({
+                phase: 'ready',
+                language: typeof payload?.language === 'string' ? payload.language : '',
+                symbols: Array.isArray(payload?.symbols) ? payload.symbols : [],
+                error: '',
+              })
+            })
+            .catch((cause) => {
+              if (controller.signal.aborted) return
+              if (cause !== null && typeof cause === 'object' && cause.code === 'cancelled') return
+              setStructure({ phase: 'failed', language: '', symbols: [], error: describeError(cause) })
+            })
+        }
+        timer = window.setTimeout(run, 300)
+        const content = editor.onDidChangeModelContent(() => {
+          window.clearTimeout(timer)
+          timer = window.setTimeout(run, 300)
+        })
+        const swap = editor.onDidChangeModel(() => {
+          window.clearTimeout(timer)
+          timer = window.setTimeout(run, 0)
+        })
+        return () => {
+          window.clearTimeout(timer)
+          content.dispose()
+          swap.dispose()
+          controller.abort()
+        }
+      }, [structureOpen, activeKey, sessionId])
 
       React.useEffect(() => {
         if (tab === undefined || typeof tab.id !== 'string') return
@@ -10607,7 +10790,7 @@ function IdeBody(props) {
       }
 
       // Creating a file or a folder starts an inline row inside the explorer,
-      // the way VS Code does it: the name is typed in place, not in a dialog.
+      // the way a classic editor does it: the name is typed in place, not in a dialog.
       const createNonce = React.useRef(0)
       const beginCreate = (type, directory = '') => {
         createNonce.current += 1
@@ -11116,7 +11299,7 @@ function IdeBody(props) {
         h(
           'div',
           { className: 'dsh-ide-body' },
-          // VS Code's activity bar: one narrow rail, the panel toggles live there,
+          // a classic activity bar: one narrow rail, the panel toggles live there,
           // so the explorer can be hidden without leaving the editor.
           h(
             'div',
@@ -11133,6 +11316,7 @@ function IdeBody(props) {
                   setShowTree(true)
                   setChangesOpen(false)
                   setSearchOpen(false)
+                  setStructureOpen(false)
                 },
               },
               h(ScmBranchIcon, { size: 18 }),
@@ -11175,6 +11359,7 @@ function IdeBody(props) {
                   setShowTree(true)
                   setChangesOpen(false)
                   setSearchOpen(true)
+                  setStructureOpen(false)
                 },
               },
               h('span', { className: 'dsh-ide-activity-glyph' }, '🔍'),
@@ -11190,10 +11375,38 @@ function IdeBody(props) {
                   setExplorerMode('files')
                   setShowTree(true)
                   setSearchOpen(false)
+                  setStructureOpen(false)
                   setChangesOpen((open) => !open)
                 },
               },
               h('span', { className: 'dsh-ide-activity-glyph' }, '🕘'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: `dsh-ide-activity-button${structureOpen ? ' dsh-ide-activity-button-active' : ''}`,
+                title: 'Структура активного файла',
+                'aria-label': 'Структура активного файла',
+                onClick: () => {
+                  setExplorerMode('files')
+                  setShowTree(true)
+                  setChangesOpen(false)
+                  setSearchOpen(false)
+                  setStructureOpen((open) => !open)
+                },
+              },
+              h(
+                'svg',
+                { width: '18', height: '18', viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+                h('path', {
+                  fill: 'none',
+                  stroke: 'currentColor',
+                  strokeWidth: '1.3',
+                  // Three indented lines: the outline of a document.
+                  d: 'M3 3.5h8M5 7.5h7M7 11.5h6',
+                }),
+              ),
             ),
             h('span', { className: 'dsh-ide-activity-spacer' }),
             h(
@@ -11287,6 +11500,9 @@ function IdeBody(props) {
                   onOpenFile: (path, line) => {
                     if (typeof line === 'number') {
                       runtime.current.pendingReveal = { path: normalPath(path), line }
+                      // A click on the already-active file changes no other state,
+                      // so the nonce is what makes the reveal effect run again.
+                      setRevealNonce((value) => value + 1)
                     }
                     // The file has to be seen: get the drawer out of the way.
                     if (compactRef.current) setShowTree(false)
@@ -11294,6 +11510,9 @@ function IdeBody(props) {
                   },
                   searchOpen,
                   onCloseSearch: () => setSearchOpen(false),
+                  structureOpen,
+                  structure,
+                  onCloseStructure: () => setStructureOpen(false),
                   changesOpen,
                   changes,
                   assistant,
@@ -12365,6 +12584,24 @@ function IdeBody(props) {
 .dsh-ide-search-path { color:var(--ide-fg-dim); font:400 10px/1.3 var(--ide-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-search-preview { flex:1 1 auto; min-width:0; color:var(--ide-fg); font:400 11px/1.35 var(--ide-mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dsh-ide-search-mark { background:rgba(255, 196, 0, .32); color:inherit; border-radius:2px; }
+.dsh-ide-structure-row:hover { background:var(--ide-hover); }
+.dsh-ide-structure-kind { flex:0 0 auto; min-width:14px; height:14px; padding:0 2px; display:inline-flex; align-items:center; justify-content:center;
+  align-self:center; border-radius:3px; background:var(--ide-hover); color:var(--ide-fg-dim); font:600 9px/1 var(--ide-mono); }
+.dsh-ide-structure-class { color:#b48ead; }
+.dsh-ide-structure-function { color:#bf9560; }
+.dsh-ide-structure-method { color:#81a1c1; }
+.dsh-ide-structure-interface { color:#7fb285; }
+.dsh-ide-structure-heading, .dsh-ide-structure-rule, .dsh-ide-structure-atrule { color:#8fa876; }
+.dsh-ide-structure-name { flex:1 1 auto; min-width:0; color:var(--ide-fg);
+  font:400 11.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-structure-line { flex:0 0 auto; min-width:3ch; text-align:right; color:var(--ide-fg-dim); font:400 10.5px/1.4 var(--ide-mono); }
+.dsh-ide-structure-resize { flex:0 0 5px; height:5px; cursor:row-resize; background:transparent; border-top:1px solid var(--ide-border); }
+.dsh-ide-structure-resize:hover { background:var(--ide-hover); }
+.dsh-ide-structure { flex:0 0 auto; display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+.dsh-ide-structure .dsh-ide-tree { flex:1 1 auto; }
+.dsh-ide-structure-hit { flex-direction:column; align-items:stretch; gap:0; }
+.dsh-ide-structure-main { display:flex; align-items:baseline; gap:6px; min-width:0; }
+.dsh-ide-structure-comment { display:block; margin-left:20px; color:var(--ide-fg-dim); font:400 10.5px/1.4 var(--dsh-font-ui, system-ui, sans-serif); white-space:normal; overflow-wrap:anywhere; }
 .dsh-ide-change-hint { padding:6px 10px; color:var(--ide-fg-dim);
   font:400 10.5px/1.45 var(--dsh-font-ui, system-ui, sans-serif); }
 .dsh-ide-change-list { padding:0 0 10px; }

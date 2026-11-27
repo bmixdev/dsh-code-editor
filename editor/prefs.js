@@ -79,8 +79,8 @@ export const DEFAULT_PREFERENCES = Object.freeze({
   systemPrompt: '',
 
   // Tab mechanics. Every value below is a knob of the suggestion engine ported
-  // from the observed behaviour of Cursor's Tab (see tab.js and
-  // docs/cursor-tab-mechanics.md); the IDE settings drawer exposes all of them.
+  // from the observed behaviour of the reference editor's Tab (see tab.js and
+  // docs/reference-editor-tab-mechanics.md); the IDE settings drawer exposes all of them.
   /** Quiet time after the last keystroke before an automatic request. */
   debounceMs: 500,
   /** Lines of the buffer before the cursor kept in the prompt. */

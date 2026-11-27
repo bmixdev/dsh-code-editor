@@ -2,8 +2,8 @@
  * Project instruction files for one open document.
  *
  * Rules are discovered, not invented: every directory from the workspace root
- * down to the file's folder may carry `AGENTS.md`, `CLAUDE.md`, `.cursorrules`
- * or `.cursor/rules/*.mdc`. The chain is returned in that order so a nested
+ * down to the file's folder may carry `AGENTS.md`, `CLAUDE.md`, `.dshiderules`
+ * or `.dshide/rules/*.mdc`. The chain is returned in that order so a nested
  * rule visibly overrides its parent. Discovery is local and cheap; only the
  * explicitly applied subset ever reaches a model, and only for Inline Edit.
  *
@@ -15,7 +15,7 @@ import { lstat, readFile, readdir } from 'node:fs/promises'
 import path from 'node:path'
 
 /** Names checked in every directory of the chain, in listing order. */
-export const RULE_NAMES = ['AGENTS.md', 'CLAUDE.md', '.cursorrules']
+export const RULE_NAMES = ['AGENTS.md', 'CLAUDE.md', '.dshiderules']
 /** One rule file larger than this is listed but never applied. */
 export const MAX_RULE_BYTES = 32 * 1024
 /** Combined size of applied rule text in one Inline Edit request. */
@@ -47,8 +47,8 @@ function chain(root, file) {
   return dirs
 }
 
-/** List the `.mdc` files of one `.cursor/rules` folder, sorted by name. */
-async function cursorRules(directory) {
+/** List the `.mdc` files of one `.dshide/rules` folder, sorted by name. */
+async function localRules(directory) {
   let entries
   try {
     entries = await readdir(directory, { withFileTypes: true })
@@ -79,7 +79,7 @@ export async function discoverRules({ root, target }) {
   let truncated = false
   for (const directory of chain(top, file)) {
     const candidates = RULE_NAMES.map((name) => path.join(directory, name))
-    for (const candidate of await cursorRules(path.join(directory, '.cursor', 'rules'))) {
+    for (const candidate of await localRules(path.join(directory, '.dshide', 'rules'))) {
       candidates.push(candidate)
     }
     for (const candidate of candidates) {

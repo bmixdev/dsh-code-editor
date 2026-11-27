@@ -155,10 +155,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-agent-exec",
-      "name": "cursor-agent-exec",
+      "folder": "refeditor-agent-exec",
+      "name": "refeditor-agent-exec",
       "version": "0.0.1",
-      "description": "Provides agent execution capabilities for Cursor, enabling agents to run commands, interact with files, and use tools with user permissions and approvals",
+      "description": "Provides agent execution capabilities for the sample editor, enabling agents to run commands, interact with files, and use tools with user permissions and approvals",
       "entry": "./dist/main",
       "activation": [
         "*"
@@ -169,10 +169,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-agent-host",
-      "name": "cursor-agent-host",
+      "folder": "refeditor-agent-host",
+      "name": "refeditor-agent-host",
       "version": "0.0.1",
-      "description": "Hosts Cursor agent orchestration in the AgentExec extension host",
+      "description": "Hosts sample editor agent orchestration in the AgentExec extension host",
       "entry": "./dist/main.js",
       "activation": [
         "*"
@@ -185,10 +185,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-agent-worker",
-      "name": "cursor-agent-worker",
+      "folder": "refeditor-agent-worker",
+      "name": "refeditor-agent-worker",
       "version": "0.0.1",
-      "description": "Install and run Cursor agent worker from extension startup",
+      "description": "Install and run sample editor agent worker from extension startup",
       "entry": "./dist/main",
       "activation": [
         "onStartupFinished"
@@ -199,10 +199,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-always-local",
-      "name": "cursor-always-local",
+      "folder": "refeditor-always-local",
+      "name": "refeditor-always-local",
       "version": "0.0.1",
-      "description": "Implements experimentation features for Cursor",
+      "description": "Implements experimentation features for the sample editor",
       "entry": "./dist/main",
       "kind": [
         "ui"
@@ -223,10 +223,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-browser-automation",
-      "name": "cursor-browser-automation",
+      "folder": "refeditor-browser-automation",
+      "name": "refeditor-browser-automation",
       "version": "1.0.0",
-      "description": "MCP server for browser automation in Cursor",
+      "description": "MCP server for browser automation in sample editor",
       "entry": "./dist/extension.js",
       "kind": [
         "ui"
@@ -240,8 +240,8 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-checkout",
-      "name": "cursor-checkout",
+      "folder": "refeditor-checkout",
+      "name": "refeditor-checkout",
       "version": "0.0.1",
       "description": "Checkout provider for branch migration operations",
       "entry": "./dist/main",
@@ -254,10 +254,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-commits",
-      "name": "cursor-commits",
+      "folder": "refeditor-commits",
+      "name": "refeditor-commits",
       "version": "0.0.1",
-      "description": "Tracks requests and commits for Cursor online metrics",
+      "description": "Tracks requests and commits for the sample editor online metrics",
       "entry": "./dist/main",
       "kind": [
         "workspace"
@@ -275,10 +275,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-computer-use",
-      "name": "cursor-computer-use",
+      "folder": "refeditor-computer-use",
+      "name": "refeditor-computer-use",
       "version": "1.0.0",
-      "description": "Computer use in Cursor",
+      "description": "Computer use in sample editor",
       "entry": "./dist/extension.js",
       "kind": [
         "ui"
@@ -292,8 +292,8 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-deeplink",
-      "name": "cursor-deeplink",
+      "folder": "refeditor-deeplink",
+      "name": "refeditor-deeplink",
       "version": "0.0.1",
       "description": "Handles deep-link URIs.",
       "entry": "./dist/main",
@@ -308,16 +308,16 @@
         "commands"
       ],
       "commands": [
-        "cursor-deeplink.debug.triggerDeeplink"
+        "refeditor-deeplink.debug.triggerDeeplink"
       ],
       "languages": [],
       "keybindings": []
     },
     {
-      "folder": "cursor-explorer",
-      "name": "cursor-explorer",
+      "folder": "refeditor-explorer",
+      "name": "refeditor-explorer",
       "version": "0.0.1",
-      "description": "Workspace extension for Cursor Explorer",
+      "description": "Workspace extension for the sample editor Explorer",
       "entry": "./dist/main",
       "kind": [
         "workspace"
@@ -331,20 +331,20 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-file-service",
-      "name": "cursor-file-service",
+      "folder": "refeditor-file-service",
+      "name": "refeditor-file-service",
       "version": "1.0.0",
-      "description": "Handles indexing and retrieval for Cursor",
+      "description": "Handles indexing and retrieval for the sample editor",
       "categories": [],
       "commands": [],
       "languages": [],
       "keybindings": []
     },
     {
-      "folder": "cursor-local-agent-runtime",
-      "name": "cursor-local-agent-runtime",
+      "folder": "refeditor-local-agent-runtime",
+      "name": "refeditor-local-agent-runtime",
       "version": "0.0.1",
-      "description": "Hosts Cursor Private Inference outside workspace extension hosts",
+      "description": "Hosts sample editor Private Inference outside workspace extension hosts",
       "entry": "./dist/main",
       "kind": [
         "ui"
@@ -358,10 +358,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-mcp",
-      "name": "cursor-mcp",
+      "folder": "refeditor-mcp",
+      "name": "refeditor-mcp",
       "version": "0.0.1",
-      "description": "Handles MCP for Cursor",
+      "description": "Handles MCP for the sample editor",
       "entry": "./dist/main",
       "kind": [
         "workspace"
@@ -381,35 +381,35 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-ndjson-ingest",
-      "name": "cursor-ndjson-ingest",
+      "folder": "refeditor-ndjson-ingest",
+      "name": "refeditor-ndjson-ingest",
       "version": "0.0.1",
-      "description": "HTTP server for ingesting NDJSON logs to workspace/.cursor/debug.log",
+      "description": "HTTP server for ingesting NDJSON logs to workspace/.refeditor/debug.log",
       "entry": "./dist/main",
       "kind": [
         "workspace"
       ],
       "activation": [
-        "onCommand:cursor.ndjsonIngest.start",
-        "onCommand:cursor.ndjsonIngest.reassignPort"
+        "onCommand:refeditor.ndjsonIngest.start",
+        "onCommand:refeditor.ndjsonIngest.reassignPort"
       ],
       "categories": [
         "commands",
         "configuration"
       ],
       "commands": [
-        "cursor.ndjsonIngest.start",
-        "cursor.ndjsonIngest.stop",
-        "cursor.ndjsonIngest.copyCurl",
-        "cursor.ndjsonIngest.reassignPort",
-        "cursor.ndjsonIngest.showStatus"
+        "refeditor.ndjsonIngest.start",
+        "refeditor.ndjsonIngest.stop",
+        "refeditor.ndjsonIngest.copyCurl",
+        "refeditor.ndjsonIngest.reassignPort",
+        "refeditor.ndjsonIngest.showStatus"
       ],
       "languages": [],
       "keybindings": []
     },
     {
-      "folder": "cursor-polyfills-remote",
-      "name": "cursor-polyfills-remote",
+      "folder": "refeditor-polyfills-remote",
+      "name": "refeditor-polyfills-remote",
       "version": "0.0.1",
       "description": "Polyfills for workspace extension host",
       "entry": "./dist/main",
@@ -425,10 +425,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-resolver",
-      "name": "cursor-resolver",
+      "folder": "refeditor-resolver",
+      "name": "refeditor-resolver",
       "version": "0.0.1",
-      "description": "Background composer remote authority resolver for Cursor",
+      "description": "Background composer remote authority resolver for the sample editor",
       "entry": "./dist/main",
       "browser": "./dist/browser/main",
       "kind": [
@@ -445,10 +445,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-resolver-helper",
-      "name": "cursor-resolver-helper",
+      "folder": "refeditor-resolver-helper",
+      "name": "refeditor-resolver-helper",
       "version": "0.0.1",
-      "description": "Connection token provider for Cursor resolver",
+      "description": "Connection token provider for the sample editor resolver",
       "entry": "./dist/main",
       "kind": [
         "ui"
@@ -463,10 +463,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-retrieval",
-      "name": "cursor-retrieval",
+      "folder": "refeditor-retrieval",
+      "name": "refeditor-retrieval",
       "version": "0.0.1",
-      "description": "Handles indexing and retrieval for Cursor",
+      "description": "Handles indexing and retrieval for the sample editor",
       "entry": "./dist/main",
       "kind": [
         "workspace"
@@ -482,8 +482,8 @@
         "languages"
       ],
       "commands": [
-        "cursor.grepClient.debug",
-        "cursor.codebaseTelemetry.triggerSnapshot"
+        "refeditor.grepClient.debug",
+        "refeditor.codebaseTelemetry.triggerSnapshot"
       ],
       "languages": [
         "ignore",
@@ -492,8 +492,8 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-shadow-workspace",
-      "name": "cursor-shadow-workspace",
+      "folder": "refeditor-shadow-workspace",
+      "name": "refeditor-shadow-workspace",
       "version": "1.0.0",
       "description": "%description%",
       "entry": "./dist/extension",
@@ -513,10 +513,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-socket",
-      "name": "cursor-socket",
+      "folder": "refeditor-socket",
+      "name": "refeditor-socket",
       "version": "0.0.1",
-      "description": "TCP/TLS socket provider for Cursor extensions",
+      "description": "TCP/TLS socket provider for the sample editor extensions",
       "entry": "./dist/main",
       "kind": [
         "ui"
@@ -531,10 +531,10 @@
       "keybindings": []
     },
     {
-      "folder": "cursor-worktree-textmate",
+      "folder": "refeditor-worktree-textmate",
       "name": "worktree-textmate",
       "version": "0.0.1",
-      "description": "Provides TextMate-only syntax highlighting for .cursor/worktrees files without activating language servers.",
+      "description": "Provides TextMate-only syntax highlighting for .refeditor/worktrees files without activating language servers.",
       "kind": [
         "ui"
       ],
@@ -1057,7 +1057,7 @@
       "folder": "grunt",
       "name": "grunt",
       "version": "1.0.0",
-      "description": "Extension to add Grunt capabilities to VS Code.",
+      "description": "Extension to add Grunt capabilities to the reference editor.",
       "entry": "./dist/main",
       "activation": [
         "onTaskType:grunt"
@@ -1575,7 +1575,7 @@
       "keybindings": []
     },
     {
-      "folder": "ms-vscode.js-debug",
+      "folder": "ms-refeditor.js-debug",
       "name": "js-debug",
       "version": "1.93.0",
       "description": "An extension for debugging Node.js programs and Chrome.",
@@ -1665,7 +1665,7 @@
       ]
     },
     {
-      "folder": "ms-vscode.js-debug-companion",
+      "folder": "ms-refeditor.js-debug-companion",
       "name": "js-debug-companion",
       "version": "1.1.3",
       "description": "Companion extension to js-debug that provides capability for remote debugging",
@@ -1685,8 +1685,8 @@
       "keybindings": []
     },
     {
-      "folder": "ms-vscode.vscode-js-profile-table",
-      "name": "vscode-js-profile-table",
+      "folder": "ms-refeditor.refeditor-js-profile-table",
+      "name": "refeditor-js-profile-table",
       "version": "1.0.11",
       "description": "Text visualizer for profiles taken from the JavaScript debugger",
       "entry": "out/extension.js",
@@ -1849,7 +1849,7 @@
     },
     {
       "folder": "protobuf",
-      "name": "cursor-protobuf",
+      "name": "refeditor-protobuf",
       "version": "0.0.1",
       "description": "%description%",
       "kind": [
@@ -2192,10 +2192,10 @@
       "keybindings": []
     },
     {
-      "folder": "theme-cursor",
-      "name": "cursor-themes",
+      "folder": "theme-refeditor",
+      "name": "refeditor-themes",
       "version": "0.0.2",
-      "description": "Default Cursor themes",
+      "description": "Default sample editor themes",
       "categories": [
         "themes"
       ],
@@ -2278,7 +2278,7 @@
     },
     {
       "folder": "theme-seti",
-      "name": "vscode-theme-seti",
+      "name": "refeditor-theme-seti",
       "version": "1.0.0",
       "description": "%description%",
       "categories": [
@@ -2432,7 +2432,7 @@
       "keybindings": []
     },
     {
-      "folder": "vscode-jupyter-keymap",
+      "folder": "refeditor-jupyter-keymap",
       "name": "jupyter-keymap",
       "version": "1.0.0",
       "description": "Jupyter keymaps for notebooks",

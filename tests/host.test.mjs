@@ -60,6 +60,7 @@ const ROUTES = [
   'resolve',
   'tree',
   'files',
+  'structure',
   'create',
   'mkdir',
   'rename',
@@ -1021,7 +1022,7 @@ test('explore filters ignored files before asking the model', async () => {
   const root = await makeWorkspace()
   try {
     await writeFile(path.join(root, 'secret.ts'), 'hidden word\n', 'utf8')
-    await writeFile(path.join(root, '.cursorignore'), 'secret.ts\n', 'utf8')
+    await writeFile(path.join(root, '.dshideignore'), 'secret.ts\n', 'utf8')
     const app = setup({ root, answer: 'не должно вызываться' })
     const found = await app.call('explore', { sessionId: SESSION_ID, question: 'где hidden?' })
     assert.equal(found.status, 200)
@@ -1084,7 +1085,7 @@ test('side chat refuses a selection in an ignored file', async () => {
   const root = await makeWorkspace()
   try {
     await writeFile(path.join(root, 'secret.ts'), 'const token = 1\n', 'utf8')
-    await writeFile(path.join(root, '.cursorignore'), 'secret.ts\n', 'utf8')
+    await writeFile(path.join(root, '.dshideignore'), 'secret.ts\n', 'utf8')
     const app = setup({ root })
     const opened = await app.call('open', { sessionId: SESSION_ID, path: 'secret.ts' })
     const asked = await app.call('sideChat', {
@@ -1109,8 +1110,8 @@ test('content search honours both ignore scopes', async () => {
     await writeFile(path.join(root, 'secret.txt'), 'needle\n', 'utf8')
     await mkdir(path.join(root, 'generated'), { recursive: true })
     await writeFile(path.join(root, 'generated', 'x.ts'), 'needle\n', 'utf8')
-    await writeFile(path.join(root, '.cursorignore'), 'secret.txt\n', 'utf8')
-    await writeFile(path.join(root, '.cursorindexingignore'), 'generated/\n', 'utf8')
+    await writeFile(path.join(root, '.dshideignore'), 'secret.txt\n', 'utf8')
+    await writeFile(path.join(root, '.dshideindexingignore'), 'generated/\n', 'utf8')
     const app = setup({ root })
     const found = await app.call('searchText', { sessionId: SESSION_ID, query: 'needle' })
     assert.equal(found.status, 200)
@@ -1124,8 +1125,8 @@ test('cursorignore blocks inline edit and rules, indexing ignore does not', asyn
   const root = await makeWorkspace()
   try {
     await writeFile(path.join(root, 'AGENTS.md'), 'Пиши тесты.\n', 'utf8')
-    await writeFile(path.join(root, '.cursorignore'), 'AGENTS.md\nsrc/index.js\n', 'utf8')
-    await writeFile(path.join(root, '.cursorindexingignore'), 'src/util.ts\n', 'utf8')
+    await writeFile(path.join(root, '.dshideignore'), 'AGENTS.md\nsrc/index.js\n', 'utf8')
+    await writeFile(path.join(root, '.dshideindexingignore'), 'src/util.ts\n', 'utf8')
     await withFile('DSH_CODE_EDITOR_PREFS', 'code-editor.json', async () => {
       const app = setup({ root, answer: '{"replacement":"3"}' })
       await app.call('prefs', { patch: { inlineEditConsent: true } })

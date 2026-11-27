@@ -36,8 +36,8 @@ test('loads both scopes and keeps them apart', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'dsh-ignore-'))
   try {
     await mkdir(path.join(root, 'generated'), { recursive: true })
-    await writeFile(path.join(root, '.cursorignore'), 'secret.txt\n')
-    await writeFile(path.join(root, '.cursorindexingignore'), 'generated/\n')
+    await writeFile(path.join(root, '.dshideignore'), 'secret.txt\n')
+    await writeFile(path.join(root, '.dshideindexingignore'), 'generated/\n')
     const ignore = await loadIgnore(root)
     assert.equal(ignore.blocked('secret.txt'), true)
     assert.equal(ignore.blocked('generated/x.ts'), false)

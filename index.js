@@ -1,5 +1,5 @@
 /**
- * Host half of `@local/dsh-ide` — a tabbed, VS Code-shaped editor that brings
+ * Host half of `@local/dsh-ide` — a tabbed, code-editor-shaped editor that brings
  * its own explorer and does not depend on the built-in file plugin.
  *
  * Responsibilities:
@@ -41,6 +41,7 @@ import { buildFileContext, editInstructions, locateEdits, parseEditResponse } fr
 import { createProposal, ProposalError, readReplacementAnswer } from './proposal.js'
 import { boundLines, evaluateSuggestion, planEdit, reasonLabel } from './tab.js'
 import { listFiles, listTree } from './tree.js'
+import { outlineOf } from './structure.js'
 import { searchText as searchWorkspace } from './search.js'
 import { applyHunks, createChangeTracker, revertHunks } from './agentChanges.js'
 import * as scm from './scm.js'
@@ -448,6 +449,7 @@ export function apply(ctx, config) {
     resolve: (body) => resolveSession(body),
     tree: (body, signal) => treeRoute(body, signal),
     files: (body, signal) => filesRoute(body, signal),
+    structure: (body) => structureRoute(body),
     create: (body, signal) => createRoute(body, signal),
     mkdir: (body, signal) => mkdirRoute(body, signal),
     rename: (body, signal) => renameRoute(body, signal),
@@ -1067,7 +1069,7 @@ export function apply(ctx, config) {
     const result = sanitizeCompletion(answer)
 
     // Where the answer lands and whether it is worth showing. Both decisions
-    // used to live in Cursor's server response (`range_to_replace` plus the
+    // used to live in the reference editor's server response (`range_to_replace` plus the
     // bad-case heuristics); here the Host owns them because it already has the
     // whole buffer, and every knob below is a saved preference.
     const requestId = randomUUID()
@@ -1237,7 +1239,7 @@ export function apply(ctx, config) {
     }
     const ignore = await loadIgnore(document.workspaceRoot)
     if (ignore.blocked(relativePath(document.workspaceRoot, document.target.path))) {
-      return fail('ignored-file', 'Файл исключён правилами рабочей папки (.cursorignore) — модель его не получит.')
+      return fail('ignored-file', 'Файл исключён правилами рабочей папки (.dshideignore) — модель его не получит.')
     }
 
     const text = String(body.text ?? '')
@@ -1475,7 +1477,7 @@ export function apply(ctx, config) {
   /**
    * Natural-language explore: local keyword search first, then one bounded
    * answer over the matching lines. Sending those lines is the explicit action
-   * of pressing «Спросить»; `.cursorignore` and secret-looking paths are
+   * of pressing «Спросить»; `.dshideignore` and secret-looking paths are
    * filtered before the model is called.
    */
   async function exploreRoute(body, signal) {
@@ -1695,7 +1697,7 @@ export function apply(ctx, config) {
     const ignore = await loadIgnore(document.workspaceRoot)
     const relative = relativePath(document.workspaceRoot, document.target.path)
     if (ignore.blocked(relative)) {
-      return fail('ignored-file', 'Файл исключён правилами рабочей папки (.cursorignore) — модель его не получит.')
+      return fail('ignored-file', 'Файл исключён правилами рабочей папки (.dshideignore) — модель его не получит.')
     }
     if (completionExcluded(relative)) {
       return fail('excluded-file', 'Файл похож на секрет — побочный вопрос его не отправляет.')
@@ -3190,6 +3192,18 @@ export function apply(ctx, config) {
       limit: typeof body.limit === 'number' ? body.limit : undefined,
       signal,
     })
+  }
+
+  // --------------------------------------------------------------- structure
+
+  function structureRoute(body) {
+    if (sessionOf(body) === undefined) return fail('no-session', 'Сессия не найдена — откройте файл из активной сессии.')
+    const path = typeof body.path === 'string' ? body.path : ''
+    const text = typeof body.text === 'string' ? body.text : ''
+    // The client already caps what it sends; this only stops a runaway request
+    // from costing the Host more than an outline is worth.
+    if (text.length > 4000000) return fail('too-large', 'Файл слишком большой для структуры.')
+    return outlineOf(path, text)
   }
 
   // ----------------------------------------------------------------- create

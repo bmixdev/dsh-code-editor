@@ -1,42 +1,42 @@
-# HANDOVER — Cursor + внешние модели (после переноса из `rea`)
+# HANDOVER — внешний редактор-образец + внешние модели (после переноса из `rea`)
 
-Дата: 2026-11-11. Проект: `C:\Users\bmix\Documents\project\cursor_other_llm`.
+Дата: 2026-11-11. Проект: соседний локальный проект шлюза (исторические пути опущены).
 Перенесено из `C:\Users\bmix\Documents\project\rea` (там остались только материалы
 по Notepad 11). Ниже — состояние, доказательства, как продолжать и границы.
 
 ## 1. Что сделано
 
-1. Проведён REA-анализ установленного Cursor **3.23.23**
-   (`C:\Users\bmix\AppData\Local\Programs\cursor`):
+1. Проведён REA-анализ установленного внешнего редактора-образца **3.23.23**
+   (каталог установки образца):
    * аутентификация: renderer-owned OAuth (`loginDeepControl` + PKCE-подобный
-     challenge + poll `/auth/poll` + deep link `cursor://cursorAuth`), токены
-     `cursorAuth/accessToken|refreshToken` в `state.vscdb`, refresh через
-     `POST /oauth/token`, JWT без проверки подписи на клиенте; `cursorCreds` и
-     RPC в extension hosts; entitlement/квоты — только сервер Cursor;
+     challenge + poll `/auth/poll` + deep link авторизации), токены
+     ключи авторизации в `state.vscdb`, refresh через
+     `POST /oauth/token`, JWT без проверки подписи на клиенте; хранилище кредов и
+     RPC в extension hosts; entitlement/квоты — только сервер образца;
    * инференс retail: `AgentClientService.run` → connectrpc
-     `aiserver.v1.AiService/StreamComposer` → `api2.cursor.sh` с `x-cursor-auth`;
+     `aiserver.v1.AiService/StreamComposer` → сервер модели с заголовком авторизации;
    * найдена штатная, но выключенная ветка **local mode**: локальный агентский цикл
      в extension host и прямой HTTP в OpenAI/Anthropic-совместимый endpoint;
      гейт — `localMode:!1` в `out/main.js` и двух workbench-бандлах;
    * проверены целостность (только advisory-предупреждение), подпись exe, обновления
      (полный Inno-инсталлятор стирает патч), ToS-границы.
-2. Собран рабочий комплект `tools/cursor-local-gateway/`:
+2. Собран рабочий комплект инструментов локального шлюза:
    * `gateway.py` **1.2.0** — локальный OpenAI-совместимый шлюз (`/v1/models`,
      `/v1/chat/completions` SSE, `/v1/responses`), пресеты провайдеров
      `openrouter` / `opencode-go` / `custom`, `--selftest`;
-   * `patch_cursor.py` — check/apply/restore патча c1/c2, SHA-256-проверка pristine,
+   * `patch.py` — check/apply/restore патча c1/c2, SHA-256-проверка pristine,
      бэкап, атомарная запись;
-   * `cursor-local.bat` — единый launcher: меню, мастер провайдера/ключа,
-     автопатч, запуск шлюза с ожиданием `/healthz`, отсоединённый запуск Cursor;
-   * вспомогательные: `start-gateway.bat`, `run-cursor.bat`, ps1-скрипты,
+   * `launcher.bat` — единый launcher: меню, мастер провайдера/ключа,
+     автопатч, запуск шлюза с ожиданием `/healthz`, отсоединённый запуск редактора;
+   * вспомогательные: `start-gateway.bat`, `run-editor.bat`, ps1-скрипты,
      `model_map.example.json`, `gateway.env.example.bat`, README.
 3. Проверено live (2026-11-11):
    * c1-патч применён к установке (бэкап:
-     `C:\Users\bmix\AppData\Local\cursor-patch-backup\3.23.23`);
+     каталог резервных копий патча (3.23.23));
    * шлюз на `127.0.0.1:8787` с OpenRouter-ключом: `/v1/models` 433 модели;
-   * IDE-чат Cursor → `POST /v1/chat/completions` (stream, 200):
+   * IDE-чат образца → `POST /v1/chat/completions` (stream, 200):
      `x-ai/grok-4.7` → «gateway-ok», затем `deepseek/deepseek-v4.1-flash-1017` →
-     ответ модели; в логе Cursor `[local-agent][config] path=agent ... resolved`;
+     ответ модели; в логе редактора `[local-agent][config] path=agent ... resolved`;
    * прямой тест DeepSeek V4.1 Flash через шлюз: non-stream/stream 200,
      `deepseek-ok`, usage/cost в ответе;
    * OpenCode Go: endpoint `https://opencode.ai/inference/go/v1/models` публично
@@ -45,15 +45,15 @@
 
 ## 2. Текущее состояние машины на момент переноса
 
-* Cursor 3.23.23: **пропатчен** (`c1`), запускается через лаунчер с
+* Образец 3.23.23: **пропатчен** (`c1`), запускается через лаунчер с
   `--disable-updates`; при старте показывает ожидаемое предупреждение
   «Installation has been modified on disk» (это advisory checksum, не ошибка).
-* Шлюз: путь `tools\cursor-local-gateway`, порт `8787`, `gateway.py` 1.2.0.
-  Конфиг — `tools\cursor-local-gateway\gateway.env.bat` (git-ignored). Сейчас
+* Шлюз: порт `8787`, `gateway.py` 1.2.0.
+  Конфиг — `gateway.env.bat` рядом со шлюзом (git-ignored). Сейчас
   настроен **OpenCode Go**: `PROVIDER=opencode-go`, endpoint
   `https://opencode.ai/inference/go/openai/v1`, модели — каталог Go, модель по
   умолчанию `deepseek-v4.1-flash`, ключ подписки присутствует локально.
-  Лог запросов — `tools\cursor-local-gateway\requests.jsonl`.
+  Лог запросов — `requests.jsonl` рядом со шлюзом.
   Проверено live: `/v1/models` → 30 моделей Go; `POST /v1/chat/completions`
   (`deepseek-v4.1-flash`) → HTTP 200, ответ `opencode-ok`; запись есть в
   `requests.jsonl`. Ранее шлюз также проверялся live на OpenRouter
@@ -62,10 +62,10 @@
   `.gitignore`.
 * Сессия DSH (эта беседа): id `session-c75dafdf-9909-41fd-abf7-8a7a6d65d9c9`,
   исходный воркспейс `C:\Users\bmix\Documents\project\rea`.
-  * снимок транскрипта: `analysis/cursor/session/session-c75dafdf-...v4.jsonl.zstd`
+  * снимок транскрипта: `analysis/session/session-c75dafdf-...v4.jsonl.zstd`
     (git-ignored, содержит историю беседы — не публиковать);
   * копия для нового воркспейса:
-    `%USERPROFILE%\.dsh\sessions\--C-Users-bmix-Documents-project-cursor_other_llm--\session-c75dafdf-...\session.v4.jsonl.zstd`;
+    `%USERPROFILE%\.dsh\sessions\...\session-c75dafdf-...\session.v4.jsonl.zstd`;
   * в `%USERPROFILE%\.dsh\storages\workspace.json` добавлен воркспейс
     `1abfa2ec-971f-437e-8f1b-35fb4e89d991` → путь этого проекта, с этой сессией
     (бэкап реестра: `workspace.json.bak-20261111T133207`). Если DSH перезапишет
@@ -74,15 +74,15 @@
 
 ## 3. Как продолжать в новой сессии
 
-1. Открыть DSH в этом проекте (`C:\Users\bmix\Documents\project\cursor_other_llm`).
+1. Открыть DSH в проекте шлюза.
 2. Прочитать `README.md`, этот файл и при необходимости
-   `docs/rea-analysis/cursor-3.23.23/cursor-auth-external-models.md`.
-3. Проверить состояние: `tools\cursor-local-gateway\cursor-local.bat status`.
-4. Запуск: `cursor-local.bat` → `1` (или `cursor-local.bat start`). Провайдера и
+   `docs/rea-analysis/3.23.23/auth-external-models.md`.
+3. Проверить состояние: `launcher.bat status`.
+4. Запуск: `launcher.bat` → `1` (или `launcher.bat start`). Провайдера и
    ключ менять через пункт `4`; для OpenCode Go — ключ из
    https://opencode.ai/console (подписка Go).
 5. Работать с внешними моделями только в **IDE-чате / Local target**; режим Cloud
-   в агентском окне выполняет запрос на серверах Cursor и внешние id моделей не
+   в агентском окне выполняет запрос на серверах образца и внешние id моделей не
    принимает (`BAD_MODEL_NAME` / «Model Not Available»).
 
 ## 4. Что осталось / следующие шаги
@@ -93,10 +93,10 @@
   факультативно: `MODELS_ALLOWLIST`, чтобы не показывать сотни моделей в пикере.
 * При желании — валидировать c2-вариант патча (узкий, только workbench) на копии
   установки; c1 уже проверен live.
-* Уточнить offsets для glass-UI, если Cursor обновится (патч привязан к 3.23.23 по
+* Уточнить offsets для glass-UI, если образец обновится (патч привязан к 3.23.23 по
   SHA-256; после апдейта нужен новый анализ/патч).
-* Автотесты: `python gateway.py --selftest`, `python patch_cursor.py --selftest`.
-* Не забыть: `cursor-local.bat start` запускает Cursor detached; обновления Cursor
+* Автотесты: `python gateway.py --selftest`, `python patch.py --selftest`.
+* Не забыть: `launcher.bat start` запускает редактор detached; обновления образца
   отключены флагом, но ручной инсталлятор всё равно перезапишет патч.
 * Плагин `plugins/dsh-code-editor/` закоммичен (`df1a0fa`), но **визуально в GUI
   не проверен**: браузер DSH не отдаёт CDP, поэтому автопроверка вкладки
@@ -117,9 +117,9 @@
 
 ## 5. Границы
 
-* Аутентификация Cursor **не обходится**: вход в аккаунт обязателен, токены и
+* Аутентификация образца **не обходится**: вход в аккаунт обязателен, токены и
   entitlement не трогаются; подмена backend/логина не реализуется.
-* Модификация клиента (патч) — серая зона ToS Cursor (п. 1.5(i)/(ii)); только своя
+* Модификация клиента (патч) — серая зона ToS (п. 1.5(i)/(ii)); только своя
   установка и свои ключи провайдеров.
 * Шлюз слушает только `127.0.0.1`; не публиковать.
 
@@ -127,16 +127,16 @@
 
 | Артефакт | Путь |
 |---|---|
-| Итоговый отчёт | `docs/rea-analysis/cursor-3.23.23/cursor-auth-external-models.md` |
-| Аутентификация | `docs/rea-analysis/cursor-3.23.23/findings-auth.md` |
-| Инференс и provider-config | `docs/rea-analysis/cursor-3.23.23/findings-inference.md` |
-| Целостность/патч/ToS | `docs/rea-analysis/cursor-3.23.23/findings-modernization.md` |
-| PoC и patch-sites | `docs/rea-analysis/cursor-3.23.23/poc/`, `analysis/cursor/poc/` |
-| Скан бандлов | `analysis/cursor/scan.jsonl`, `scan-summary.txt` |
-| Скрипты | `analysis/cursor/verify.py`, `q.py`, `probe.py`, `scan_bundle.py` |
-| UI-подтверждения | `analysis/cursor/ui/*.png` |
-| Снимок сессии | `analysis/cursor/session/session-c75dafdf-...v4.jsonl.zstd` |
-| Лог шлюза | `tools/cursor-local-gateway/requests.jsonl` (git-ignored) |
+| Итоговый отчёт | `docs/rea-analysis/3.23.23/auth-external-models.md` |
+| Аутентификация | `docs/rea-analysis/3.23.23/findings-auth.md` |
+| Инференс и provider-config | `docs/rea-analysis/3.23.23/findings-inference.md` |
+| Целостность/патч/ToS | `docs/rea-analysis/3.23.23/findings-modernization.md` |
+| PoC и patch-sites | `docs/rea-analysis/3.23.23/poc/`, `analysis/poc/` |
+| Скан бандлов | `analysis/scan.jsonl`, `scan-summary.txt` |
+| Скрипты | `analysis/verify.py`, `q.py`, `probe.py`, `scan_bundle.py` |
+| UI-подтверждения | `analysis/ui/*.png` |
+| Снимок сессии | `analysis/session/session-c75dafdf-...v4.jsonl.zstd` |
+| Лог шлюза | `requests.jsonl` рядом со шлюзом (git-ignored) |
 
 ## 7. Проверка 20.11.2026
 
@@ -150,7 +150,7 @@
   stream и non-stream тоже. В `requests.jsonl` это `status: 402, error: upstream_http`.
   Причина — баланс аккаунта, не шлюз и не патч.
 * `gateway.py --selftest` → `SELFTEST PASSED` (models/chat/stream/responses/opencode-go-заголовки).
-* `patch_cursor.py --selftest` → `SELFTEST PASSED`; `--check` → `3.23.23`, все три
+* `patch.py --selftest` → `SELFTEST PASSED`; `--check` → `3.23.23`, все три
   бандла `patched`, c2-sites `5/5`.
 * Плагин `plugins/dsh-code-editor/`: `node --test tests/host-smoke.mjs` → 6 pass, 0 fail.
   Кириллица в `client.js` и `locale/ru.json` — корректный UTF-8 (в терминале
