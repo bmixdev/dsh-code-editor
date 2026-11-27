@@ -6576,8 +6576,30 @@ function loadXterm() {
       const element = document.createElement('script')
       element.src = src
       element.async = true
-      element.addEventListener('load', onDone)
-      element.addEventListener('error', () => reject(new Error('Не удалось загрузить xterm.js')))
+      // Monaco's loader defines the globals `define`, and a bundled page can
+      // carry `module`/`exports`; the xterm UMD wrapper prefers the AMD/CJS
+      // branches then and never touches `window`. Shadow them for the duration
+      // of this script only.
+      const saved = ['define', 'module', 'exports'].map((name) => [name, window[name]])
+      const shadow = () => {
+        for (const [name, value] of saved) {
+          try {
+            if (value === undefined) delete window[name]
+            else window[name] = value
+          } catch { /* a frozen window keeps the shadow; harmless */ }
+        }
+      }
+      for (const [name] of saved) {
+        try { delete window[name] } catch { /* keep going */ }
+      }
+      element.addEventListener('load', () => {
+        shadow()
+        onDone()
+      })
+      element.addEventListener('error', () => {
+        shadow()
+        reject(new Error('Не удалось загрузить xterm.js'))
+      })
       document.head.appendChild(element)
       return element
     }
@@ -11150,10 +11172,8 @@ function IdeBody(props) {
             setShowTree(saved.showTree !== false)
             setHidden(saved.hidden === true)
             if (loaded.showChat !== false) setPanel({ tab: 'chat', index: 0 })
-            if (saved.ptyOpen === true) {
-              setPtyOpen(true)
-              setPanel({ tab: 'pty', index: 0 })
-            }
+            if (saved.ptyOpen !== false) setPtyOpen(true)
+            if (saved.ptyOpen === true || saved.ptyOpen === undefined) setPanel({ tab: 'pty', index: 0 })
             const wanted = []
             if (initialPath !== '') wanted.push(initialPath)
             for (const candidate of Array.isArray(saved.tabs) ? saved.tabs : []) {
