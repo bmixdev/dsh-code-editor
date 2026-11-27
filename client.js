@@ -6713,14 +6713,19 @@ function terminalScreenTail(term) {
  * Keys that wipe the typed input before the replacement command is written.
  * The prediction replaces the draft (a model answer may rewrite it entirely),
  * and only the shell itself can clear its own line:
- * PSReadLine binds Escape to RevertLine (a fresh prompt reverts to empty) and
- * cmd.exe clears the line on Escape; readline shells (bash, zsh, the Node
- * REPL) discard the input on Ctrl+U. WSL profiles are bash-like, hence the
- * fallback.
+ * - PSReadLine: Ctrl+End (ForwardDeleteLine) + Ctrl+Home (BackwardDeleteLine),
+ *   both standard CSI sequences, so ConPTY transports them without eating
+ *   them. A bare Escape byte is unreliable here: ConPTY merges it with the
+ *   characters that follow into an escape sequence, and the revert never
+ *   happens (the typed text survived).
+ * - cmd.exe: Escape clears the whole typed line.
+ * - readline shells (bash, zsh, the Node REPL): Ctrl+U discards the input.
+ * WSL profiles are bash-like, hence the fallback.
  */
 function terminalClearKeys(profile) {
   const id = String(profile ?? '').split(':')[0]
-  if (id === 'powershell' || id === 'pwsh' || id === 'cmd') return '\x1b'
+  if (id === 'powershell' || id === 'pwsh') return '\x1b[1;5F\x1b[1;5H'
+  if (id === 'cmd') return '\x1b'
   return '\x15'
 }
 
@@ -6873,10 +6878,18 @@ function PtyPanel({ sessionId, call, height }) {
     applyHint(undefined)
     if (call !== undefined && current.text !== '') {
       // The prediction replaces the draft: clear the shell's own line first
-      // (per-shell key), then type the full command. Nothing is executed —
-      // the user still runs it with Enter.
+      // (per-shell key), then type the full command. The clear keys and the
+      // command must be separate writes: ConPTY coalesces them, and a control
+      // byte followed by text in one chunk is parsed as an escape sequence —
+      // the clear key disappears and the text lands glued to the draft.
+      // Nothing is executed: the user still runs it with Enter.
       const engine = engineOf(current.id)
-      call('termWrite', { sessionId, id: current.id, data: terminalClearKeys(engine?.profile) + current.text }).catch(() => {})
+      const clear = terminalClearKeys(engine?.profile)
+      call('termWrite', { sessionId, id: current.id, data: clear }).catch(() => {})
+      window.setTimeout(() => {
+        if (engineOf(current.id) === undefined) return
+        call('termWrite', { sessionId, id: current.id, data: current.text }).catch(() => {})
+      }, 80)
     }
   }, [call, sessionId, cancelIdle, applyHint])
 
