@@ -6732,12 +6732,27 @@ function PtyPanel({ sessionId, call, height }) {
           if (controller.signal.aborted) return
           const engine = engineOf(id)
           if (payload.gap === true) {
-            if (engine !== undefined) engine.term.reset()
+            if (engine !== undefined) {
+              engine.term.reset()
+              // The re-fed buffer may contain escape-sequence queries (device
+              // attributes); answering them after the fact only types garbage
+              // into the prompt, so swallow responses while replaying.
+              engine.replayMute = true
+            }
             offsetsRef.current.set(id, payload.offset)
             continue
           }
           if (payload.data !== '' && engine !== undefined) {
-            engine.term.write(bytesFromBase64(payload.data))
+            const bytes = bytesFromBase64(payload.data)
+            if (engine.replayMute === true) {
+              engine.mute = true
+              engine.term.write(bytes, () => {
+                engine.mute = false
+                engine.replayMute = false
+              })
+            } else {
+              engine.term.write(bytes)
+            }
           }
           offsetsRef.current.set(id, payload.offset)
           if (payload.alive === false) {
@@ -6788,7 +6803,13 @@ function PtyPanel({ sessionId, call, height }) {
           setError(`${TERMINAL_PROFILE_LABELS[item.profile] ?? item.profile}: сетка ${term.cols}×${term.rows}, панель ${host.clientWidth}×${host.clientHeight}`)
         }
         if (item.id === activeId) term.focus()
+        // Swallow query responses (device attributes) that the replayed
+        // startup buffer triggers: nobody is waiting for them any more.
+        engineOf(item.id).mute = false
+        engineOf(item.id).replayMute = false
         term.onData((data) => {
+          const engine = engineOf(item.id)
+          if (engine !== undefined && engine.mute === true) return
           if (call !== undefined) call('termWrite', { sessionId, id: item.id, data }).catch(() => {})
         })
         term.onResize((size) => {
@@ -6800,7 +6821,13 @@ function PtyPanel({ sessionId, call, height }) {
         if (call !== undefined && item.alive !== false && (offsetsRef.current.get(item.id) ?? 0) === 0) {
           call('termRead', { sessionId, id: item.id, offset: 0, waitMs: 0 })
             .then((payload) => {
-              if (payload.data !== '') term.write(bytesFromBase64(payload.data))
+              const engine = engineOf(item.id)
+              if (payload.data !== '' && engine !== undefined) {
+                engine.mute = true
+                term.write(bytesFromBase64(payload.data), () => {
+                  engine.mute = false
+                })
+              }
               offsetsRef.current.set(item.id, payload.offset)
             })
             .catch(() => {})
