@@ -13915,7 +13915,7 @@ function IdeBody(props) {
 .dsh-ide-pty-close:hover { color:var(--ide-fg); background:var(--ide-border); }
 .dsh-ide-pty-empty { color:var(--ide-fg-dim); font:400 11px/1.6 var(--ide-font); padding:0 6px; }
 .dsh-ide-pty-error { color:#f48771; font:400 11px/1.4 var(--ide-font); padding-right:8px; overflow:hidden; text-overflow:ellipsis; }
-.dsh-ide-pty-screens { min-height:0; flex:1; position:relative; background:var(--ide-bg); }
+.dsh-ide-pty-screens { position:relative; background:var(--ide-bg); }
 .dsh-ide-pty-screen { position:absolute; inset:0; padding:2px 4px; overflow:hidden; }
 .dsh-ide-pty-screen .xterm { height:100%; }
 .dsh-ide-pty-blank { color:var(--ide-fg-dim); padding:10px 12px; font:400 11.5px/1.5 var(--ide-font); }
