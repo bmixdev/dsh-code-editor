@@ -6938,6 +6938,9 @@ function PtyPanel({ sessionId, call, height }) {
 
   // Pixel position of the caret cell: the fit addon divides the host exactly
   // into cols×rows cells, so cell size needs no private renderer internals.
+  // The hint renders on the row below the caret so it never covers the text
+  // being typed; when the caret is on the last row the position is clamped to
+  // stay inside the screen.
   const ghostPosition = React.useCallback((id) => {
     const engine = engineOf(id)
     const host = hostsRef.current.get(id)
@@ -6948,7 +6951,8 @@ function PtyPanel({ sessionId, call, height }) {
     const cellW = host.clientWidth / Math.max(1, term.cols)
     const cellH = host.clientHeight / Math.max(1, term.rows)
     const buffer = term.buffer.active
-    return { x: 4 + buffer.cursorX * cellW, y: 2 + buffer.cursorY * cellH, cellH, hostWidth: host.clientWidth }
+    const belowY = Math.min(2 + (buffer.cursorY + 1) * cellH, host.clientHeight - cellH)
+    return { x: 4, y: belowY, cellH, hostWidth: host.clientWidth }
   }, [])
 
   const startReader = React.useCallback((id) => {
@@ -7295,7 +7299,8 @@ function PtyPanel({ sessionId, call, height }) {
                         left: `${position.x}px`,
                         top: `${position.y}px`,
                         lineHeight: `${position.cellH}px`,
-                        maxWidth: `${Math.max(60, position.hostWidth - position.x - 8)}px`,
+                        width: `${Math.max(60, position.hostWidth - position.x - 8)}px`,
+                        maxHeight: `${position.cellH * 4}px`,
                       },
                     },
                     shown.text,
@@ -14265,7 +14270,7 @@ function IdeBody(props) {
 .dsh-ide-pty-bulb:hover { background:var(--ide-hover); }
 .dsh-ide-pty-bulb-busy { cursor:progress; opacity:.65; animation:dsh-ide-pty-pulse 1.2s ease-in-out infinite; }
 @keyframes dsh-ide-pty-pulse { 50% { opacity:.3; } }
-.dsh-ide-pty-ghost { position:absolute; z-index:5; color:color-mix(in srgb, var(--ide-fg) 38%, transparent); font:12.5px/1 Consolas, "Courier New", monospace; white-space:pre; overflow:hidden; pointer-events:none; user-select:none; }
+.dsh-ide-pty-ghost { position:absolute; z-index:5; color:color-mix(in srgb, var(--ide-fg) 38%, transparent); font:12.5px/1 Consolas, "Courier New", monospace; white-space:normal; word-break:break-word; overflow:hidden; pointer-events:none; user-select:none; }
 .dsh-ide-empty { position:absolute; inset:0; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:6px; text-align:center; padding:16px; pointer-events:none; z-index:2; }
 .dsh-ide-watermark { font:700 72px/1 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.02em; color:var(--ide-text);
