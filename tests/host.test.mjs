@@ -439,6 +439,68 @@ test('the open, save and state routes work together', async () => {
   }
 })
 
+test('open decodes legacy encodings and save honours the picked eol and encoding', async () => {
+  const root = await makeWorkspace()
+  try {
+    // UTF-16 LE with a BOM — the sniffer must catch it without any hint.
+    // (Node Buffers never write a BOM themselves, so it is prepended by hand.)
+    await writeFile(
+      path.join(root, 'src', 'legacy.txt'),
+      Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('привет мир\nвторой\n', 'utf16le')]),
+    )
+    // Windows-1251 «привет\nмир\n» — Node Buffers cannot encode it, so the
+    // fixture lists the bytes; the Host decodes through TextDecoder.
+    await writeFile(
+      path.join(root, 'src', 'cp1251.txt'),
+      Buffer.from([0xef, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2, 0x0a, 0xec, 0xe8, 0xf0, 0x0a]),
+    )
+    const app = setup({ root })
+
+    const sniffed = await app.call('open', { sessionId: SESSION_ID, path: 'src/legacy.txt' })
+    assert.equal(sniffed.body.encoding, 'utf16le')
+    assert.equal(sniffed.body.bom, true)
+    assert.equal(sniffed.body.text, 'привет мир\nвторой\n')
+    assert.equal(sniffed.body.eol, 'lf')
+
+    const cp1251 = await app.call('open', { sessionId: SESSION_ID, path: 'src/cp1251.txt', encoding: 'windows-1251' })
+    assert.equal(cp1251.body.encoding, 'windows-1251')
+    assert.equal(cp1251.body.text, 'привет\nмир\n')
+
+    // Saving may switch the EOL and the encoding; both are remembered on the
+    // document, so a later save keeps writing the same shape.
+    const converted = await app.call('save', {
+      id: cp1251.body.id,
+      sessionId: SESSION_ID,
+      token: cp1251.body.token,
+      text: 'строка один\nстрока два\n',
+      eol: 'crlf',
+      encoding: 'utf8-bom',
+    })
+    assert.equal(typeof converted.body.token, 'string')
+    const bytes = await readFile(path.join(root, 'src', 'cp1251.txt'))
+    assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf])
+    assert.equal(bytes.toString('utf8'), '\uFEFFстрока один\r\nстрока два\r\n')
+
+    const reopened = await app.call('open', { sessionId: SESSION_ID, path: 'src/cp1251.txt' })
+    assert.equal(reopened.body.encoding, 'utf8-bom')
+    assert.equal(reopened.body.eol, 'crlf')
+    assert.equal(reopened.body.text, 'строка один\nстрока два\n')
+
+    // Anything beyond UTF-8 stays read-and-convert-only: the file system seam
+    // writes text, and there is no byte-level write to encode into Windows-1251.
+    const refused = await app.call('save', {
+      id: reopened.body.id,
+      sessionId: SESSION_ID,
+      token: reopened.body.token,
+      text: 'строка\n',
+      encoding: 'windows-1251',
+    })
+    assert.equal(errorCode(refused.body), 'unsupported-encoding')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('preferences are shared with the code-editor plugin', async () => {
   const root = await makeWorkspace()
   try {

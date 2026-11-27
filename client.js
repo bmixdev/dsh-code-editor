@@ -4023,6 +4023,141 @@ function describeScmError(cause) {
       )
     }
 
+    /** Encodings the status bar offers. `writable` ones can be written back by the Host. */
+    const ENCODING_OPTIONS = [
+      { id: 'utf8', label: 'UTF-8', writable: true },
+      { id: 'utf8-bom', label: 'UTF-8 с BOM', writable: true },
+      { id: 'utf16le', label: 'UTF-16 LE', writable: false },
+      { id: 'utf16be', label: 'UTF-16 BE', writable: false },
+      { id: 'windows-1251', label: 'Windows-1251', writable: false },
+      { id: 'koi8-r', label: 'KOI8-R', writable: false },
+      { id: 'ibm866', label: 'OEM 866', writable: false },
+      { id: 'windows-1252', label: 'Windows-1252', writable: false },
+      { id: 'iso-8859-5', label: 'ISO 8859-5', writable: false },
+    ]
+
+    const encodingLabel = (id) => {
+      const spec = ENCODING_OPTIONS.find((candidate) => candidate.id === id)
+      return spec === undefined ? 'UTF-8' : spec.label
+    }
+
+    /**
+     * Monaco does not give every language an extension list; this maps the
+     * ids it omits to a representative extension so the language picker can
+     * reuse the explorer's colored file badges.
+     */
+    const LANG_BADGE_BY_ID = {
+      javascript: '.js', typescript: '.ts', json: '.json', css: '.css', html: '.html', xml: '.xml',
+      markdown: '.md', python: '.py', ruby: '.rb', go: '.go', rust: '.rs', java: '.java',
+      kotlin: '.kt', c: '.c', cpp: '.cpp', csharp: '.cs', php: '.php', shell: '.sh',
+      powershell: '.ps1', yaml: '.yml', ini: '.ini', sql: '.sql', lua: '.lua', dart: '.dart',
+      swift: '.swift', perl: '.pl', dockerfile: 'Dockerfile', scss: '.scss', less: '.less', bat: '.bat',
+    }
+
+    /**
+     * Status-bar list picker (language mode, EOL, encoding) — Cursor-style:
+     * a search field, keyboard navigation and a checkmark on the active value.
+     * `head` renders the encoding mode toggle («открыть» / «сохранить»).
+     */
+    function StatusPicker({ title, entries, currentId, head, onPick, onClose }) {
+      const [query, setQuery] = React.useState('')
+      const [position, setPosition] = React.useState(0)
+      const needle = query.trim().toLowerCase()
+      const visible = entries.filter(
+        (entry) => needle === '' || entry.label.toLowerCase().includes(needle) || entry.id.toLowerCase().includes(needle),
+      )
+      const move = (delta) =>
+        setPosition((value) => (visible.length === 0 ? 0 : (value + delta + visible.length) % visible.length))
+      const current = visible[position]
+      return h(
+        'div',
+        { className: 'dsh-ide-modal dsh-ide-modal-top', onClick: onClose },
+        h(
+          'div',
+          { className: 'dsh-ide-modal-card dsh-ide-quick dsh-ide-picker', onClick: (event) => event.stopPropagation() },
+          h('div', { className: 'dsh-ide-picker-title' }, title),
+          head === undefined
+            ? null
+            : h(
+                'div',
+                { className: 'dsh-ide-picker-head' },
+                head.map((part) =>
+                  h(
+                    'button',
+                    {
+                      key: part.id,
+                      type: 'button',
+                      className: `dsh-ide-picker-head-item${part.active ? ' dsh-ide-picker-head-item-active' : ''}`,
+                      onClick: part.run,
+                    },
+                    part.label,
+                  ),
+                ),
+              ),
+          h('input', {
+            className: 'dsh-ide-quick-input',
+            type: 'text',
+            autoFocus: true,
+            placeholder: menuText('Фильтр…', 'Filter…'),
+            spellCheck: false,
+            value: query,
+            'aria-label': title,
+            onChange: (event) => {
+              setQuery(event.target.value)
+              setPosition(0)
+            },
+            onKeyDown: (event) => {
+              if (event.key === 'ArrowDown') {
+                event.preventDefault()
+                move(1)
+                return
+              }
+              if (event.key === 'ArrowUp') {
+                event.preventDefault()
+                move(-1)
+                return
+              }
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                onClose()
+                return
+              }
+              if (event.key !== 'Enter') return
+              event.preventDefault()
+              if (current !== undefined) onPick(current)
+            },
+          }),
+          h(
+            'div',
+            { className: 'dsh-ide-quick-list', role: 'list' },
+            visible.length === 0
+              ? h('div', { className: 'dsh-ide-tree-empty' }, menuText('Ничего не найдено', 'No matches'))
+              : visible.map((entry, index) =>
+                  h(
+                    'button',
+                    {
+                      key: entry.id,
+                      type: 'button',
+                      className: `dsh-ide-quick-row dsh-ide-picker-row${index === position ? ' dsh-ide-quick-row-active' : ''}${
+                        entry.disabled === true ? ' dsh-ide-picker-row-off' : ''
+                      }`,
+                      title: entry.detail === undefined ? entry.label : `${entry.label} — ${entry.detail}`,
+                      onClick: () => onPick(entry),
+                      onMouseEnter: () => setPosition(index),
+                    },
+                    entry.badge === undefined
+                      ? h('span', { className: 'dsh-ide-badge' }, '')
+                      : h(FileBadge, { name: entry.badge }),
+                    h('span', { className: 'dsh-ide-row-name' }, entry.label),
+                    entry.detail === undefined ? null : h('span', { className: 'dsh-ide-row-dim' }, entry.detail),
+                    h('span', { className: 'dsh-ide-picker-check' }, entry.id === currentId ? '✓' : ''),
+                  ),
+                ),
+          ),
+        ),
+      )
+    }
+
     function QuickOpen({ files, loading, error, onPick, onClose }) {
       const [query, setQuery] = React.useState('')
       const [index, setIndex] = React.useState(0)
@@ -6774,6 +6909,7 @@ function IdeBody(props) {
   const [replayHint, setReplayHint] = React.useState(undefined)
   const showChat = preferences === undefined || preferences.showChat !== false
       const [quick, setQuick] = React.useState(undefined)
+      const [picker, setPicker] = React.useState(undefined)
       const [dialog, setDialog] = React.useState(undefined)
       const [cursor, setCursor] = React.useState({ line: 1, column: 1 })
       const [consent, setConsent] = React.useState(undefined)
@@ -6866,7 +7002,7 @@ function IdeBody(props) {
         if (pendingOpens.current.has(normalized)) return undefined
         pendingOpens.current.add(normalized)
         try {
-          const payload = await call('open', { sessionId: scope, path: normalized })
+          const payload = await call('open', { sessionId: scope, path: normalized, encoding: options?.encoding })
           const entry = {
             key: payload.id,
             path: normalized,
@@ -6876,6 +7012,8 @@ function IdeBody(props) {
             text: payload.text,
             language: payload.language,
             eol: payload.eol,
+            encoding: payload.encoding ?? 'utf8',
+            languageOverride: undefined,
             readOnly: payload.readOnly === true,
             dirty: false,
           }
@@ -7482,6 +7620,8 @@ function IdeBody(props) {
             sessionId: stateRef.current.sessionId,
             token: target.token,
             text: model.getValue(),
+            eol: target.eol,
+            encoding: target.encoding,
           })
           setTabs((previous) => previous.map((candidate) => (candidate.key === key ? { ...candidate, token: payload.token, dirty: false } : candidate)))
           setChanges((previous) => previous.map((change) => (change.path === target.path ? { ...change, saved: true } : change)))
@@ -7494,6 +7634,110 @@ function IdeBody(props) {
           setStatus({ kind: 'error', message: describeError(cause) })
           return false
         }
+      }
+
+      // ------------------------------------------------------ status pickers
+      //
+      // Language / EOL / encoding pickers driven from the status bar. The
+      // language is view-only (it never marks the tab dirty); switching the EOL
+      // or the save encoding changes what the next save writes, so it does;
+      // reopening in another encoding needs a clean tab because the buffer is
+      // re-read from disk.
+      const closePicker = () => setPicker(undefined)
+
+      const pickLanguage = (entry, picked) => {
+        closePicker()
+        const languageId = picked.id === 'auto' ? entry.language || 'plaintext' : picked.id
+        const model = runtime.current.models.get(entry.key)
+        if (model !== undefined && monaco !== undefined) monaco.editor.setModelLanguage(model, languageId)
+        setTabs((previous) =>
+          previous.map((candidate) =>
+            candidate.key === entry.key
+              ? { ...candidate, languageOverride: picked.id === 'auto' ? undefined : picked.id }
+              : candidate,
+          ),
+        )
+      }
+
+      const pickEol = (entry, eol) => {
+        closePicker()
+        if (entry.eol === eol) return
+        setTabs((previous) => previous.map((candidate) => (candidate.key === entry.key ? { ...candidate, eol, dirty: true } : candidate)))
+        setStatus({
+          kind: 'idle',
+          message: eol === 'crlf' ? 'Конец строк: CRLF — применится при сохранении' : 'Конец строк: LF — применится при сохранении',
+        })
+      }
+
+      const pickEncoding = (entry, encodingId, mode) => {
+        closePicker()
+        const spec = ENCODING_OPTIONS.find((candidate) => candidate.id === encodingId)
+        if (spec === undefined) return
+        if (mode === 'save' && spec.writable === true) {
+          setTabs((previous) =>
+            previous.map((candidate) =>
+              candidate.key === entry.key && candidate.encoding !== encodingId ? { ...candidate, encoding: encodingId, dirty: true } : candidate,
+            ),
+          )
+          setStatus({ kind: 'idle', message: `Кодировка сохранения: ${spec.label}` })
+          return
+        }
+        if (entry.dirty) {
+          setStatus({ kind: 'error', message: 'Сначала сохраните изменения — файл будет переоткрыт в новой кодировке.' })
+          return
+        }
+        const path = entry.path
+        // The buffer is re-read from disk in the chosen encoding: the old tab
+        // and its model must go, or openFile would only re-activate it. A save
+        // pick of a non-writable encoding lands here too — there is no
+        // byte-level write on the file seam, so reopening is all it can mean.
+        removeTab(entry.key)
+        void openFile(path, { activate: true, encoding: encodingId }).then(() => {
+          setStatus({
+            kind: 'idle',
+            message:
+              mode === 'save'
+                ? `${spec.label}: запись недоступна — файл переоткрыт в этой кодировке, сохранение будет в UTF-8.`
+                : `Открыто в кодировке ${spec.label}`,
+          })
+        })
+      }
+
+      const pickerEntries = (kind, mode, entry) => {
+        if (kind === 'language') {
+          const items = [{ id: 'auto', label: menuText('Автоматическое обнаружение', 'Auto detect') }]
+          if (monaco !== undefined) {
+            const languages = monaco.languages
+              .getLanguages()
+              .map((candidate) => ({
+                id: candidate.id,
+                label: candidate.aliases !== undefined && candidate.aliases.length > 0 ? candidate.aliases[0] : candidate.id,
+                badge:
+                  candidate.extensions !== undefined && candidate.extensions.length > 0
+                    ? candidate.extensions[0]
+                    : LANG_BADGE_BY_ID[candidate.id],
+              }))
+            languages.sort((left, right) => left.label.localeCompare(right.label, 'ru'))
+            items.push(...languages)
+          }
+          return items
+        }
+        if (kind === 'eol') {
+          return [
+            { id: 'lf', label: 'LF', detail: menuText('перевод строки (Unix)', 'line feed (Unix)') },
+            {
+              id: 'crlf',
+              label: 'CRLF',
+              detail: menuText('возврат каретки и перевод строки (Windows)', 'carriage return and line feed (Windows)'),
+            },
+          ]
+        }
+        return ENCODING_OPTIONS.map((candidate) => ({
+          id: candidate.id,
+          label: candidate.label,
+          detail: candidate.writable ? undefined : menuText('только открытие', 'open only'),
+          disabled: mode === 'save' && candidate.writable !== true,
+        }))
       }
 
       const pathOfTab = (key) => {
@@ -7655,10 +7899,20 @@ function IdeBody(props) {
         const next = current.filter((candidate) => !removing.has(candidate.key))
         const active = stateRef.current.activeKey
         setTabs(next)
+        // Sync the ref immediately: an openFile() call later in the same tick
+        // (reopening with another encoding) must not see the removed tab and
+        // "re-activate" a key that no longer exists — the file would just close.
+        stateRef.current.tabs = next
         if (removing.has(active)) {
           const index = current.findIndex((candidate) => candidate.key === active)
-          if (next.length === 0) setActiveKey('')
-          else setActiveKey((next[Math.min(Math.max(index, 0), next.length - 1)] || next[0]).key)
+          if (next.length === 0) {
+            setActiveKey('')
+            stateRef.current.activeKey = ''
+          } else {
+            const fallback = (next[Math.min(Math.max(index, 0), next.length - 1)] || next[0]).key
+            setActiveKey(fallback)
+            stateRef.current.activeKey = fallback
+          }
         }
       }
 
@@ -12172,15 +12426,44 @@ function IdeBody(props) {
               h('span', { className: 'dsh-ide-status-spacer' }),
               activeTab === undefined
                 ? null
-                : h('span', { className: 'dsh-ide-status-item dsh-ide-status-lang' }, activeTab.language || 'plain'),
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action dsh-ide-status-lang',
+                      title: 'Выбрать языковой режим',
+                      onClick: () => setPicker({ kind: 'language' }),
+                    },
+                    activeTab.languageOverride || activeTab.language || 'plain',
+                  ),
               activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item dsh-ide-status-pos' }, `Стр ${cursor.line}, Стлб ${cursor.column}`),
               activeTab !== undefined && activeTab.readOnly
                 ? h('span', { className: 'dsh-ide-status-item dsh-ide-status-readonly' }, 'Только чтение')
                 : null,
               activeTab === undefined || activeTab.readOnly
                 ? null
-                : h('span', { className: 'dsh-ide-status-item dsh-ide-status-eol' }, activeTab.eol === 'crlf' ? 'CRLF' : 'LF'),
-              activeTab === undefined ? null : h('span', { className: 'dsh-ide-status-item dsh-ide-status-enc' }, 'UTF-8'),
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action dsh-ide-status-eol',
+                      title: 'Выбрать конец строки',
+                      onClick: () => setPicker({ kind: 'eol' }),
+                    },
+                    activeTab.eol === 'crlf' ? 'CRLF' : 'LF',
+                  ),
+              activeTab === undefined
+                ? null
+                : h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-ide-status-item dsh-ide-status-action dsh-ide-status-enc',
+                      title: 'Выбрать кодировку',
+                      onClick: () => setPicker({ kind: 'encoding', mode: 'save' }),
+                    },
+                    encodingLabel(activeTab.encoding),
+                  ),
               askModeOn
                 ? h(
                     'button',
@@ -12407,6 +12690,46 @@ function IdeBody(props) {
                 void openFile(path, { activate: true })
               },
               onClose: () => setQuick(undefined),
+            })
+          : null,
+        picker !== undefined && activeTab !== undefined
+          ? h(StatusPicker, {
+              title:
+                picker.kind === 'language'
+                  ? menuText('Выбрать языковой режим', 'Select Language Mode')
+                  : picker.kind === 'eol'
+                    ? menuText('Выбрать конец строки', 'Select End of Line Sequence')
+                    : menuText('Выбрать кодировку', 'Select File Encoding'),
+              currentId:
+                picker.kind === 'language'
+                  ? activeTab.languageOverride ?? 'auto'
+                  : picker.kind === 'eol'
+                    ? activeTab.eol
+                    : activeTab.encoding,
+              head:
+                picker.kind !== 'encoding'
+                  ? undefined
+                  : [
+                      {
+                        id: 'open',
+                        label: menuText('Открыть в кодировке', 'Reopen with encoding'),
+                        active: picker.mode !== 'save',
+                        run: () => setPicker({ kind: 'encoding', mode: 'open' }),
+                      },
+                      {
+                        id: 'save',
+                        label: menuText('Сохранить в кодировке', 'Save with encoding'),
+                        active: picker.mode === 'save',
+                        run: () => setPicker({ kind: 'encoding', mode: 'save' }),
+                      },
+                    ],
+              entries: pickerEntries(picker.kind, picker.mode, activeTab),
+              onPick: (picked) => {
+                if (picker.kind === 'language') pickLanguage(activeTab, picked)
+                else if (picker.kind === 'eol') pickEol(activeTab, picked.id)
+                else pickEncoding(activeTab, picked.id, picker.mode === 'save' ? 'save' : 'open')
+              },
+              onClose: closePicker,
             })
           : null,
         dialog !== undefined
@@ -13398,6 +13721,13 @@ function IdeBody(props) {
 .dsh-ide-quick-row { display:flex; align-items:center; gap:6px; width:100%; border:0; background:transparent; color:inherit;
   text-align:left; cursor:pointer; padding:3px 6px; border-radius:4px; font:inherit; }
 .dsh-ide-quick-row-active { background:var(--ide-active); }
+.dsh-ide-picker-title { font:600 11px/1.3 var(--dsh-font-ui, system-ui, sans-serif); color:var(--ide-muted); padding:2px 2px 6px; }
+.dsh-ide-picker-head { display:flex; gap:4px; margin-bottom:6px; }
+.dsh-ide-picker-head-item { flex:1; border:1px solid var(--ide-border); background:transparent; color:inherit; font:inherit; border-radius:4px; padding:4px 6px; cursor:pointer; }
+.dsh-ide-picker-head-item-active { background:var(--ide-active); }
+.dsh-ide-picker-check { width:14px; flex:none; text-align:center; opacity:.9; margin-left:auto; }
+.dsh-ide-picker-row-off { opacity:.45; cursor:default; }
+.dsh-ide-picker .dsh-ide-quick-list { min-height:80px; }
 .dsh-ide-action { display:inline-flex; align-items:center; gap:4px; }
 .dsh-ide-action-button { display:inline-flex; align-items:center; gap:5px; font:600 10.5px/1.25 var(--dsw-font-family, var(--dsh-font-ui, system-ui, sans-serif));
   color:var(--dsw-alias-label-secondary, inherit); background:var(--dsw-alias-bg-layer-1, transparent);

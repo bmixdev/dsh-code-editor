@@ -559,9 +559,22 @@ export function apply(ctx, config) {
     if (bytes.byteLength > MAX_EDIT_BYTES) {
       return fail('too-large', 'Файл больше 1 МиБ — редактор такие не открывает.')
     }
-    const decoded = decodeUtf8(bytes)
+
+    // An explicit `body.encoding` reopens the file with that charset; without
+    // one the BOM decides and the rest is read as UTF-8.
+    const requestedEncoding = typeof body.encoding === 'string' ? body.encoding : ''
+    if (requestedEncoding !== '' && !ENCODINGS.has(requestedEncoding)) {
+      return fail('unsupported-encoding', `Неизвестная кодировка: ${requestedEncoding}`)
+    }
+    const encoding = requestedEncoding !== '' ? requestedEncoding : (sniffEncoding(bytes) ?? 'utf8')
+    const decoded = decodeWithEncoding(bytes, encoding)
     if (decoded === undefined) {
-      return fail('unsupported-encoding', 'Файл не является текстом UTF-8 (или содержит NUL) — только просмотр.')
+      return fail(
+        'unsupported-encoding',
+        encoding === 'utf8'
+          ? 'Файл не является текстом UTF-8 (или содержит NUL) — попробуйте открыть его в другой кодировке через статус-бар.'
+          : `Файл не удалось декодировать как ${ENCODINGS.get(encoding).label}.`,
+      )
     }
 
     const eol = detectEol(decoded.text)
@@ -581,6 +594,7 @@ export function apply(ctx, config) {
       token: record.token,
       eol,
       bom: decoded.bom,
+      encoding,
       displayPath,
       workspaceRoot: scope.cwd,
       language: languageOf(displayPath),
@@ -593,6 +607,7 @@ export function apply(ctx, config) {
       text,
       eol,
       bom: decoded.bom,
+      encoding,
       language: languageOf(displayPath),
       displayPath,
       relativePath: relativeOf(scope.cwd, displayPath),
@@ -621,6 +636,21 @@ export function apply(ctx, config) {
     }
     if (typeof body.text !== 'string') return fail('bad-request', 'Не передано содержимое файла.')
 
+    // The client owns the EOL and the encoding while a tab is open: it may
+    // switch either from the status bar and save the new choice. Anything
+    // beyond UTF-8 cannot be written back — the file system seam writes text,
+    // and such a file must first be converted to UTF-8.
+    const eol = body.eol === 'crlf' || body.eol === 'lf' ? body.eol : document.eol
+    const encoding =
+      body.encoding === 'utf8' || body.encoding === 'utf8-bom'
+        ? body.encoding
+        : body.encoding === undefined || body.encoding === ''
+          ? document.encoding
+          : undefined
+    if (encoding === undefined) {
+      return fail('unsupported-encoding', 'Запись возможна только в UTF-8 — пересохраните файл как UTF-8.')
+    }
+
     const session = ctx.sessions.get(document.sessionId)
     if (session === undefined) return fail('no-session', 'Сессия закрыта — сохранение невозможно.')
     const policy = ctx.sandboxPolicy.resolve({ session })
@@ -628,9 +658,13 @@ export function apply(ctx, config) {
       return fail('read-only', 'Сессия работает в режиме только для чтения — сохранение запрещено.')
     }
 
+    document.eol = eol
+    document.encoding = encoding
+    document.bom = encoding === 'utf8-bom'
+    const normalized = body.text.replace(/\r\n/g, '\n')
     const content =
       (document.bom ? '\uFEFF' : '') +
-      (document.eol === 'crlf' ? body.text.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n') : body.text)
+      (eol === 'crlf' ? normalized.replace(/\n/g, '\r\n') : normalized)
 
     const outcome = await ctx.fs.writeText(
       document.target,
@@ -3455,6 +3489,67 @@ function detectEol(text) {
 
 function languageOf(displayPath) {
   return EXTENSIONS.get(path.extname(displayPath).toLowerCase()) ?? 'plaintext'
+}
+
+/**
+ * Encodings the Host can decode on open. `writable` marks the ones that can be
+ * expressed as a `ctx.fs.writeText` payload (UTF-8 text); the others are
+ * read-and-convert-only, because the file system seam has no byte-level write.
+ */
+const ENCODINGS = new Map([
+  ['utf8', { label: 'UTF-8', writable: true }],
+  ['utf8-bom', { label: 'UTF-8 с BOM', writable: true }],
+  ['utf16le', { label: 'UTF-16 LE', writable: false }],
+  ['utf16be', { label: 'UTF-16 BE', writable: false }],
+  ['windows-1251', { label: 'Windows-1251', writable: false }],
+  ['koi8-r', { label: 'KOI8-R', writable: false }],
+  ['ibm866', { label: 'OEM 866', writable: false }],
+  ['windows-1252', { label: 'Windows-1252', writable: false }],
+  ['iso-8859-5', { label: 'ISO 8859-5', writable: false }],
+])
+
+/** BOM sniffing only: there is no reliable heuristic for byte-level charsets. */
+function sniffEncoding(bytes) {
+  if (bytes.byteLength >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) return 'utf16le'
+  if (bytes.byteLength >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return 'utf16be'
+  if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return 'utf8-bom'
+  return undefined
+}
+
+function decodeWithEncoding(bytes, encoding) {
+  if (encoding === 'utf8') return decodeUtf8(bytes)
+  if (encoding === 'utf8-bom') {
+    const hasBom = bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+    const view = hasBom ? bytes.subarray(3) : bytes
+    try {
+      return { text: new TextDecoder('utf-8', { fatal: true }).decode(view), bom: hasBom }
+    } catch {
+      return undefined
+    }
+  }
+  if (encoding === 'utf16le' || encoding === 'utf16be') {
+    if (bytes.byteLength % 2 !== 0) return undefined
+    const hasBom =
+      (encoding === 'utf16le' && bytes[0] === 0xff && bytes[1] === 0xfe) ||
+      (encoding === 'utf16be' && bytes[0] === 0xfe && bytes[1] === 0xff)
+    const view = hasBom ? bytes.subarray(2) : bytes
+    try {
+      const text = new TextDecoder(encoding === 'utf16le' ? 'utf-16le' : 'utf-16be').decode(view)
+      if (text.includes('\u0000')) return undefined
+      return { text, bom: hasBom }
+    } catch {
+      return undefined
+    }
+  }
+  const spec = ENCODINGS.get(encoding)
+  if (spec === undefined) return undefined
+  try {
+    const text = new TextDecoder(encoding, { fatal: true }).decode(bytes)
+    if (text.includes('\u0000')) return undefined
+    return { text, bom: false }
+  } catch {
+    return undefined
+  }
 }
 
 /**
