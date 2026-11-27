@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-ide",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "private": true,
   "type": "module",
   "description": "Main plugin of the dsh-code-editor repository: a classic code-editor style IDE for DeepSeek Harness with an explorer tree, file tabs, quick open (Ctrl+P), a Monaco editor with AI inline suggestions, a Source Control panel for Git with branches and a commit graph, and a settings drawer for the completion model and API key. It lives in the right sidebar and opens from the IDE button on the Start tab, in the composer row, or in the file/Files tab actions.",
@@ -37,6 +37,7 @@
     "ignore.js",
     "rules.js",
     "plans.js",
+    "terminal.js",
     "agentChanges.js",
     "scm.js",
     "prefs.js",
@@ -52,7 +53,7 @@
   "scripts": {
     "check": "node scripts/check-manifests.mjs",
     "bench:search": "node bench/search-compare.mjs",
-    "test": "node --test tests/host.test.mjs tests/client.test.mjs tests/tab.test.mjs tests/edits.test.mjs tests/proposal.test.mjs tests/search.test.mjs tests/structure.test.mjs tests/ignore.test.mjs tests/rules.test.mjs tests/plans.test.mjs tests/agentChanges.test.mjs tests/scm.test.mjs",
+    "test": "node --test tests/host.test.mjs tests/client.test.mjs tests/tab.test.mjs tests/edits.test.mjs tests/proposal.test.mjs tests/search.test.mjs tests/structure.test.mjs tests/ignore.test.mjs tests/rules.test.mjs tests/plans.test.mjs tests/terminal.test.mjs tests/agentChanges.test.mjs tests/scm.test.mjs",
     "test:editor": "node --test editor/tests/completion.test.mjs editor/tests/client-smoke.test.mjs editor/tests/host-smoke.mjs editor/tests/editor-state.test.mjs editor/tests/sync.test.mjs",
     "test:all": "npm test && npm run test:editor"
   },

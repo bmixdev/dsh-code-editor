@@ -49,6 +49,7 @@ import { chooseRules, discoverRules, rulePrompt } from './rules.js'
 import { listPlans, readPlan, savePlan } from './plans.js'
 import { loadIgnore, relativePath } from './ignore.js'
 import { readSessionState, writeSessionState } from './state.js'
+import { createTerminalService } from './terminal.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ASSET_ROOT = path.join(HERE, 'vendor', 'vs')
@@ -353,6 +354,12 @@ export function apply(ctx, config) {
    */
   const changeTracker = createChangeTracker({ recorder: optionalChangeRecorder(ctx) })
 
+  /**
+   * Real PTY terminals. The service owns its processes; the `session/disposed`
+   * hook below and the plugin's own teardown kill anything still running.
+   */
+  const terminalService = createTerminalService({ platform: process.platform })
+
   const json = (value, status = 200) =>
     new Response(JSON.stringify(value), {
       status,
@@ -399,10 +406,18 @@ export function apply(ctx, config) {
       'dsh-ide: workspace changes feed',
     )
     ctx.effect(
-      () => ctx.on('session/disposed', (session) => changeTracker.forget(session?.id)),
+      () => ctx.on('session/disposed', (session) => {
+        changeTracker.forget(session?.id)
+        terminalService.killSession(String(session?.id ?? ''))
+      }),
       'dsh-ide: workspace changes cleanup',
     )
   }
+
+  ctx.effect(
+    () => () => terminalService.dispose(),
+    'dsh-ide: terminal cleanup',
+  )
 
   const handlers = {
     open: (body, signal) => open(body, signal),
@@ -456,6 +471,13 @@ export function apply(ctx, config) {
     remove: (body, signal) => removeRoute(body, signal),
     reveal: (body, signal) => revealRoute(body, signal),
     state: (body) => stateRoute(body),
+    termProfiles: () => terminalService.profilesRoute(),
+    termCreate: (body, signal) => termCreateRoute(body, signal),
+    termWrite: (body) => terminalService.termWriteRoute(body),
+    termResize: (body) => terminalService.termResizeRoute(body),
+    termKill: (body) => terminalService.termKillRoute(body),
+    termList: (body) => terminalService.termListRoute(body),
+    termRead: (body, signal) => terminalService.termReadRoute(body, signal),
     catalog: () => buildCatalog(ctx),
     credentials: (body) => credentialsRoute(body),
     prefs: (body) => prefsRoute(body),
@@ -3387,6 +3409,14 @@ export function apply(ctx, config) {
       return { state: await writeSessionState(scope.id, body.patch) }
     }
     return { state: await readSessionState(scope.id) }
+  }
+
+  /** The terminal always starts in the session workspace root. */
+  async function termCreateRoute(body, signal) {
+    const scope = sessionOf(body)
+    if (scope === undefined) return fail('no-session', 'Сессия не найдена — откройте терминал из активной сессии.')
+    const root = await rootTarget(scope.cwd, signal)
+    return terminalService.termCreateRoute(body, { cwd: ctx.fs.processPath(root) })
   }
 
   async function credentialsRoute(body) {

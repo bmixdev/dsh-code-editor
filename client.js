@@ -6549,6 +6549,378 @@ function matchChord(keymap, event) {
   return undefined
 }
 
+// --------------------------------------------------------------- terminal
+
+let xtermPromise
+
+// xterm ships as plain UMD next to the vendored Monaco: the xterm.js global
+// (`window.Terminal`) is a namespace object holding the `Terminal` class, and
+// `addon-fit.js` sets a `FitAddon` namespace.
+function loadXterm() {
+  if (xtermPromise) return xtermPromise
+  xtermPromise = new Promise((resolve, reject) => {
+    const read = () => (window.Terminal !== undefined && window.FitAddon !== undefined && window.FitAddon.FitAddon !== undefined
+      ? { Terminal: window.Terminal.Terminal ?? window.Terminal, FitAddon: window.FitAddon.FitAddon }
+      : undefined)
+    const ready = read()
+    if (ready !== undefined) {
+      resolve(ready)
+      return
+    }
+    const style = document.createElement('link')
+    style.rel = 'stylesheet'
+    style.href = `${ASSET_BASE}/xterm/xterm.css`
+    document.head.appendChild(style)
+    let script
+    const next = (src, onDone) => {
+      const element = document.createElement('script')
+      element.src = src
+      element.async = true
+      element.addEventListener('load', onDone)
+      element.addEventListener('error', () => reject(new Error('Не удалось загрузить xterm.js')))
+      document.head.appendChild(element)
+      return element
+    }
+    script = next(`${ASSET_BASE}/xterm/xterm.js`, () => {
+      script = next(`${ASSET_BASE}/xterm/addon-fit.js`, () => {
+        const libs = read()
+        if (libs === undefined) {
+          reject(new Error('xterm.js загрузился без глобальных экспортов'))
+          return
+        }
+        resolve(libs)
+      })
+    })
+  })
+  return xtermPromise
+}
+
+function bytesFromBase64(text) {
+  const binary = atob(text)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
+
+const TERMINAL_PROFILE_LABELS = {
+  powershell: 'PowerShell',
+  pwsh: 'PowerShell (pwsh)',
+  cmd: 'Command Prompt',
+  'git-bash': 'Git Bash',
+  node: 'Node',
+  shell: 'Shell',
+}
+
+/**
+ * One real PTY session in the bottom panel. Terminals live on the Host, so a
+ * page reload finds them again through `termList`; the reader keeps a byte
+ * offset per terminal and long-polls for new output.
+ */
+function PtyPanel({ sessionId, call, height }) {
+  const [terminals, setTerminals] = React.useState([])
+  const [activeId, setActiveId] = React.useState(undefined)
+  const [profiles, setProfiles] = React.useState(undefined)
+  const [profileMenu, setProfileMenu] = React.useState(false)
+  const [error, setError] = React.useState('')
+  const hostsRef = React.useRef(new Map())
+  const enginesRef = React.useRef(new Map())
+  const readersRef = React.useRef(new Map())
+  const offsetsRef = React.useRef(new Map())
+
+  const engineOf = (id) => enginesRef.current.get(id)
+
+  const markDead = React.useCallback((id, exitCode) => {
+    setTerminals((previous) => previous.map((item) => (item.id === id ? { ...item, alive: false, exitCode: exitCode ?? item.exitCode } : item)))
+  }, [])
+
+  const startReader = React.useCallback((id) => {
+    if (readersRef.current.has(id)) return
+    const controller = new AbortController()
+    readersRef.current.set(id, controller)
+    ;(async () => {
+      while (!controller.signal.aborted) {
+        try {
+          const payload = await call('termRead', { sessionId, id, offset: offsetsRef.current.get(id) ?? 0, waitMs: 15000 }, controller.signal)
+          if (controller.signal.aborted) return
+          const engine = engineOf(id)
+          if (payload.gap === true) {
+            if (engine !== undefined) engine.term.reset()
+            offsetsRef.current.set(id, payload.offset)
+            continue
+          }
+          if (payload.data !== '' && engine !== undefined) {
+            engine.term.write(bytesFromBase64(payload.data))
+          }
+          offsetsRef.current.set(id, payload.offset)
+          if (payload.alive === false) {
+            markDead(id, payload.exitCode)
+            return
+          }
+        } catch (cause) {
+          if (controller.signal.aborted || cause?.name === 'AbortError') return
+          markDead(id, undefined)
+          return
+        }
+      }
+    })()
+  }, [call, markDead, sessionId])
+
+  // Attach an xterm to every terminal that does not have one yet, then start
+  // its reader. Dead terminals from a previous page keep their scrollback.
+  React.useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      let libs
+      try {
+        libs = await loadXterm()
+      } catch (cause) {
+        if (!cancelled) setError(describeError(cause))
+        return
+      }
+      if (cancelled) return
+      for (const item of terminals) {
+        const host = hostsRef.current.get(item.id)
+        if (host === undefined || enginesRef.current.has(item.id)) continue
+        const term = new (libs.Terminal.Terminal ?? libs.Terminal)({
+          cursorBlink: true,
+          fontSize: 12.5,
+          fontFamily: 'Consolas, "Courier New", monospace',
+          scrollback: 5000,
+          convertEol: false,
+        })
+        const fit = new libs.FitAddon()
+        term.loadAddon(fit)
+        term.open(host)
+        try {
+          fit.fit()
+        } catch {
+          /* zero-size host while hidden */
+        }
+        term.onData((data) => {
+          if (call !== undefined) call('termWrite', { sessionId, id: item.id, data }).catch(() => {})
+        })
+        term.onResize((size) => {
+          if (call !== undefined) call('termResize', { sessionId, id: item.id, cols: size.cols, rows: size.rows }).catch(() => {})
+        })
+        enginesRef.current.set(item.id, { term, fit })
+        if (item.alive !== false) startReader(item.id)
+        // Pull the backlog the reader may already have missed.
+        if (call !== undefined && item.alive !== false && (offsetsRef.current.get(item.id) ?? 0) === 0) {
+          call('termRead', { sessionId, id: item.id, offset: 0, waitMs: 0 })
+            .then((payload) => {
+              if (payload.data !== '') term.write(bytesFromBase64(payload.data))
+              offsetsRef.current.set(item.id, payload.offset)
+            })
+            .catch(() => {})
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [terminals, startReader, call, sessionId])
+
+  // Keep the active terminal fitted to the panel: height drags and window
+  // resizes both land here.
+  React.useEffect(() => {
+    const refit = () => {
+      const engine = engineOf(activeId)
+      if (engine === undefined) return
+      try {
+        engine.fit.fit()
+      } catch {
+        /* zero-size host */
+      }
+    }
+    refit()
+    window.addEventListener('resize', refit)
+    return () => window.removeEventListener('resize', refit)
+  }, [activeId, height, terminals])
+
+  const refreshList = React.useCallback(async () => {
+    if (call === undefined) return
+    try {
+      const payload = await call('termList', { sessionId })
+      setTerminals(Array.isArray(payload.terminals) ? payload.terminals : [])
+      for (const item of payload.terminals ?? []) {
+        if (offsetsRef.current.get(item.id) === undefined) offsetsRef.current.set(item.id, 0)
+      }
+    } catch (cause) {
+      setError(describeError(cause))
+    }
+  }, [call, sessionId])
+
+  const createTerminal = React.useCallback(async (profile) => {
+    if (call === undefined) return
+    setProfileMenu(false)
+    try {
+      const created = await call('termCreate', { sessionId, profile, cols: 80, rows: 24 })
+      offsetsRef.current.set(created.id, 0)
+      setTerminals((previous) => [...previous, { ...created, alive: true }])
+      setActiveId(created.id)
+    } catch (cause) {
+      setError(describeError(cause))
+    }
+  }, [call, sessionId])
+
+  const killTerminal = React.useCallback(async (id) => {
+    readersRef.current.get(id)?.abort()
+    readersRef.current.delete(id)
+    const engine = enginesRef.current.get(id)
+    enginesRef.current.delete(id)
+    try {
+      engine?.term.dispose()
+    } catch {
+      /* already gone */
+    }
+    if (call !== undefined) call('termKill', { sessionId, id }).catch(() => {})
+    setTerminals((previous) => previous.filter((item) => item.id !== id))
+    setActiveId((current) => (current === id ? undefined : current))
+  }, [call, sessionId])
+
+  // On mount: adopt whatever the Host still runs; otherwise create the first
+  // terminal in the default profile, the way VS Code opens one for you.
+  React.useEffect(() => {
+    if (call === undefined || sessionId === undefined) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const payload = await call('termProfiles', {})
+        if (!cancelled) setProfiles(Array.isArray(payload.profiles) ? payload.profiles.filter((profile) => profile.available !== false) : [])
+      } catch {
+        if (!cancelled) setProfiles([])
+      }
+      await refreshList()
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [call, sessionId, refreshList])
+
+  React.useEffect(() => {
+    if (profiles === undefined || terminals.length > 0 || activeId !== undefined) return
+    if (profiles.length === 0) return
+    const preferred = profiles.find((profile) => profile.id === 'powershell') ?? profiles[0]
+    void createTerminal(preferred.id)
+  }, [profiles, terminals.length, activeId, createTerminal])
+
+  // Tear down readers when the panel unmounts; the processes stay alive on
+  // the Host so a reopened panel (or reload) can adopt them again.
+  React.useEffect(() => () => {
+    for (const controller of readersRef.current.values()) controller.abort()
+    readersRef.current.clear()
+  }, [])
+
+  React.useEffect(() => {
+    if (!profileMenu) return undefined
+    const close = () => setProfileMenu(false)
+    const onKey = (event) => {
+      if (event.key === 'Escape') close()
+    }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [profileMenu])
+
+  const labelOf = (item) => `${TERMINAL_PROFILE_LABELS[item.profile] ?? item.profile} — ${item.cwd === undefined ? '' : item.cwd}`
+
+  const visible = terminals.filter((item) => item.alive !== false || enginesRef.current.has(item.id))
+  return h(
+    'div',
+    { className: 'dsh-ide-pty' },
+    h(
+      'div',
+      { className: 'dsh-ide-pty-strip' },
+      h(
+        'div',
+        { className: 'dsh-ide-pty-actions' },
+        h('button', {
+          type: 'button',
+          className: 'dsh-ide-pty-new',
+          title: menuText('Создать терминал', 'New terminal'),
+          onClick: () => setProfileMenu((current) => !current),
+          onMouseDown: (event) => event.stopPropagation(),
+        }, '+'),
+        h(
+          'div',
+          { className: 'dsh-ide-pty-tabs' },
+          visible.length === 0 ? h('span', { className: 'dsh-ide-pty-empty' }, menuText('Терминалов нет', 'No terminals')) : null,
+          visible.map((item) => h(
+            'button',
+            {
+              key: item.id,
+              type: 'button',
+              className: `dsh-ide-pty-tab${item.id === activeId ? ' dsh-ide-pty-tab-active' : ''}`,
+              title: labelOf(item),
+              onClick: () => setActiveId(item.id),
+            },
+            h('span', { className: item.alive === false ? 'dsh-ide-pty-dead' : undefined },
+              item.alive === false
+                ? menuText(`завершён (${item.exitCode ?? 0})`, `exited (${item.exitCode ?? 0})`)
+                : TERMINAL_PROFILE_LABELS[item.profile] ?? item.profile),
+            h('span', {
+              className: 'dsh-ide-pty-close',
+              title: menuText('Завершить', 'Kill terminal'),
+              onClick: (event) => {
+                event.stopPropagation()
+                void killTerminal(item.id)
+              },
+            }, '×'),
+          )),
+        ),
+      ),
+      error === '' ? null : h('span', { className: 'dsh-ide-pty-error' }, error),
+    ),
+    h(
+      'div',
+      { className: 'dsh-ide-pty-screens', style: { height: `${Math.max(120, height - 30)}px` } },
+      visible.length === 0
+        ? h(
+            'div',
+            { className: 'dsh-ide-pty-blank' },
+            profiles === undefined ? menuText('Загрузка…', 'Loading…') : menuText('Создайте терминал кнопкой «+»', 'Create a terminal with “+”'),
+          )
+        : visible.map((item) => h(
+            'div',
+            {
+              key: item.id,
+              hidden: item.id !== activeId,
+              className: 'dsh-ide-pty-screen',
+              ref: (node) => {
+                if (node === null) hostsRef.current.delete(item.id)
+                else hostsRef.current.set(item.id, node)
+              },
+            },
+          )),
+    ),
+    profileMenu
+      ? h(
+          'div',
+          {
+            className: 'dsh-ide-pty-profiles',
+            onMouseDown: (event) => event.stopPropagation(),
+          },
+          (profiles ?? []).map((profile) => h(
+            'button',
+            {
+              key: profile.id,
+              type: 'button',
+              className: 'dsh-ide-pty-profile',
+              onClick: () => void createTerminal(profile.id),
+            },
+            TERMINAL_PROFILE_LABELS[profile.id.split(':')[0]] !== undefined
+              ? `${TERMINAL_PROFILE_LABELS[profile.id.split(':')[0]]}${profile.id.includes(':') ? profile.id.slice(profile.id.indexOf(':')) : ''}`
+              : profile.id,
+          )),
+          (profiles ?? []).length === 0 ? h('span', { className: 'dsh-ide-pty-empty' }, menuText('Профили не найдены', 'No profiles found')) : null,
+        )
+      : null,
+  )
+}
+
 function OutputPanel({ panel, height, trace, showChat, toolTabs, onTab, onSelect, onAccept, onClose }) {
   const [menu, setMenu] = React.useState(undefined)
   React.useEffect(() => {
@@ -6869,6 +7241,7 @@ function IdeBody(props) {
       const [rulesOpen, setRulesOpen] = React.useState(false)
       const [plansOpen, setPlansOpen] = React.useState(false)
       const [terminalOpen, setTerminalOpen] = React.useState(false)
+      const [ptyOpen, setPtyOpen] = React.useState(false)
       const [snoozeUntil, setSnoozeUntil] = React.useState(0)
       const [splitKey, setSplitKey] = React.useState('')
   const [crossFile, setCrossFile] = React.useState(undefined)
@@ -10777,6 +11150,10 @@ function IdeBody(props) {
             setShowTree(saved.showTree !== false)
             setHidden(saved.hidden === true)
             if (loaded.showChat !== false) setPanel({ tab: 'chat', index: 0 })
+            if (saved.ptyOpen === true) {
+              setPtyOpen(true)
+              setPanel({ tab: 'pty', index: 0 })
+            }
             const wanted = []
             if (initialPath !== '') wanted.push(initialPath)
             for (const candidate of Array.isArray(saved.tabs) ? saved.tabs : []) {
@@ -10851,11 +11228,12 @@ function IdeBody(props) {
               showTree,
               hidden,
               fontSize,
+              ptyOpen,
             },
           }).catch(() => {})
         }, STATE_WRITE_DELAY_MS)
         return () => window.clearTimeout(timer)
-      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, panelHeight, showTree, hidden, explorerSide, fontSize])
+      }, [booted, sessionId, tabsKey, activeKey, explorerWidth, panelHeight, showTree, hidden, explorerSide, fontSize, ptyOpen])
 
       const saveSettings = async (patch) => {
         try {
@@ -11110,7 +11488,16 @@ function IdeBody(props) {
       }
 
       const selectPanelTab = (tab) => setPanel((current) => ({ tab, index: current?.index ?? 0 }))
+      const openTerminal = () => {
+        setPtyOpen(true)
+        selectPanelTab('pty')
+      }
       const toolTabs = [
+        ptyOpen && { id: 'pty', label: menuText('Терминал', 'Terminal'), body: h(PtyPanel, {
+              sessionId: stateRef.current.sessionId,
+              call,
+              height: panelHeight,
+            }) },
         plansOpen && { id: 'plans', label: menuText('Планы', 'Plans'), body: h(PlansPanel, {
               sessionId: stateRef.current.sessionId,
               onClose: () => setPlansOpen(false),
@@ -11234,6 +11621,7 @@ function IdeBody(props) {
               key: chordLabel('output'),
               run: toggleOutput,
             },
+            { id: 'pty', label: menuText('Терминал', 'Terminal'), run: openTerminal },
             { separator: true },
             { id: 'word-wrap', label: wordWrap ? menuText('Отключить перенос по словам', 'Disable word wrap') : menuText('Включить перенос по словам', 'Enable word wrap'), run: toggleWordWrap },
             { id: 'zoom-in', label: menuText('Увеличить шрифт', 'Increase font size'), key: 'Ctrl+=', run: () => zoom(1) },
@@ -13429,6 +13817,27 @@ function IdeBody(props) {
 .dsh-ide-chat { padding:6px 12px 10px; }
 .dsh-ide-chat-label { color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px; font-size:10px; margin:8px 0 3px; }
 .dsh-ide-chat-text { margin:0; white-space:pre-wrap; word-break:break-word; font:400 11.5px/1.5 var(--ide-mono); color:var(--ide-fg); max-height:120px; overflow:auto; background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; }
+.dsh-ide-pty { display:flex; flex-direction:column; min-height:0; flex:1; position:relative; }
+.dsh-ide-pty-strip { display:flex; align-items:center; gap:8px; padding:0 6px; height:26px; flex:0 0 auto; border-bottom:1px solid var(--ide-border); overflow-x:auto; white-space:nowrap; }
+.dsh-ide-pty-actions { display:flex; align-items:center; gap:6px; flex:0 0 auto; }
+.dsh-ide-pty-new { border:1px solid var(--ide-border); border-radius:4px; background:transparent; color:var(--ide-fg); font:600 12px/1 var(--ide-font); padding:2px 7px; cursor:pointer; }
+.dsh-ide-pty-new:hover { background:var(--ide-hover); }
+.dsh-ide-pty-tabs { display:flex; align-items:center; gap:2px; min-width:0; }
+.dsh-ide-pty-tab { display:flex; align-items:center; gap:4px; border:none; background:transparent; color:var(--ide-fg-dim); font:400 11px/1.5 var(--ide-font); padding:2px 4px 2px 8px; cursor:pointer; border-radius:4px; }
+.dsh-ide-pty-tab:hover { background:var(--ide-hover); color:var(--ide-fg); }
+.dsh-ide-pty-tab-active { background:var(--ide-active); color:var(--ide-fg); }
+.dsh-ide-pty-dead { color:var(--ide-fg-dim); font-style:italic; }
+.dsh-ide-pty-close { color:var(--ide-fg-dim); font-size:12px; line-height:1; padding:0 3px; border-radius:3px; }
+.dsh-ide-pty-close:hover { color:var(--ide-fg); background:var(--ide-border); }
+.dsh-ide-pty-empty { color:var(--ide-fg-dim); font:400 11px/1.6 var(--ide-font); padding:0 6px; }
+.dsh-ide-pty-error { color:#f48771; font:400 11px/1.4 var(--ide-font); padding-right:8px; overflow:hidden; text-overflow:ellipsis; }
+.dsh-ide-pty-screens { min-height:0; flex:1; position:relative; background:var(--ide-bg); }
+.dsh-ide-pty-screen { position:absolute; inset:0; padding:2px 4px; overflow:hidden; }
+.dsh-ide-pty-screen .xterm { height:100%; }
+.dsh-ide-pty-blank { color:var(--ide-fg-dim); padding:10px 12px; font:400 11.5px/1.5 var(--ide-font); }
+.dsh-ide-pty-profiles { position:absolute; z-index:40; top:24px; left:6px; min-width:180px; padding:4px; border:1px solid var(--ide-border); border-radius:7px; background:var(--ide-panel-2); box-shadow:0 10px 28px rgba(0,0,0,.35); }
+.dsh-ide-pty-profile { display:block; width:100%; padding:5px 9px; border:0; border-radius:5px; background:transparent; color:var(--ide-text); font:12px/1.4 var(--dsw-font-family,inherit); text-align:left; cursor:pointer; }
+.dsh-ide-pty-profile:hover { background:var(--ide-active); }
 .dsh-ide-empty { position:absolute; inset:0; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:6px; text-align:center; padding:16px; pointer-events:none; z-index:2; }
 .dsh-ide-watermark { font:700 72px/1 var(--dsh-font-ui, system-ui, sans-serif); letter-spacing:.02em; color:var(--ide-text);
