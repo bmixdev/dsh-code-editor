@@ -6571,48 +6571,65 @@ function loadXterm() {
     style.rel = 'stylesheet'
     style.href = `${ASSET_BASE}/xterm/xterm.css`
     document.head.appendChild(style)
-    let script
-    const next = (src, onDone) => {
-      const element = document.createElement('script')
-      element.src = src
-      element.async = true
-      // Monaco's loader defines the globals `define`, and a bundled page can
-      // carry `module`/`exports`; the xterm UMD wrapper prefers the AMD/CJS
-      // branches then and never touches `window`. Shadow them for the duration
-      // of this script only.
-      const saved = ['define', 'module', 'exports'].map((name) => [name, window[name]])
-      const shadow = () => {
-        for (const [name, value] of saved) {
-          try {
-            if (value === undefined) delete window[name]
-            else window[name] = value
-          } catch { /* a frozen window keeps the shadow; harmless */ }
+    // The page can carry `define` (Monaco loader), `module`/`exports` (bundled
+    // page code), including lexical bindings that `delete window[...]` cannot
+    // reach. The xterm UMD wrapper prefers those branches and never touches
+    // the global scope then. Evaluate the library inside a hidden same-origin
+    // iframe instead and read the exports from its window. The frame stays
+    // alive: the exported class resolves globals through it at runtime.
+    const loadInFrame = (src, names) => new Promise((resolve, reject) => {
+      const frame = document.createElement('iframe')
+      frame.setAttribute('aria-hidden', 'true')
+      frame.style.display = 'none'
+      let settled = false
+      const settle = (fn) => {
+        if (settled) return
+        settled = true
+        fn()
+      }
+      frame.addEventListener('error', () => settle(() => reject(new Error('Не удалось загрузить ' + src))))
+      frame.addEventListener('load', () => {
+        let doc
+        try {
+          doc = frame.contentDocument
+          if (doc === null) throw new Error('iframe document недоступен')
+        } catch (error) {
+          settle(() => reject(error))
+          return
         }
-      }
-      for (const [name] of saved) {
-        try { delete window[name] } catch { /* keep going */ }
-      }
-      element.addEventListener('load', () => {
-        shadow()
-        onDone()
+        const script = doc.createElement('script')
+        script.src = src
+        script.addEventListener('load', () => {
+          let values
+          try {
+            const win = frame.contentWindow
+            values = names.map((name) => win[name])
+          } catch (error) {
+            settle(() => reject(error))
+            return
+          }
+          settle(() => resolve(values))
+        })
+        script.addEventListener('error', () => settle(() => reject(new Error('Не удалось загрузить ' + src))))
+        ;(doc.head ?? doc.documentElement).appendChild(script)
       })
-      element.addEventListener('error', () => {
-        shadow()
-        reject(new Error('Не удалось загрузить xterm.js'))
-      })
-      document.head.appendChild(element)
-      return element
-    }
-    script = next(`${ASSET_BASE}/xterm/xterm.js`, () => {
-      script = next(`${ASSET_BASE}/xterm/addon-fit.js`, () => {
-        const libs = read()
-        if (libs === undefined) {
+      ;(document.body ?? document.documentElement).appendChild(frame)
+    })
+    Promise
+      .all([
+        loadInFrame(`${ASSET_BASE}/xterm/xterm.js`, ['Terminal']),
+        loadInFrame(`${ASSET_BASE}/xterm/addon-fit.js`, ['FitAddon']),
+      ])
+      .then(([terminals, fits]) => {
+        const Terminal = terminals[0]
+        const FitAddon = fits[0] && fits[0].FitAddon
+        if (Terminal === undefined || FitAddon === undefined) {
           reject(new Error('xterm.js загрузился без глобальных экспортов'))
           return
         }
-        resolve(libs)
+        resolve({ Terminal, FitAddon })
       })
-    })
+      .catch((error) => reject(error instanceof Error ? error : new Error(String(error))))
   })
   return xtermPromise
 }
