@@ -6740,6 +6740,10 @@ function PtyPanel({ sessionId, call, height }) {
   const [profiles, setProfiles] = React.useState(undefined)
   const [profileMenu, setProfileMenu] = React.useState(false)
   const [error, setError] = React.useState('')
+  // AI predictions are opt-in: the lightbulb only appears after the user
+  // turns the toggle on, and the choice is saved in the session state.
+  const [hintsOn, setHintsOn] = React.useState(false)
+  const hintsOnRef = React.useRef(false)
   const hostsRef = React.useRef(new Map())
   const enginesRef = React.useRef(new Map())
   const readersRef = React.useRef(new Map())
@@ -6819,8 +6823,30 @@ function PtyPanel({ sessionId, call, height }) {
     }
   }, [])
 
+  // The input handlers read the switch through a mirror: their closures are
+  // installed once per engine and must see the live toggle state.
+  React.useEffect(() => {
+    hintsOnRef.current = hintsOn
+    if (!hintsOn) {
+      cancelIdle()
+      applyHint(undefined)
+    }
+  }, [hintsOn, cancelIdle, applyHint])
+
+  const toggleHints = React.useCallback(() => {
+    setHintsOn((current) => {
+      const next = !current
+      if (call !== undefined) call('state', { sessionId, patch: { terminalHints: next } }).catch(() => {})
+      return next
+    })
+  }, [call, sessionId])
+
   const requestHint = React.useCallback(async (id) => {
     if (call === undefined || hintBlockedRef.current) return
+    if (!hintsOnRef.current) {
+      applyHint(undefined)
+      return
+    }
     const engine = engineOf(id)
     if (engine === undefined || engine.alive === false) return
     const command = terminalLineUnderCursor(engine.term)
@@ -7018,6 +7044,7 @@ function PtyPanel({ sessionId, call, height }) {
           const engine = engineOf(item.id)
           if (engine !== undefined && engine.mute === true) return
           if (call !== undefined) call('termWrite', { sessionId, id: item.id, data }).catch(() => {})
+          if (!hintsOnRef.current) return
           // Enter runs the command: the line under the caret is about to
           // vanish, so predicting on it would suggest a finished command.
           if (data.includes('\r') || data.includes('\n')) {
@@ -7124,6 +7151,13 @@ function PtyPanel({ sessionId, call, height }) {
     if (call === undefined || sessionId === undefined) return
     let cancelled = false
     ;(async () => {
+      // The hint switch is saved in the session state; the default is off.
+      try {
+        const saved = await call('state', { sessionId })
+        if (!cancelled) setHintsOn(saved?.state?.terminalHints === true)
+      } catch {
+        /* keep the default */
+      }
       try {
         const payload = await call('termProfiles', {})
         if (!cancelled) setProfiles(Array.isArray(payload.profiles) ? payload.profiles.filter((profile) => profile.available !== false) : [])
@@ -7179,6 +7213,15 @@ function PtyPanel({ sessionId, call, height }) {
       h(
         'div',
         { className: 'dsh-ide-pty-actions' },
+        h('button', {
+          type: 'button',
+          className: `dsh-ide-pty-ai${hintsOn ? ' dsh-ide-pty-ai-on' : ''}`,
+          title: hintsOn
+            ? menuText('ИИ-подсказки включены — выключить', 'AI hints are on — click to turn off')
+            : menuText('ИИ-подсказки в терминале — включить', 'Turn on AI hints in the terminal'),
+          'aria-pressed': hintsOn ? 'true' : 'false',
+          onClick: toggleHints,
+        }, hintsOn ? '💡' : 'ИИ'),
         h('button', {
           type: 'button',
           className: 'dsh-ide-pty-new',
@@ -14198,6 +14241,9 @@ function IdeBody(props) {
 .dsh-ide-pty-strip { display:flex; align-items:center; gap:8px; padding:0 6px; height:26px; flex:0 0 auto; border-bottom:1px solid var(--ide-border); overflow-x:auto; white-space:nowrap; }
 .dsh-ide-pty-actions { display:flex; align-items:center; gap:6px; flex:0 0 auto; }
 .dsh-ide-pty-new { border:1px solid var(--ide-border); border-radius:4px; background:transparent; color:var(--ide-fg); font:600 12px/1 var(--ide-font); padding:2px 7px; cursor:pointer; }
+.dsh-ide-pty-ai { border:1px solid var(--ide-border); border-radius:4px; background:transparent; color:var(--ide-fg-dim); font:600 12px/1 var(--ide-font); padding:2px 7px; cursor:pointer; }
+.dsh-ide-pty-ai:hover { background:var(--ide-hover); }
+.dsh-ide-pty-ai-on { color:var(--ide-accent); border-color:var(--ide-accent); }
 .dsh-ide-pty-new:hover { background:var(--ide-hover); }
 .dsh-ide-pty-tabs { display:flex; align-items:center; gap:2px; min-width:0; }
 .dsh-ide-pty-tab { display:flex; align-items:center; gap:4px; border:none; background:transparent; color:var(--ide-fg-dim); font:400 11px/1.5 var(--ide-font); padding:2px 4px 2px 8px; cursor:pointer; border-radius:4px; }
