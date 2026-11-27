@@ -6961,7 +6961,7 @@ function PtyPanel({ sessionId, call, height }) {
     ),
     h(
       'div',
-      { className: 'dsh-ide-pty-screens', style: { height: `${Math.max(120, height - 30)}px` } },
+      { className: 'dsh-ide-pty-screens' },
       visible.length === 0
         ? h(
             'div',
@@ -13901,7 +13901,7 @@ function IdeBody(props) {
 .dsh-ide-chat { padding:6px 12px 10px; }
 .dsh-ide-chat-label { color:var(--ide-fg-dim); text-transform:uppercase; letter-spacing:.4px; font-size:10px; margin:8px 0 3px; }
 .dsh-ide-chat-text { margin:0; white-space:pre-wrap; word-break:break-word; font:400 11.5px/1.5 var(--ide-mono); color:var(--ide-fg); max-height:120px; overflow:auto; background:var(--ide-bg); border:1px solid var(--ide-border); border-radius:4px; padding:6px 8px; }
-.dsh-ide-pty { display:flex; flex-direction:column; min-height:0; flex:1; position:relative; }
+.dsh-ide-pty { display:flex; flex-direction:column; min-height:0; height:100%; box-sizing:border-box; position:relative; }
 .dsh-ide-pty-strip { display:flex; align-items:center; gap:8px; padding:0 6px; height:26px; flex:0 0 auto; border-bottom:1px solid var(--ide-border); overflow-x:auto; white-space:nowrap; }
 .dsh-ide-pty-actions { display:flex; align-items:center; gap:6px; flex:0 0 auto; }
 .dsh-ide-pty-new { border:1px solid var(--ide-border); border-radius:4px; background:transparent; color:var(--ide-fg); font:600 12px/1 var(--ide-font); padding:2px 7px; cursor:pointer; }
@@ -13915,7 +13915,7 @@ function IdeBody(props) {
 .dsh-ide-pty-close:hover { color:var(--ide-fg); background:var(--ide-border); }
 .dsh-ide-pty-empty { color:var(--ide-fg-dim); font:400 11px/1.6 var(--ide-font); padding:0 6px; }
 .dsh-ide-pty-error { color:#f48771; font:400 11px/1.4 var(--ide-font); padding-right:8px; overflow:hidden; text-overflow:ellipsis; }
-.dsh-ide-pty-screens { position:relative; background:var(--ide-bg); }
+.dsh-ide-pty-screens { flex:1 1 auto; min-height:60px; position:relative; background:var(--ide-bg); }
 .dsh-ide-pty-screen { position:absolute; inset:0; padding:2px 4px; overflow:hidden; }
 .dsh-ide-pty-screen .xterm { height:100%; }
 .dsh-ide-pty-blank { color:var(--ide-fg-dim); padding:10px 12px; font:400 11.5px/1.5 var(--ide-font); }
