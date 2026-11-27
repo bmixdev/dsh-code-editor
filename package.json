@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-ide",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "private": true,
   "type": "module",
   "description": "Main plugin of the dsh-code-editor repository: a classic code-editor style IDE for DeepSeek Harness with an explorer tree, file tabs, quick open (Ctrl+P), a Monaco editor with AI inline suggestions, a Source Control panel for Git with branches and a commit graph, a real terminal panel with profiles (PowerShell, pwsh, cmd, Git Bash, WSL, Node) on a PTY, and a settings drawer for the completion model and API key. It lives in the right sidebar and opens from the IDE button on the Start tab, in the composer row, or in the file/Files tab actions.",
