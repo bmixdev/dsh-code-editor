@@ -6681,7 +6681,7 @@ function IdeBody(props) {
       /** Host checkpoints of assistant turns: `{phase, available, turns, error}`. */
       const [assistant, setAssistant] = React.useState({ phase: 'idle', available: true, turns: [], error: '' })
       const [changesOpen, setChangesOpen] = React.useState(false)
-      const [structureOpen, setStructureOpen] = React.useState(false)
+      const [structureOpen, setStructureOpen] = React.useState(true)
       /** Outline of the active file: `{phase, language, symbols, error}`. */
       const [structure, setStructure] = React.useState({ phase: 'idle', language: '', symbols: [], error: '' })
       // Bumped on every «open at line» click: an already-active tab makes
