@@ -6570,6 +6570,13 @@ function loadXterm() {
     const style = document.createElement('link')
     style.rel = 'stylesheet'
     style.href = `${ASSET_BASE}/xterm/xterm.css`
+    // The renderer measures glyphs with styles applied; a half-loaded sheet
+    // yields zero cell metrics. The timeout only backstops a swallowed event.
+    const stylesReady = new Promise((done) => {
+      style.addEventListener('load', () => done())
+      style.addEventListener('error', () => done())
+      setTimeout(done, 3000)
+    })
     document.head.appendChild(style)
     // The page can carry `define` (Monaco loader), `module`/`exports` (bundled
     // page code), including lexical bindings that `delete window[...]` cannot
@@ -6615,21 +6622,23 @@ function loadXterm() {
       })
       ;(document.body ?? document.documentElement).appendChild(frame)
     })
-    Promise
-      .all([
-        loadInFrame(`${ASSET_BASE}/xterm/xterm.js`, ['Terminal']),
-        loadInFrame(`${ASSET_BASE}/xterm/addon-fit.js`, ['FitAddon']),
-      ])
-      .then(([terminals, fits]) => {
-        const Terminal = terminals[0]
-        const FitAddon = fits[0] && fits[0].FitAddon
-        if (Terminal === undefined || FitAddon === undefined) {
-          reject(new Error('xterm.js загрузился без глобальных экспортов'))
-          return
-        }
-        resolve({ Terminal, FitAddon })
-      })
-      .catch((error) => reject(error instanceof Error ? error : new Error(String(error))))
+    stylesReady.then(() =>
+      Promise
+        .all([
+          loadInFrame(`${ASSET_BASE}/xterm/xterm.js`, ['Terminal']),
+          loadInFrame(`${ASSET_BASE}/xterm/addon-fit.js`, ['FitAddon']),
+        ])
+        .then(([terminals, fits]) => {
+          const Terminal = terminals[0]
+          const FitAddon = fits[0] && fits[0].FitAddon
+          if (Terminal === undefined || FitAddon === undefined) {
+            reject(new Error('xterm.js загрузился без глобальных экспортов'))
+            return
+          }
+          resolve({ Terminal, FitAddon })
+        })
+        .catch((error) => reject(error instanceof Error ? error : new Error(String(error)))),
+    )
   })
   return xtermPromise
 }
@@ -6665,8 +6674,48 @@ function PtyPanel({ sessionId, call, height }) {
   const enginesRef = React.useRef(new Map())
   const readersRef = React.useRef(new Map())
   const offsetsRef = React.useRef(new Map())
+  const observerRef = React.useRef(undefined)
 
   const engineOf = (id) => enginesRef.current.get(id)
+
+  // Refit only while the host actually has a layout box: FitAddon divides the
+  // parent width by the cell width, so a zero-size parent would pin the
+  // terminal to 2×1 cells forever.
+  const safeFit = React.useCallback((id) => {
+    const host = hostsRef.current.get(id)
+    const engine = enginesRef.current.get(id)
+    if (host === undefined || engine === undefined) return false
+    if (host.clientWidth < 8 || host.clientHeight < 8) return false
+    try {
+      engine.fit.fit()
+      return true
+    } catch {
+      return false
+    }
+  }, [])
+
+  // One observer keeps every visible terminal fitted through drag-resize,
+  // window resize, and the moment a screen leaves `display:none`.
+  React.useEffect(() => {
+    if (typeof ResizeObserver !== 'function') return undefined
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const id = entry.target.getAttribute('data-pty-id')
+        if (typeof id !== 'string') continue
+        if (entry.target.clientWidth < 8 || entry.target.clientHeight < 8) continue
+        if (safeFit(id)) setError('')
+      }
+    })
+    observerRef.current = observer
+    for (const [id, host] of hostsRef.current) {
+      host.setAttribute('data-pty-id', id)
+      observer.observe(host)
+    }
+    return () => {
+      observer.disconnect()
+      observerRef.current = undefined
+    }
+  }, [])
 
   const markDead = React.useCallback((id, exitCode) => {
     setTerminals((previous) => previous.map((item) => (item.id === id ? { ...item, alive: false, exitCode: exitCode ?? item.exitCode } : item)))
@@ -6729,12 +6778,16 @@ function PtyPanel({ sessionId, call, height }) {
         })
         const fit = new libs.FitAddon()
         term.loadAddon(fit)
+        enginesRef.current.set(item.id, { term, fit })
         term.open(host)
-        try {
-          fit.fit()
-        } catch {
-          /* zero-size host while hidden */
+        host.setAttribute('data-pty-id', item.id)
+        observerRef.current?.observe(host)
+        const fitted = safeFit(item.id)
+        if (!fitted || term.cols < 5 || term.rows < 2) {
+          // Real sizes make layout bugs obvious instead of a silent 2×1 cell.
+          setError(`${TERMINAL_PROFILE_LABELS[item.profile] ?? item.profile}: сетка ${term.cols}×${term.rows}, панель ${host.clientWidth}×${host.clientHeight}`)
         }
+        if (item.id === activeId) term.focus()
         term.onData((data) => {
           if (call !== undefined) call('termWrite', { sessionId, id: item.id, data }).catch(() => {})
         })
@@ -6762,19 +6815,9 @@ function PtyPanel({ sessionId, call, height }) {
   // Keep the active terminal fitted to the panel: height drags and window
   // resizes both land here.
   React.useEffect(() => {
-    const refit = () => {
-      const engine = engineOf(activeId)
-      if (engine === undefined) return
-      try {
-        engine.fit.fit()
-      } catch {
-        /* zero-size host */
-      }
-    }
-    refit()
-    window.addEventListener('resize', refit)
-    return () => window.removeEventListener('resize', refit)
-  }, [activeId, height, terminals])
+    if (activeId === undefined) return
+    safeFit(activeId)
+  }, [activeId, height, terminals, safeFit])
 
   const refreshList = React.useCallback(async () => {
     if (call === undefined) return
@@ -6894,7 +6937,10 @@ function PtyPanel({ sessionId, call, height }) {
               type: 'button',
               className: `dsh-ide-pty-tab${item.id === activeId ? ' dsh-ide-pty-tab-active' : ''}`,
               title: labelOf(item),
-              onClick: () => setActiveId(item.id),
+              onClick: () => {
+                setActiveId(item.id)
+                engineOf(item.id)?.term.focus()
+              },
             },
             h('span', { className: item.alive === false ? 'dsh-ide-pty-dead' : undefined },
               item.alive === false
@@ -6928,6 +6974,7 @@ function PtyPanel({ sessionId, call, height }) {
               key: item.id,
               hidden: item.id !== activeId,
               className: 'dsh-ide-pty-screen',
+              onClick: () => engineOf(item.id)?.term.focus(),
               ref: (node) => {
                 if (node === null) hostsRef.current.delete(item.id)
                 else hostsRef.current.set(item.id, node)
